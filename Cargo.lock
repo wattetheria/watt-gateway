@@ -5673,6 +5673,8 @@ dependencies = [
  "bs58",
  "chrono",
  "ed25519-dalek 2.2.0",
+ "hex",
+ "libp2p-identity",
  "rand 0.8.5",
  "reqwest",
  "serde",
@@ -5685,6 +5687,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "watt-did",
+ "wattswarm-artifact-store",
  "wattswarm-network-substrate",
  "wattswarm-network-transport-core",
  "wattswarm-network-transport-iroh",
@@ -5722,6 +5725,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wattswarm-protocol",
 ]
 
 [[package]]

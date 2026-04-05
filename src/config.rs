@@ -2,6 +2,7 @@ use crate::gateway_identity::GatewayIdentityConfig;
 use anyhow::{Context, Result};
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use wattswarm_network_substrate::{PeerHandshakeMetadata, SubstrateConfig, TopicNamespace};
 
 pub const GATEWAY_IDENTIFY_AGENT_PREFIX: &str = "wattetheria-gateway-p2p";
@@ -21,6 +22,7 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct GatewayP2pConfig {
     pub enabled: bool,
+    pub state_dir: PathBuf,
     pub namespace: TopicNamespace,
     pub protocol_version: String,
     pub identify_agent_version: String,
@@ -53,6 +55,7 @@ impl GatewayP2pConfig {
     fn from_substrate(config: SubstrateConfig) -> Self {
         Self {
             enabled: false,
+            state_dir: PathBuf::from(".wattetheria-gateway-p2p-state"),
             namespace: config.namespace,
             protocol_version: config.protocol_version,
             identify_agent_version: config.identify_agent_version,
@@ -134,6 +137,9 @@ impl Config {
                 .unwrap_or(false),
             ..GatewayP2pConfig::default()
         };
+        if let Ok(state_dir) = env::var("WATTETHERIA_GATEWAY_P2P_STATE_DIR") {
+            p2p.state_dir = PathBuf::from(state_dir);
+        }
         if let Ok(listen_addrs) = env::var("WATTETHERIA_GATEWAY_P2P_LISTEN_ADDRS") {
             p2p.listen_addrs = parse_csv(&listen_addrs);
         }

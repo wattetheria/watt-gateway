@@ -7,13 +7,16 @@ use serde_json::{Value, json};
 use sqlx::ConnectOptions;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use tower::util::ServiceExt;
 use wattetheria_gateway::db::{self, UpsertSnapshotRecord};
 use wattetheria_gateway::gateway_identity::{GatewayIdentity, GatewayIdentityConfig};
-use wattetheria_gateway::gateway_network::{GatewayNetworkNode, GatewayNetworkRuntime};
+use wattetheria_gateway::gateway_network::{
+    self, GatewayNetworkHandle, GatewayNetworkNode, GatewayNetworkRuntime,
+};
 use wattetheria_gateway::http;
 use wattetheria_gateway::models::{
     GatewayManifest, PublicClientSnapshot, SignedGatewayManifest, SignedPublicClientSnapshot,
@@ -22,6 +25,7 @@ use wattetheria_gateway::node_client::NodeClient;
 use wattetheria_gateway::registry_client::RegistryClient;
 use wattetheria_gateway::state::AppState;
 use wattetheria_gateway::verify::{canonical_bytes, verify_signed_gateway_manifest};
+use wattswarm_artifact_store::ArtifactStore;
 use wattswarm_network_transport_core::PeerTransportCapabilities;
 
 static POSTGRES_READY: OnceLock<()> = OnceLock::new();
@@ -825,7 +829,7 @@ async fn register_node_persists_transport_material_and_routes() {
 #[tokio::test]
 async fn network_status_includes_gateway_runtime_when_shared_p2p_is_enabled() {
     let db = TestDatabase::new().await;
-    let app = test_app_with_network(&db.database_url).await;
+    let (app, _runtime, _handle) = test_app_with_network(&db.database_url).await;
 
     let response = request(&app, "GET", "/api/network/status").await;
     assert_eq!(response.0, StatusCode::OK);
@@ -835,6 +839,96 @@ async fn network_status_includes_gateway_runtime_when_shared_p2p_is_enabled() {
     );
     assert!(response.1["gateway_runtime"]["peer_id"].as_str().is_some());
 
+    db.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exist() {
+    let db = TestDatabase::new().await;
+    let remote_state_dir = unique_state_dir("gateway-remote");
+    let remote_runtime = GatewayNetworkRuntime::new(
+        GatewayNetworkNode::generate(wattetheria_gateway::config::GatewayP2pConfig {
+            enabled: true,
+            state_dir: remote_state_dir.clone(),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let remote_snapshot = signed_snapshot(
+        "node-iroh",
+        SnapshotContents {
+            network_name: Some("Watt Etheria"),
+            network_org_name: Some("Iroh Mesh"),
+            peers: &[json!({"id":"peer-iroh"})],
+            public_topics: &[],
+            public_topic_messages: &[],
+            tasks: &[json!({"id":"task-iroh"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    gateway_network::persist_snapshot_artifact(remote_runtime.state_dir(), &remote_snapshot)
+        .unwrap();
+    let remote_contact = remote_runtime
+        .export_transport_contact_material(chrono::Utc::now().timestamp() as u64)
+        .unwrap();
+    let (app, _local_runtime, local_handle) = test_app_with_network(&db.database_url).await;
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/nodes/register",
+        json!({
+            "name": "iroh-source",
+            "export_url": "http://127.0.0.1:9/v1/client/export",
+            "transport_capabilities": PeerTransportCapabilities::iroh_direct_default(),
+            "transport_contact_material": remote_contact,
+        }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+    let source_id = uuid::Uuid::parse_str(register.1["source_id"].as_str().unwrap()).unwrap();
+
+    let pool = db.pool().await;
+    db::upsert_snapshot(
+        &pool,
+        UpsertSnapshotRecord {
+            source_id: Some(source_id),
+            node_id: "node-iroh",
+            signer_agent_did: &remote_snapshot.signer_agent_did,
+            public_key: &remote_snapshot.payload.public_key,
+            generated_at: remote_snapshot.payload.generated_at - 1,
+            payload: &serde_json::to_value(&remote_snapshot.payload).unwrap(),
+            signature: "seed-signature",
+        },
+    )
+    .await
+    .unwrap();
+
+    let sync = request_json(&app, "POST", "/api/nodes/sync", json!({})).await;
+    assert_eq!(sync.0, StatusCode::OK);
+    assert_eq!(sync.1.as_array().unwrap().len(), 1);
+    assert_eq!(sync.1[0]["node_id"].as_str(), Some("node-iroh"));
+
+    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    assert_eq!(tasks.0, StatusCode::OK);
+    assert_eq!(tasks.1.as_array().unwrap().len(), 1);
+    assert_eq!(tasks.1[0]["id"].as_str(), Some("task-iroh"));
+
+    let artifact_store = ArtifactStore::new(local_handle.state_dir.join("artifacts"));
+    let snapshot_path = artifact_store
+        .snapshot_path(
+            gateway_network::PUBLIC_CLIENT_SNAPSHOT_SCOPE,
+            &remote_snapshot.payload.node_id,
+        )
+        .unwrap();
+    assert!(snapshot_path.exists());
+
+    drop(pool);
+    drop(app);
+    drop(remote_runtime);
     db.cleanup().await;
 }
 
@@ -912,12 +1006,15 @@ async fn test_app_with_identity_and_bootstrap(
     })
 }
 
-async fn test_app_with_network(database_url: &str) -> Router {
+async fn test_app_with_network(
+    database_url: &str,
+) -> (Router, GatewayNetworkRuntime, GatewayNetworkHandle) {
     let pool = db::connect(database_url).await.unwrap();
     db::init_schema(&pool).await.unwrap();
     let runtime = GatewayNetworkRuntime::new(
         GatewayNetworkNode::generate(wattetheria_gateway::config::GatewayP2pConfig {
             enabled: true,
+            state_dir: unique_state_dir("gateway-local"),
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_string()],
             ..Default::default()
         })
@@ -925,9 +1022,9 @@ async fn test_app_with_network(database_url: &str) -> Router {
     )
     .unwrap();
     let gateway_network = runtime
-        .export_info(chrono::Utc::now().timestamp() as u64)
+        .export_handle(chrono::Utc::now().timestamp() as u64)
         .unwrap();
-    http::router(AppState {
+    let app = http::router(AppState {
         pool,
         node_client: NodeClient::new(5).unwrap(),
         registry_client: RegistryClient::new(5).unwrap(),
@@ -935,8 +1032,13 @@ async fn test_app_with_network(database_url: &str) -> Router {
         registry_admin_token: Some("registry-secret".to_string()),
         bootstrap_registry_urls: Vec::new(),
         gateway_identity: None,
-        gateway_network: Some(gateway_network),
-    })
+        gateway_network: Some(gateway_network.clone()),
+    });
+    (app, runtime, gateway_network)
+}
+
+fn unique_state_dir(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()))
 }
 
 async fn request(app: &Router, method: &str, uri: &str) -> (StatusCode, Value) {

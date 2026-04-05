@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let gateway_network = gateway_network_runtime
         .as_ref()
-        .map(|runtime| runtime.export_info(chrono::Utc::now().timestamp() as u64))
+        .map(|runtime| runtime.export_handle(chrono::Utc::now().timestamp() as u64))
         .transpose()
         .context("export gateway p2p info")?;
     let pool = db::connect(&config.database_url)

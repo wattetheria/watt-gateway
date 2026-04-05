@@ -1,5 +1,5 @@
 use crate::db;
-use crate::gateway_network::GatewayNetworkInfo;
+use crate::gateway_network::{GatewayNetworkHandle, persist_snapshot_artifact};
 use crate::models::{
     BootstrapRegistryEntry, DiscoveredGatewayEntry, GatewayRegistryQuery, ListQuery,
     RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest, RegisterNodeResponse,
@@ -514,13 +514,22 @@ async fn sync_nodes(State(state): State<AppState>, Json(body): Json<SyncRequest>
         Ok(sources) => sources,
         Err(response) => return response,
     };
+    let known_snapshots = match db::list_snapshots(&state.pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
     let mut results = Vec::with_capacity(sources.len());
     for source in sources {
-        let fetched = match state
-            .node_client
-            .fetch_signed_snapshot(&source.export_url)
-            .await
-        {
+        let known_snapshot = known_snapshots
+            .iter()
+            .find(|row| row.source_id == Some(source.id));
+        let fetched = match fetch_snapshot_for_source(&state, &source, known_snapshot).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let message = error.to_string();
@@ -566,6 +575,50 @@ async fn sync_nodes(State(state): State<AppState>, Json(body): Json<SyncRequest>
         });
     }
     Json(results).into_response()
+}
+
+async fn fetch_snapshot_for_source(
+    state: &AppState,
+    source: &crate::models::NodeSourceRow,
+    known_snapshot: Option<&crate::models::SnapshotRow>,
+) -> anyhow::Result<SignedPublicClientSnapshot> {
+    if let Some(snapshot) = try_fetch_snapshot_via_iroh(state, source, known_snapshot).await? {
+        return Ok(snapshot);
+    }
+    state
+        .node_client
+        .fetch_signed_snapshot(&source.export_url)
+        .await
+}
+
+async fn try_fetch_snapshot_via_iroh(
+    state: &AppState,
+    source: &crate::models::NodeSourceRow,
+    known_snapshot: Option<&crate::models::SnapshotRow>,
+) -> anyhow::Result<Option<SignedPublicClientSnapshot>> {
+    let Some(handle) = state.gateway_network.as_ref() else {
+        return Ok(None);
+    };
+    let Some(contact) = source
+        .transport_contact_material
+        .as_ref()
+        .map(|value| value.0.clone())
+    else {
+        return Ok(None);
+    };
+    let Some(snapshot) = known_snapshot else {
+        return Ok(None);
+    };
+    let fetched = state
+        .node_client
+        .fetch_signed_snapshot_via_iroh(
+            &handle.state_dir,
+            &handle.local_peer_id,
+            &contact,
+            &snapshot.node_id,
+        )
+        .await?;
+    Ok(Some(fetched))
 }
 
 fn authorize_registry_admin(state: &AppState, headers: &HeaderMap) -> Option<Response> {
@@ -741,6 +794,9 @@ async fn ingest_signed_snapshot(
 ) -> anyhow::Result<()> {
     verify_signed_snapshot(snapshot, expected_signer_agent_did)?;
     let payload_json = serde_json::to_value(&snapshot.payload)?;
+    if let Some(handle) = &state.gateway_network {
+        persist_snapshot_artifact(&handle.state_dir, snapshot)?;
+    }
     db::upsert_snapshot(
         &state.pool,
         db::UpsertSnapshotRecord {
@@ -822,17 +878,17 @@ async fn network_status(State(state): State<AppState>) -> Response {
     }
 }
 
-fn gateway_runtime_status(runtime: &GatewayNetworkInfo) -> Value {
+fn gateway_runtime_status(runtime: &GatewayNetworkHandle) -> Value {
     json!({
-        "peer_id": runtime.peer_id,
-        "listen_addrs": runtime.listen_addrs,
-        "transport_capabilities": runtime.transport_capabilities,
-        "transport_contact_material": runtime.transport_contact_material,
-        "nat_status": runtime.nat_status,
-        "nat_public_address": runtime.nat_public_address,
-        "nat_confidence": runtime.nat_confidence,
-        "relay_reservations": runtime.relay_reservations,
-        "peer_health": runtime.peer_health.iter().map(|entry| json!({
+        "peer_id": runtime.info.peer_id,
+        "listen_addrs": runtime.info.listen_addrs,
+        "transport_capabilities": runtime.info.transport_capabilities,
+        "transport_contact_material": runtime.info.transport_contact_material,
+        "nat_status": runtime.info.nat_status,
+        "nat_public_address": runtime.info.nat_public_address,
+        "nat_confidence": runtime.info.nat_confidence,
+        "relay_reservations": runtime.info.relay_reservations,
+        "peer_health": runtime.info.peer_health.iter().map(|entry| json!({
             "peer": entry.peer,
             "score": entry.score,
             "blacklisted": entry.blacklisted,

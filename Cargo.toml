@@ -11,6 +11,9 @@ base64 = "0.22"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = "2"
+hex = "0.4"
+libp2p-identity = { version = "0.2.13", features = ["ed25519", "rand"] }
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,6 +24,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 watt-did = { path = "../watt-did" }
+wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }
 wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }
 wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }
 wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }
