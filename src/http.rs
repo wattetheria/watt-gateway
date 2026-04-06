@@ -1,11 +1,11 @@
 use crate::db;
 use crate::gateway_network::{GatewayNetworkHandle, persist_snapshot_artifact};
 use crate::models::{
-    BootstrapRegistryEntry, DiscoveredGatewayEntry, GatewayRegistryQuery, ListQuery,
-    RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest, RegisterNodeResponse,
-    ReviewGatewayRequest, SelfRegisterGatewayBatchResponse, SelfRegisterGatewayRequest,
-    SelfRegisterGatewayResponse, SignedPublicClientSnapshot, SyncRequest, SyncResult,
-    TopicMessageQuery, TopicQuery,
+    BootstrapRegistryEntry, DiscoveredGatewayEntry, DmMessageQuery, GatewayRegistryQuery,
+    ListQuery, RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest,
+    RegisterNodeResponse, ReviewGatewayRequest, SelfRegisterGatewayBatchResponse,
+    SelfRegisterGatewayRequest, SelfRegisterGatewayResponse, SignedPublicClientSnapshot,
+    SyncRequest, SyncResult, TopicMessageQuery, TopicQuery,
 };
 use crate::state::AppState;
 use crate::verify::{verify_signed_gateway_manifest, verify_signed_snapshot};
@@ -47,6 +47,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/peers", get(peers))
         .route("/api/topics", get(public_topics))
         .route("/api/topic-messages", get(public_topic_messages))
+        .route("/api/friends", get(friend_relationships))
+        .route("/api/friend-requests", get(pending_friend_requests))
+        .route("/api/dm/threads", get(dm_threads))
+        .route("/api/dm/messages", get(dm_messages))
         .route("/api/tasks", get(tasks))
         .route("/api/organizations", get(organizations))
         .route("/api/leaderboard", get(leaderboard))
@@ -855,6 +859,30 @@ async fn network_status(State(state): State<AppState>) -> Response {
                         .map_or(0, Vec::len)
                 })
                 .sum::<usize>();
+            let total_friend_relationships = snapshots
+                .iter()
+                .map(|payload| {
+                    payload["friend_relationships"]
+                        .as_array()
+                        .map_or(0, Vec::len)
+                })
+                .sum::<usize>();
+            let total_pending_friend_requests = snapshots
+                .iter()
+                .map(|payload| {
+                    payload["pending_friend_requests"]
+                        .as_array()
+                        .map_or(0, Vec::len)
+                })
+                .sum::<usize>();
+            let total_dm_threads = snapshots
+                .iter()
+                .map(|payload| payload["dm_threads"].as_array().map_or(0, Vec::len))
+                .sum::<usize>();
+            let total_dm_messages = snapshots
+                .iter()
+                .map(|payload| payload["dm_messages"].as_array().map_or(0, Vec::len))
+                .sum::<usize>();
             Json(json!({
                 "status": "ok",
                 "nodes": total_nodes,
@@ -863,6 +891,10 @@ async fn network_status(State(state): State<AppState>) -> Response {
                 "organizations": total_organizations,
                 "topics": total_topics,
                 "topic_messages": total_topic_messages,
+                "friend_relationships": total_friend_relationships,
+                "pending_friend_requests": total_pending_friend_requests,
+                "dm_threads": total_dm_threads,
+                "dm_messages": total_dm_messages,
                 "network_name": network_name,
                 "network_org_name": network_org_name,
                 "gateway_runtime": state.gateway_network.as_ref().map(gateway_runtime_status),
@@ -972,6 +1004,75 @@ async fn tasks(State(state): State<AppState>, Query(query): Query<ListQuery>) ->
         |source_id, value| attach_source(value, source_id),
     )
     .await
+}
+
+async fn friend_relationships(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    aggregate_array_endpoint(
+        &state,
+        query.limit.unwrap_or(200),
+        "friend_relationships",
+        |source_id, value| attach_source(value, source_id),
+    )
+    .await
+}
+
+async fn pending_friend_requests(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    aggregate_array_endpoint(
+        &state,
+        query.limit.unwrap_or(200),
+        "pending_friend_requests",
+        |source_id, value| attach_source(value, source_id),
+    )
+    .await
+}
+
+async fn dm_threads(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
+    aggregate_array_endpoint(
+        &state,
+        query.limit.unwrap_or(200),
+        "dm_threads",
+        |source_id, value| attach_source(value, source_id),
+    )
+    .await
+}
+
+async fn dm_messages(
+    State(state): State<AppState>,
+    Query(query): Query<DmMessageQuery>,
+) -> Response {
+    match db::list_snapshots(&state.pool).await {
+        Ok(rows) => {
+            let mut values = Vec::new();
+            for row in rows {
+                if let Some(entries) = row.payload.0["dm_messages"].as_array() {
+                    for entry in entries.iter().cloned() {
+                        let message = attach_snapshot_metadata(
+                            attach_source(entry, row.node_id.clone()),
+                            row.generated_at,
+                        );
+                        if matches_dm_message_filters(&message, &query) {
+                            values.push(message);
+                        }
+                    }
+                }
+            }
+            sort_values_desc_by_timestamp_with_fallback(&mut values, &["created_at"]);
+            dedupe_values_by_key(&mut values, dm_message_identity_key);
+            values.truncate(query.limit.unwrap_or(500));
+            Json(values).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn organizations(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
@@ -1133,6 +1234,15 @@ fn matches_topic_message_filters(value: &Value, query: &TopicMessageQuery) -> bo
         )
 }
 
+fn matches_dm_message_filters(value: &Value, query: &DmMessageQuery) -> bool {
+    matches_optional_string_filter(value, &["thread_id"], query.thread_id.as_deref())
+        && matches_optional_string_filter(
+            value,
+            &["counterpart_public_id"],
+            query.counterpart_public_id.as_deref(),
+        )
+}
+
 fn matches_optional_string_filter(value: &Value, keys: &[&str], expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -1146,6 +1256,10 @@ fn sort_values_desc_by_timestamp(values: &mut [Value]) {
     values.sort_by_key(|value| std::cmp::Reverse(topic_sort_timestamp(value)));
 }
 
+fn sort_values_desc_by_timestamp_with_fallback(values: &mut [Value], fallback_keys: &[&str]) {
+    values.sort_by_key(|value| std::cmp::Reverse(timestamp_with_fallback(value, fallback_keys)));
+}
+
 fn topic_sort_timestamp(value: &Value) -> i64 {
     for key in [
         "last_message_at",
@@ -1156,6 +1270,19 @@ fn topic_sort_timestamp(value: &Value) -> i64 {
         "snapshot_generated_at",
     ] {
         if let Some(number) = value.get(key).and_then(value_to_timestamp) {
+            return number;
+        }
+    }
+    0
+}
+
+fn timestamp_with_fallback(value: &Value, fallback_keys: &[&str]) -> i64 {
+    let primary = topic_sort_timestamp(value);
+    if primary != 0 {
+        return primary;
+    }
+    for key in fallback_keys {
+        if let Some(number) = value.get(*key).and_then(value_to_timestamp) {
             return number;
         }
     }
@@ -1211,6 +1338,18 @@ fn topic_message_identity_key(value: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         Some(format!("{topic_id}:{author_id}:{timestamp}:{body}"))
+    })
+}
+
+fn dm_message_identity_key(value: &Value) -> Option<String> {
+    topic_key_from_value(value, &["message_id", "id"]).or_else(|| {
+        let thread_id = value.get("thread_id").and_then(Value::as_str)?;
+        let created_at = timestamp_with_fallback(value, &["created_at"]);
+        let direction = value
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Some(format!("{thread_id}:{direction}:{created_at}"))
     })
 }
 

@@ -26,6 +26,14 @@ pub struct PublicClientSnapshot {
     pub operator: Value,
     pub rpc_logs: Vec<Value>,
     #[serde(default)]
+    pub friend_relationships: Vec<Value>,
+    #[serde(default)]
+    pub pending_friend_requests: Vec<Value>,
+    #[serde(default)]
+    pub dm_threads: Vec<Value>,
+    #[serde(default)]
+    pub dm_messages: Vec<Value>,
+    #[serde(default)]
     pub public_topics: Vec<Value>,
     #[serde(default)]
     pub public_topic_messages: Vec<Value>,
@@ -207,6 +215,13 @@ pub struct TopicMessageQuery {
     pub topic_id: Option<String>,
     pub organization_id: Option<String>,
     pub author_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DmMessageQuery {
+    pub limit: Option<usize>,
+    pub thread_id: Option<String>,
+    pub counterpart_public_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
