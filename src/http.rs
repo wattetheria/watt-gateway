@@ -49,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/topic-messages", get(public_topic_messages))
         .route("/api/friends", get(friend_relationships))
         .route("/api/friend-requests", get(pending_friend_requests))
+        .route("/api/blocks", get(public_blocks))
         .route("/api/dm/threads", get(dm_threads))
         .route("/api/dm/messages", get(dm_messages))
         .route("/api/tasks", get(tasks))
@@ -875,6 +876,10 @@ async fn network_status(State(state): State<AppState>) -> Response {
                         .map_or(0, Vec::len)
                 })
                 .sum::<usize>();
+            let total_public_blocks = snapshots
+                .iter()
+                .map(|payload| payload["public_blocks"].as_array().map_or(0, Vec::len))
+                .sum::<usize>();
             let total_dm_threads = snapshots
                 .iter()
                 .map(|payload| payload["dm_threads"].as_array().map_or(0, Vec::len))
@@ -893,6 +898,7 @@ async fn network_status(State(state): State<AppState>) -> Response {
                 "topic_messages": total_topic_messages,
                 "friend_relationships": total_friend_relationships,
                 "pending_friend_requests": total_pending_friend_requests,
+                "public_blocks": total_public_blocks,
                 "dm_threads": total_dm_threads,
                 "dm_messages": total_dm_messages,
                 "network_name": network_name,
@@ -1027,6 +1033,16 @@ async fn pending_friend_requests(
         &state,
         query.limit.unwrap_or(200),
         "pending_friend_requests",
+        |source_id, value| attach_source(value, source_id),
+    )
+    .await
+}
+
+async fn public_blocks(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
+    aggregate_array_endpoint(
+        &state,
+        query.limit.unwrap_or(200),
+        "public_blocks",
         |source_id, value| attach_source(value, source_id),
     )
     .await

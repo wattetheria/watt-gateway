@@ -47,6 +47,10 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
                 "counterpart_public_id":"did:key:friend-2",
                 "pending_inbound": true
             })],
+            public_blocks: &[json!({
+                "counterpart_public_id":"did:key:blocked-1",
+                "relationship_state":"blocked"
+            })],
             dm_threads: &[json!({
                 "thread_id":"dm:thread-1",
                 "counterpart_public_id":"did:key:friend-1",
@@ -129,6 +133,7 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
         network_status.1["pending_friend_requests"].as_u64(),
         Some(1)
     );
+    assert_eq!(network_status.1["public_blocks"].as_u64(), Some(1));
     assert_eq!(network_status.1["dm_threads"].as_u64(), Some(1));
     assert_eq!(network_status.1["dm_messages"].as_u64(), Some(1));
     assert_eq!(
@@ -174,6 +179,14 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
         Some("did:key:friend-2")
     );
 
+    let blocks = request(&app, "GET", "/api/blocks?limit=10").await;
+    assert_eq!(blocks.0, StatusCode::OK);
+    assert_eq!(blocks.1.as_array().unwrap().len(), 1);
+    assert_eq!(
+        blocks.1[0]["counterpart_public_id"].as_str(),
+        Some("did:key:blocked-1")
+    );
+
     let dm_threads = request(&app, "GET", "/api/dm/threads?limit=10").await;
     assert_eq!(dm_threads.0, StatusCode::OK);
     assert_eq!(dm_threads.1.as_array().unwrap().len(), 1);
@@ -213,6 +226,7 @@ async fn sync_rejects_invalid_signature_and_marks_source_invalid() {
             peers: &[],
             friend_relationships: &[],
             pending_friend_requests: &[],
+            public_blocks: &[],
             dm_threads: &[],
             dm_messages: &[],
             public_topics: &[],
@@ -354,6 +368,7 @@ async fn ingest_snapshot_accepts_push_without_registered_source() {
             peers: &[json!({"id":"peer-9"})],
             friend_relationships: &[],
             pending_friend_requests: &[],
+            public_blocks: &[],
             dm_threads: &[],
             dm_messages: &[],
             public_topics: &[json!({"topic_id":"topic-9","title":"Public Topic 9"})],
@@ -403,6 +418,7 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
             peers: &[],
             friend_relationships: &[],
             pending_friend_requests: &[],
+            public_blocks: &[],
             dm_threads: &[],
             dm_messages: &[],
             public_topics: &[json!({
@@ -432,6 +448,7 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
             peers: &[],
             friend_relationships: &[],
             pending_friend_requests: &[],
+            public_blocks: &[],
             dm_threads: &[],
             dm_messages: &[],
             public_topics: &[
@@ -528,6 +545,7 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
             peers: &[],
             friend_relationships: &[],
             pending_friend_requests: &[],
+            public_blocks: &[],
             dm_threads: &[],
             dm_messages: &[],
             public_topics: &[],
@@ -546,6 +564,7 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
             peers: &[],
             friend_relationships: &[],
             pending_friend_requests: &[],
+            public_blocks: &[],
             dm_threads: &[],
             dm_messages: &[],
             public_topics: &[],
@@ -941,6 +960,7 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
             peers: &[json!({"id":"peer-iroh"})],
             friend_relationships: &[],
             pending_friend_requests: &[],
+            public_blocks: &[],
             dm_threads: &[],
             dm_messages: &[],
             public_topics: &[],
@@ -1316,6 +1336,7 @@ struct SnapshotContents<'a> {
     peers: &'a [Value],
     friend_relationships: &'a [Value],
     pending_friend_requests: &'a [Value],
+    public_blocks: &'a [Value],
     dm_threads: &'a [Value],
     dm_messages: &'a [Value],
     public_topics: &'a [Value],
@@ -1360,6 +1381,7 @@ fn signed_snapshot_at(
         ],
         friend_relationships: contents.friend_relationships.to_vec(),
         pending_friend_requests: contents.pending_friend_requests.to_vec(),
+        public_blocks: contents.public_blocks.to_vec(),
         dm_threads: contents.dm_threads.to_vec(),
         dm_messages: contents.dm_messages.to_vec(),
         public_topics: contents.public_topics.to_vec(),

@@ -150,6 +150,7 @@ mod tests {
             rpc_logs: vec![],
             friend_relationships: vec![],
             pending_friend_requests: vec![],
+            public_blocks: vec![],
             dm_threads: vec![],
             dm_messages: vec![],
             public_topics: vec![],

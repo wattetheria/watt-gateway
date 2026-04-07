@@ -30,6 +30,8 @@ pub struct PublicClientSnapshot {
     #[serde(default)]
     pub pending_friend_requests: Vec<Value>,
     #[serde(default)]
+    pub public_blocks: Vec<Value>,
+    #[serde(default)]
     pub dm_threads: Vec<Value>,
     #[serde(default)]
     pub dm_messages: Vec<Value>,
