@@ -1,0 +1,278 @@
+use crate::contracts::{DataKind, projection_identity_key};
+use crate::db;
+use crate::models::NodeSourceRow;
+use crate::state::AppState;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WattswarmNetworkProjectionSnapshot {
+    pub generated_at: u64,
+    pub node_id: String,
+    pub org_id: String,
+    pub network_id: String,
+    pub running: bool,
+    pub mode: String,
+    pub peer_protocol_distribution: std::collections::BTreeMap<String, u64>,
+    pub peers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WattswarmTaskProjectionSummary {
+    pub task_id: String,
+    pub task_type: String,
+    pub epoch: u64,
+    pub terminal_state: String,
+    pub committed_candidate_id: Option<String>,
+    pub finalized_candidate_id: Option<String>,
+    pub retry_attempt: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WattswarmTaskRunProjectionSnapshot {
+    pub generated_at: u64,
+    pub recent_tasks: Vec<WattswarmTaskProjectionSummary>,
+    pub recent_runs: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WattswarmTopicMessageView {
+    pub message_id: String,
+    pub network_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub author_node_id: String,
+    pub content: Value,
+    pub reply_to_message_id: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WattswarmTopicActivitySnapshot {
+    pub generated_at: u64,
+    pub subscriber_node_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub messages: Vec<WattswarmTopicMessageView>,
+    pub cursor: Option<Value>,
+}
+
+pub async fn collect_wattswarm_read_models(state: &AppState, source: &NodeSourceRow) -> Result<()> {
+    let Some(base_url) = source
+        .wattswarm_ui_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let network: WattswarmNetworkProjectionSnapshot = state
+        .node_client
+        .fetch_json(
+            &format!("{base_url}/api/wattetheria/network/snapshot"),
+            None,
+        )
+        .await?;
+    persist_network_projection(state, source, &network).await?;
+
+    let task_run: WattswarmTaskRunProjectionSnapshot = state
+        .node_client
+        .fetch_json(
+            &format!("{base_url}/api/wattetheria/task-run/snapshot"),
+            Some(&[
+                ("task_limit", "200".to_string()),
+                ("run_limit", "50".to_string()),
+            ]),
+        )
+        .await?;
+    persist_task_projection(state, source, &task_run).await?;
+
+    collect_topic_activity_read_models(state, source, base_url).await?;
+    Ok(())
+}
+
+async fn persist_network_projection(
+    state: &AppState,
+    source: &NodeSourceRow,
+    snapshot: &WattswarmNetworkProjectionSnapshot,
+) -> Result<()> {
+    let payload = json!({
+        "node_id": snapshot.node_id,
+        "org_id": snapshot.org_id,
+        "network_id": snapshot.network_id,
+        "running": snapshot.running,
+        "mode": snapshot.mode,
+        "peer_protocol_distribution": snapshot.peer_protocol_distribution,
+        "peers": snapshot.peers,
+        "snapshot_generated_at": snapshot.generated_at,
+    });
+    persist_projection(
+        state,
+        DataKind::NetworkProjection,
+        projection_identity_key(DataKind::NetworkProjection, &payload, &snapshot.node_id),
+        &snapshot.node_id,
+        source.id,
+        i64::try_from(snapshot.generated_at).unwrap_or(i64::MAX),
+        payload,
+    )
+    .await
+}
+
+async fn persist_task_projection(
+    state: &AppState,
+    source: &NodeSourceRow,
+    snapshot: &WattswarmTaskRunProjectionSnapshot,
+) -> Result<()> {
+    let source_node_id = source
+        .expected_wattswarm_node_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source.name);
+    let generated_at = i64::try_from(snapshot.generated_at).unwrap_or(i64::MAX);
+    for task in &snapshot.recent_tasks {
+        let payload = json!({
+            "task_id": task.task_id,
+            "task_type": task.task_type,
+            "epoch": task.epoch,
+            "terminal_state": task.terminal_state,
+            "committed_candidate_id": task.committed_candidate_id,
+            "finalized_candidate_id": task.finalized_candidate_id,
+            "retry_attempt": task.retry_attempt,
+            "snapshot_generated_at": snapshot.generated_at,
+        });
+        persist_projection(
+            state,
+            DataKind::TaskSummary,
+            projection_identity_key(DataKind::TaskSummary, &payload, source_node_id),
+            source_node_id,
+            source.id,
+            generated_at,
+            payload,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn collect_topic_activity_read_models(
+    state: &AppState,
+    source: &NodeSourceRow,
+    base_url: &str,
+) -> Result<()> {
+    let rows = db::list_projection_rows(&state.pool, "hive_metadata").await?;
+    for row in rows
+        .into_iter()
+        .filter(|row| row.source_id == Some(source.id))
+    {
+        let Some(feed_key) = row.payload.0.get("feed_key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(scope_hint) = row.payload.0.get("scope_hint").and_then(Value::as_str) else {
+            continue;
+        };
+        let activity: WattswarmTopicActivitySnapshot = state
+            .node_client
+            .fetch_json(
+                &format!("{base_url}/api/wattetheria/topic/activity"),
+                Some(&[
+                    ("feed_key", feed_key.to_string()),
+                    ("scope_hint", scope_hint.to_string()),
+                    ("limit", "50".to_string()),
+                ]),
+            )
+            .await?;
+        let generated_at = i64::try_from(activity.generated_at).unwrap_or(i64::MAX);
+        for message in activity.messages {
+            let payload = json!({
+                "message_id": message.message_id,
+                "network_id": message.network_id,
+                "feed_key": message.feed_key,
+                "scope_hint": message.scope_hint,
+                "author_node_id": message.author_node_id,
+                "content": message.content,
+                "reply_to_message_id": message.reply_to_message_id,
+                "created_at": message.created_at,
+                "topic_id": row.payload.0.get("topic_id").cloned().unwrap_or(Value::Null),
+                "organization_id": row.payload.0.get("organization_id").cloned().unwrap_or(Value::Null),
+                "snapshot_generated_at": activity.generated_at,
+            });
+            let source_node_id = source
+                .expected_wattswarm_node_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&row.source_node_id);
+            persist_projection(
+                state,
+                DataKind::HiveActivity,
+                projection_identity_key(DataKind::HiveActivity, &payload, source_node_id),
+                source_node_id,
+                source.id,
+                generated_at,
+                payload,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn persist_projection(
+    state: &AppState,
+    data_kind: DataKind,
+    identity_key: String,
+    source_node_id: &str,
+    source_id: uuid::Uuid,
+    generated_at: i64,
+    payload: Value,
+) -> Result<()> {
+    let data_kind_string = serde_json::to_string(&data_kind)?
+        .trim_matches('"')
+        .to_string();
+    let provenance = json!({
+        "source_node_id": source_node_id,
+        "source_cursor_or_seq": Value::Null,
+        "ingest_path": "wattswarm_pull",
+        "last_confirmed_at": generated_at,
+        "last_provisional_at": Value::Null,
+    });
+    db::upsert_projection_row(
+        &state.pool,
+        db::UpsertProjectionRecord {
+            data_kind: &data_kind_string,
+            identity_key: &identity_key,
+            source_node_id,
+            source_id: Some(source_id),
+            generated_at,
+            visibility: "public",
+            payload: &payload,
+            provenance: &provenance,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_projection_serializes_task_id_identity() {
+        let payload = json!({"task_id":"task-1"});
+        assert_eq!(
+            projection_identity_key(DataKind::TaskSummary, &payload, "node-a"),
+            "task-1"
+        );
+    }
+
+    #[test]
+    fn network_projection_payload_carries_snapshot_timestamp() {
+        let payload = json!({
+            "node_id": "node-a",
+            "snapshot_generated_at": 12_u64,
+        });
+        assert_eq!(payload["snapshot_generated_at"].as_u64(), Some(12));
+    }
+}

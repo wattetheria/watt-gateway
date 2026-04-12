@@ -1,3 +1,4 @@
+use crate::contracts::GatewayUiEvent;
 use crate::gateway_identity::GatewayIdentity;
 use crate::gateway_network::GatewayNetworkHandle;
 use crate::node_client::NodeClient;
@@ -6,6 +7,7 @@ use anyhow::Result;
 use async_nats::Client as NatsClient;
 use serde_json::Value;
 use sqlx::PgPool;
+use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -17,6 +19,7 @@ pub struct AppState {
     pub bootstrap_registry_urls: Vec<String>,
     pub gateway_identity: Option<GatewayIdentity>,
     pub gateway_network: Option<GatewayNetworkHandle>,
+    pub ui_stream_tx: broadcast::Sender<GatewayUiEvent>,
 }
 
 impl AppState {
@@ -27,5 +30,9 @@ impl AppState {
                 .await?;
         }
         Ok(())
+    }
+
+    pub fn publish_ui_event(&self, event: GatewayUiEvent) {
+        let _ = self.ui_stream_tx.send(event);
     }
 }

@@ -1,3 +1,4 @@
+use crate::contracts::SignedNodeEvent;
 use crate::models::{SignedGatewayManifest, SignedPublicClientSnapshot};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -71,6 +72,48 @@ pub fn verify_signed_gateway_manifest(manifest: &SignedGatewayManifest) -> Resul
     Ok(())
 }
 
+pub fn verify_signed_node_event(
+    event: &SignedNodeEvent,
+    expected_signer_agent_did: Option<&str>,
+) -> Result<()> {
+    let payload = &event.payload;
+    let signer_public_key_b64 = public_key_b64_from_ref(&payload.signer_agent_did)
+        .context("resolve node event signer_agent_did public key")?;
+    if payload.event_id.trim().is_empty() {
+        bail!("node event event_id is empty");
+    }
+    if payload.node_id.trim().is_empty() {
+        bail!("node event node_id is empty");
+    }
+    if payload.public_key.trim().is_empty() {
+        bail!("node event public_key is empty");
+    }
+    if payload.event_kind.trim().is_empty() {
+        bail!("node event event_kind is empty");
+    }
+    if let Some(expected) = expected_signer_agent_did {
+        let expected_public_key_b64 = public_key_b64_from_ref(expected)
+            .context("resolve expected_signer_agent_did public key for node event")?;
+        if payload.signer_agent_did != expected && signer_public_key_b64 != expected_public_key_b64
+        {
+            bail!(
+                "unexpected node event signer_agent_did: expected {expected}, got {}",
+                payload.signer_agent_did
+            );
+        }
+    }
+    if signer_public_key_b64 != payload.public_key {
+        bail!("node event signer_agent_did does not resolve to payload public_key");
+    }
+    verify_canonical_signature(
+        payload,
+        &event.signature,
+        &payload.public_key,
+        "node event signature",
+    )?;
+    Ok(())
+}
+
 pub fn verify_canonical_signature(
     payload: &impl serde::Serialize,
     signature_b64: &str,
@@ -125,6 +168,10 @@ fn public_key_b64_from_did_key(agent_did: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::{
+        DataKind, EventScope, NodeEventPayload, ProvisionalExportPolicy, SignedNodeEvent,
+        Visibility,
+    };
     use crate::models::{GatewayManifest, PublicClientSnapshot};
     use base64::engine::general_purpose::STANDARD;
     use ed25519_dalek::{Signer, SigningKey};
@@ -155,6 +202,7 @@ mod tests {
             dm_messages: vec![],
             public_topics: vec![],
             public_topic_messages: vec![],
+            swarm_task_activity: json!({}),
             tasks: vec![],
             organizations: vec![],
             leaderboard: vec![],
@@ -199,6 +247,40 @@ mod tests {
         let manifest = SignedGatewayManifest { payload, signature };
 
         verify_signed_gateway_manifest(&manifest).unwrap();
+    }
+
+    #[test]
+    fn signed_node_event_verifies() {
+        let signing_key = SigningKey::from_bytes(&[3_u8; 32]);
+        let public_key = STANDARD.encode(signing_key.verifying_key().as_bytes());
+        let payload = NodeEventPayload {
+            event_id: "evt-1".to_string(),
+            node_id: "node-alpha".to_string(),
+            public_key: public_key.clone(),
+            signer_agent_did: did_key_from_public_key_b64(&public_key),
+            seq: 7,
+            timestamp: 1_710_000_123,
+            data_kind: DataKind::TaskRoundUpdate,
+            event_kind: "task.round.updated".to_string(),
+            visibility: Visibility::Public,
+            provisional_policy: ProvisionalExportPolicy::ProvisionalWithDowngrade,
+            scope: EventScope {
+                node_id: Some("node-alpha".to_string()),
+                topic_id: None,
+                organization_id: Some("org-1".to_string()),
+                task_id: Some("task-1".to_string()),
+            },
+            identity_key: Some("task-1".to_string()),
+            payload: json!({"task_id":"task-1","round":2}),
+        };
+        let signature = STANDARD.encode(
+            signing_key
+                .sign(&canonical_bytes(&payload).unwrap())
+                .to_bytes(),
+        );
+        let event = SignedNodeEvent { payload, signature };
+
+        verify_signed_node_event(&event, Some(&event.payload.signer_agent_did)).unwrap();
     }
 
     fn did_key_from_public_key_b64(public_key_b64: &str) -> String {

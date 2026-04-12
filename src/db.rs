@@ -1,5 +1,6 @@
 use crate::models::{
-    GatewayRegistryDbRow, GatewayRegistryEntry, NodeSourceRow, SignedGatewayManifest, SnapshotRow,
+    GatewayRegistryDbRow, GatewayRegistryEntry, NodeSourceRow, ProjectionRow,
+    SignedGatewayManifest, SnapshotRow, UiEventRow,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -26,10 +27,100 @@ pub struct InsertNodeSourceRecord<'a> {
     pub id: Uuid,
     pub name: &'a str,
     pub export_url: &'a str,
+    pub wattetheria_snapshot_export_url: Option<&'a str>,
+    pub wattetheria_events_export_url: Option<&'a str>,
+    pub wattswarm_ui_base_url: Option<&'a str>,
+    pub wattswarm_sync_grpc_endpoint: Option<&'a str>,
     pub region: Option<&'a str>,
     pub expected_signer_agent_did: Option<&'a str>,
+    pub expected_wattswarm_node_id: Option<&'a str>,
+    pub source_status: &'a str,
     pub transport_capabilities: Option<&'a Value>,
     pub transport_contact_material: Option<&'a Value>,
+}
+
+pub struct UpsertProjectionRecord<'a> {
+    pub data_kind: &'a str,
+    pub identity_key: &'a str,
+    pub source_node_id: &'a str,
+    pub source_id: Option<Uuid>,
+    pub generated_at: i64,
+    pub visibility: &'a str,
+    pub payload: &'a Value,
+    pub provenance: &'a Value,
+}
+
+pub struct InsertUiEventRecord<'a> {
+    pub event_id: &'a str,
+    pub source_id: Option<Uuid>,
+    pub node_id: &'a str,
+    pub signer_agent_did: &'a str,
+    pub data_kind: &'a str,
+    pub event_kind: &'a str,
+    pub visibility: &'a str,
+    pub provisional: bool,
+    pub topic_id: Option<&'a str>,
+    pub organization_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub generated_at: i64,
+    pub payload: &'a Value,
+    pub ingest_path: &'a str,
+    pub source_cursor_or_seq: Option<i64>,
+}
+
+pub struct ListUiEventsQuery<'a> {
+    pub cursor: i64,
+    pub data_kind: Option<&'a str>,
+    pub node_id: Option<&'a str>,
+    pub topic_id: Option<&'a str>,
+    pub organization_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub limit: i64,
+}
+
+pub struct InsertAuditRecord<'a> {
+    pub record_kind: &'a str,
+    pub data_kind: Option<&'a str>,
+    pub identity_key: Option<&'a str>,
+    pub source_id: Option<Uuid>,
+    pub source_node_id: Option<&'a str>,
+    pub generated_at: Option<i64>,
+    pub ingest_path: &'a str,
+    pub payload: &'a Value,
+    pub provenance: &'a Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayHealthCounts {
+    pub source_count: i64,
+    pub active_source_count: i64,
+    pub snapshot_count: i64,
+    pub projection_count: i64,
+    pub ui_event_count: i64,
+    pub backfill_event_count: i64,
+}
+
+pub async fn max_ui_event_source_seq(
+    pool: &PgPool,
+    node_id: &str,
+    source_id: Option<Uuid>,
+) -> Result<Option<i64>> {
+    let row = sqlx::query(
+        r#"
+        select max(source_cursor_or_seq) as max_seq
+        from gateway_ui_events
+        where node_id = $1
+          and (
+            ($2::uuid is null and source_id is null)
+            or source_id = $2
+          )
+        "#,
+    )
+    .bind(node_id)
+    .bind(source_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("max_seq")?)
 }
 
 pub async fn connect(database_url: &str) -> Result<PgPool> {
@@ -46,8 +137,14 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             id uuid primary key,
             name text not null,
             export_url text not null unique,
+            wattetheria_snapshot_export_url text null,
+            wattetheria_events_export_url text null,
+            wattswarm_ui_base_url text null,
+            wattswarm_sync_grpc_endpoint text null,
             region text null,
             expected_signer_agent_did text null,
+            expected_wattswarm_node_id text null,
+            source_status text not null default 'active',
             created_at timestamptz not null default now(),
             updated_at timestamptz not null default now(),
             last_sync_at timestamptz null,
@@ -56,6 +153,70 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             transport_capabilities jsonb null,
             transport_contact_material jsonb null
         );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        alter table node_sources
+            add column if not exists wattetheria_snapshot_export_url text null;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        alter table node_sources
+            add column if not exists wattetheria_events_export_url text null;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        alter table node_sources
+            add column if not exists wattswarm_ui_base_url text null;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        alter table node_sources
+            add column if not exists wattswarm_sync_grpc_endpoint text null;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        alter table node_sources
+            add column if not exists expected_wattswarm_node_id text null;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        alter table node_sources
+            add column if not exists source_status text not null default 'active';
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        update node_sources
+        set wattetheria_snapshot_export_url = coalesce(wattetheria_snapshot_export_url, export_url)
+        where wattetheria_snapshot_export_url is null;
         "#,
     )
     .execute(pool)
@@ -74,6 +235,106 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
         r#"
         alter table node_sources
             add column if not exists transport_contact_material jsonb null;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        create table if not exists gateway_projection_rows (
+            data_kind text not null,
+            identity_key text not null,
+            source_node_id text not null,
+            source_id uuid null references node_sources(id) on delete set null,
+            generated_at bigint not null,
+            ingested_at timestamptz not null default now(),
+            visibility text not null,
+            payload jsonb not null,
+            provenance jsonb not null,
+            primary key (data_kind, identity_key, source_node_id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        create index if not exists idx_gateway_projection_rows_kind_generated
+        on gateway_projection_rows(data_kind, generated_at desc);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        create table if not exists gateway_ui_events (
+            cursor bigserial primary key,
+            event_id text not null unique,
+            source_id uuid null references node_sources(id) on delete set null,
+            node_id text not null,
+            signer_agent_did text not null,
+            data_kind text not null,
+            event_kind text not null,
+            visibility text not null,
+            provisional boolean not null default false,
+            topic_id text null,
+            organization_id text null,
+            task_id text null,
+            generated_at bigint not null,
+            ingested_at timestamptz not null default now(),
+            payload jsonb not null,
+            ingest_path text not null,
+            source_cursor_or_seq bigint null
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        create index if not exists idx_gateway_ui_events_cursor on gateway_ui_events(cursor);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        create index if not exists idx_gateway_ui_events_kind_cursor
+        on gateway_ui_events(data_kind, cursor desc);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        create table if not exists gateway_ingest_audit (
+            id bigserial primary key,
+            record_kind text not null,
+            data_kind text null,
+            identity_key text null,
+            source_id uuid null references node_sources(id) on delete set null,
+            source_node_id text null,
+            generated_at bigint null,
+            ingest_path text not null,
+            payload jsonb not null,
+            provenance jsonb not null,
+            created_at timestamptz not null default now()
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        create index if not exists idx_gateway_ingest_audit_kind_created
+        on gateway_ingest_audit(record_kind, created_at desc);
         "#,
     )
     .execute(pool)
@@ -224,17 +485,26 @@ pub async fn insert_node_source(pool: &PgPool, record: InsertNodeSourceRecord<'_
     sqlx::query(
         r#"
         insert into node_sources (
-            id, name, export_url, region, expected_signer_agent_did, transport_capabilities,
+            id, name, export_url, wattetheria_snapshot_export_url,
+            wattetheria_events_export_url, wattswarm_ui_base_url,
+            wattswarm_sync_grpc_endpoint, region, expected_signer_agent_did,
+            expected_wattswarm_node_id, source_status, transport_capabilities,
             transport_contact_material, created_at, updated_at
         )
-        values ($1, $2, $3, $4, $5, $6, $7, now(), now())
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now())
         "#,
     )
     .bind(record.id)
     .bind(record.name)
     .bind(record.export_url)
+    .bind(record.wattetheria_snapshot_export_url)
+    .bind(record.wattetheria_events_export_url)
+    .bind(record.wattswarm_ui_base_url)
+    .bind(record.wattswarm_sync_grpc_endpoint)
     .bind(record.region)
     .bind(record.expected_signer_agent_did)
+    .bind(record.expected_wattswarm_node_id)
+    .bind(record.source_status)
     .bind(record.transport_capabilities)
     .bind(record.transport_contact_material)
     .execute(pool)
@@ -249,8 +519,14 @@ pub async fn list_node_sources(pool: &PgPool) -> Result<Vec<NodeSourceRow>> {
             id,
             name,
             export_url,
+            wattetheria_snapshot_export_url,
+            wattetheria_events_export_url,
+            wattswarm_ui_base_url,
+            wattswarm_sync_grpc_endpoint,
             region,
             expected_signer_agent_did,
+            expected_wattswarm_node_id,
+            source_status,
             created_at,
             updated_at,
             last_sync_at,
@@ -273,8 +549,14 @@ pub async fn get_node_source(pool: &PgPool, source_id: Uuid) -> Result<Option<No
             id,
             name,
             export_url,
+            wattetheria_snapshot_export_url,
+            wattetheria_events_export_url,
+            wattswarm_ui_base_url,
+            wattswarm_sync_grpc_endpoint,
             region,
             expected_signer_agent_did,
+            expected_wattswarm_node_id,
+            source_status,
             created_at,
             updated_at,
             last_sync_at,
@@ -289,6 +571,55 @@ pub async fn get_node_source(pool: &PgPool, source_id: Uuid) -> Result<Option<No
     .bind(source_id)
     .fetch_optional(pool)
     .await?)
+}
+
+pub async fn find_node_source_for_identity(
+    pool: &PgPool,
+    node_id: &str,
+    signer_agent_did: &str,
+) -> Result<Option<NodeSourceRow>> {
+    let matches = sqlx::query_as::<_, NodeSourceRow>(
+        r#"
+        select
+            id,
+            name,
+            export_url,
+            wattetheria_snapshot_export_url,
+            wattetheria_events_export_url,
+            wattswarm_ui_base_url,
+            wattswarm_sync_grpc_endpoint,
+            region,
+            expected_signer_agent_did,
+            expected_wattswarm_node_id,
+            source_status,
+            created_at,
+            updated_at,
+            last_sync_at,
+            last_sync_status,
+            last_error,
+            transport_capabilities,
+            transport_contact_material
+        from node_sources
+        where expected_signer_agent_did = $1
+           or expected_wattswarm_node_id = $2
+        order by
+            case
+                when expected_signer_agent_did = $1 then 0
+                when expected_wattswarm_node_id = $2 then 1
+                else 2
+            end,
+            created_at asc
+        limit 2
+        "#,
+    )
+    .bind(signer_agent_did)
+    .bind(node_id)
+    .fetch_all(pool)
+    .await?;
+    match matches.as_slice() {
+        [row] => Ok(Some(row.clone())),
+        _ => Ok(None),
+    }
 }
 
 pub async fn update_source_sync_status(
@@ -316,8 +647,8 @@ pub async fn update_source_sync_status(
     Ok(())
 }
 
-pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) -> Result<()> {
-    sqlx::query(
+pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) -> Result<bool> {
+    let result = sqlx::query(
         r#"
         insert into node_snapshots (
             node_id, source_id, signer_agent_did, public_key, generated_at, ingested_at, payload, signature
@@ -344,7 +675,7 @@ pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) ->
     .bind(record.signature)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn list_snapshots(pool: &PgPool) -> Result<Vec<SnapshotRow>> {
@@ -367,17 +698,294 @@ pub async fn list_snapshots(pool: &PgPool) -> Result<Vec<SnapshotRow>> {
     .await?)
 }
 
-pub async fn counts(pool: &PgPool) -> Result<(i64, i64)> {
+pub async fn list_visible_snapshots(pool: &PgPool) -> Result<Vec<SnapshotRow>> {
+    Ok(sqlx::query_as::<_, SnapshotRow>(
+        r#"
+        select
+            source_id,
+            node_id,
+            signer_agent_did,
+            public_key,
+            generated_at,
+            ingested_at,
+            payload,
+            signature
+        from node_snapshots
+        where source_id is null
+           or exists (
+                select 1
+                from node_sources
+                where node_sources.id = node_snapshots.source_id
+                  and node_sources.source_status = 'active'
+           )
+        order by ingested_at desc
+        "#,
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn counts(pool: &PgPool) -> Result<GatewayHealthCounts> {
     let row = sqlx::query(
         r#"
         select
             (select count(*) from node_sources) as source_count,
-            (select count(*) from node_snapshots) as snapshot_count
+            (select count(*) from node_sources where source_status = 'active') as active_source_count,
+            (select count(*) from node_snapshots) as snapshot_count,
+            (select count(*) from gateway_projection_rows) as projection_count,
+            (select count(*) from gateway_ui_events) as ui_event_count,
+            (select count(*) from gateway_ingest_audit where record_kind = 'gap_snapshot_refresh_applied') as backfill_event_count
         "#,
     )
     .fetch_one(pool)
     .await?;
-    Ok((row.try_get("source_count")?, row.try_get("snapshot_count")?))
+    Ok(GatewayHealthCounts {
+        source_count: row.try_get("source_count")?,
+        active_source_count: row.try_get("active_source_count")?,
+        snapshot_count: row.try_get("snapshot_count")?,
+        projection_count: row.try_get("projection_count")?,
+        ui_event_count: row.try_get("ui_event_count")?,
+        backfill_event_count: row.try_get("backfill_event_count")?,
+    })
+}
+
+pub async fn upsert_projection_row(
+    pool: &PgPool,
+    record: UpsertProjectionRecord<'_>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        insert into gateway_projection_rows (
+            data_kind, identity_key, source_node_id, source_id, generated_at,
+            ingested_at, visibility, payload, provenance
+        )
+        values ($1, $2, $3, $4, $5, now(), $6, $7, $8)
+        on conflict (data_kind, identity_key, source_node_id) do update
+        set
+            source_id = coalesce(excluded.source_id, gateway_projection_rows.source_id),
+            generated_at = excluded.generated_at,
+            ingested_at = now(),
+            visibility = excluded.visibility,
+            payload = excluded.payload,
+            provenance = excluded.provenance
+        where excluded.generated_at >= gateway_projection_rows.generated_at
+        "#,
+    )
+    .bind(record.data_kind)
+    .bind(record.identity_key)
+    .bind(record.source_node_id)
+    .bind(record.source_id)
+    .bind(record.generated_at)
+    .bind(record.visibility)
+    .bind(sqlx::types::Json(record.payload))
+    .bind(sqlx::types::Json(record.provenance))
+    .execute(pool)
+    .await?;
+    insert_audit_record(
+        pool,
+        InsertAuditRecord {
+            record_kind: "projection_upsert",
+            data_kind: Some(record.data_kind),
+            identity_key: Some(record.identity_key),
+            source_id: record.source_id,
+            source_node_id: Some(record.source_node_id),
+            generated_at: Some(record.generated_at),
+            ingest_path: record
+                .provenance
+                .get("ingest_path")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            payload: record.payload,
+            provenance: record.provenance,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn list_projection_rows(pool: &PgPool, data_kind: &str) -> Result<Vec<ProjectionRow>> {
+    Ok(sqlx::query_as::<_, ProjectionRow>(
+        r#"
+        select
+            data_kind,
+            identity_key,
+            source_node_id,
+            source_id,
+            generated_at,
+            ingested_at,
+            visibility,
+            payload,
+            provenance
+        from gateway_projection_rows
+        where data_kind = $1
+          and (
+            source_id is null
+            or exists (
+                select 1
+                from node_sources
+                where node_sources.id = gateway_projection_rows.source_id
+                  and node_sources.source_status = 'active'
+            )
+          )
+        order by generated_at desc, source_node_id asc
+        "#,
+    )
+    .bind(data_kind)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn insert_ui_event(
+    pool: &PgPool,
+    record: InsertUiEventRecord<'_>,
+) -> Result<Option<UiEventRow>> {
+    let row = sqlx::query_as::<_, UiEventRow>(
+        r#"
+        insert into gateway_ui_events (
+            event_id, source_id, node_id, signer_agent_did, data_kind, event_kind,
+            visibility, provisional, topic_id, organization_id, task_id,
+            generated_at, payload, ingest_path, source_cursor_or_seq
+        )
+        values (
+            $1, $2, $3, $4, $5, $6,
+            $7, $8, $9, $10, $11,
+            $12, $13, $14, $15
+        )
+        on conflict (event_id) do nothing
+        returning
+            cursor,
+            event_id,
+            source_id,
+            node_id,
+            signer_agent_did,
+            data_kind,
+            event_kind,
+            visibility,
+            provisional,
+            topic_id,
+            organization_id,
+            task_id,
+            generated_at,
+            ingested_at,
+            payload,
+            ingest_path,
+            source_cursor_or_seq
+        "#,
+    )
+    .bind(record.event_id)
+    .bind(record.source_id)
+    .bind(record.node_id)
+    .bind(record.signer_agent_did)
+    .bind(record.data_kind)
+    .bind(record.event_kind)
+    .bind(record.visibility)
+    .bind(record.provisional)
+    .bind(record.topic_id)
+    .bind(record.organization_id)
+    .bind(record.task_id)
+    .bind(record.generated_at)
+    .bind(sqlx::types::Json(record.payload))
+    .bind(record.ingest_path)
+    .bind(record.source_cursor_or_seq)
+    .fetch_optional(pool)
+    .await?;
+    if row.is_some() {
+        let provenance = serde_json::json!({
+            "source_cursor_or_seq": record.source_cursor_or_seq,
+            "visibility": record.visibility,
+            "provisional": record.provisional,
+        });
+        insert_audit_record(
+            pool,
+            InsertAuditRecord {
+                record_kind: "ui_event_insert",
+                data_kind: Some(record.data_kind),
+                identity_key: Some(record.event_id),
+                source_id: record.source_id,
+                source_node_id: Some(record.node_id),
+                generated_at: Some(record.generated_at),
+                ingest_path: record.ingest_path,
+                payload: record.payload,
+                provenance: &provenance,
+            },
+        )
+        .await?;
+    }
+    Ok(row)
+}
+
+pub async fn list_ui_events_after(
+    pool: &PgPool,
+    query: ListUiEventsQuery<'_>,
+) -> Result<Vec<UiEventRow>> {
+    Ok(sqlx::query_as::<_, UiEventRow>(
+        r#"
+        select
+            cursor,
+            event_id,
+            source_id,
+            node_id,
+            signer_agent_did,
+            data_kind,
+            event_kind,
+            visibility,
+            provisional,
+            topic_id,
+            organization_id,
+            task_id,
+            generated_at,
+            ingested_at,
+            payload,
+            ingest_path,
+            source_cursor_or_seq
+        from gateway_ui_events
+        where cursor > $1
+          and (
+            source_id is null
+            or exists (
+                select 1
+                from node_sources
+                where node_sources.id = gateway_ui_events.source_id
+                  and node_sources.source_status = 'active'
+            )
+          )
+          and ($2::text is null or data_kind = $2)
+          and ($3::text is null or node_id = $3)
+          and ($4::text is null or topic_id = $4)
+          and ($5::text is null or organization_id = $5)
+          and ($6::text is null or task_id = $6)
+        order by cursor asc
+        limit $7
+        "#,
+    )
+    .bind(query.cursor)
+    .bind(query.data_kind)
+    .bind(query.node_id)
+    .bind(query.topic_id)
+    .bind(query.organization_id)
+    .bind(query.task_id)
+    .bind(query.limit.max(1))
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn earliest_ui_event_cursor(pool: &PgPool) -> Result<Option<i64>> {
+    let row = sqlx::query(
+        r#"
+        select min(cursor) as earliest_cursor
+        from gateway_ui_events
+        where source_id is null
+           or exists (
+                select 1
+                from node_sources
+                where node_sources.id = gateway_ui_events.source_id
+                  and node_sources.source_status = 'active'
+           )
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("earliest_cursor")?)
 }
 
 pub async fn upsert_gateway_manifest(
@@ -473,6 +1081,38 @@ pub async fn review_gateway_manifest(
     .execute(pool)
     .await?;
     get_gateway_registry_entry(pool, gateway_id).await
+}
+
+pub async fn insert_audit_record(pool: &PgPool, record: InsertAuditRecord<'_>) -> Result<()> {
+    sqlx::query(
+        r#"
+        insert into gateway_ingest_audit (
+            record_kind,
+            data_kind,
+            identity_key,
+            source_id,
+            source_node_id,
+            generated_at,
+            ingest_path,
+            payload,
+            provenance,
+            created_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+        "#,
+    )
+    .bind(record.record_kind)
+    .bind(record.data_kind)
+    .bind(record.identity_key)
+    .bind(record.source_id)
+    .bind(record.source_node_id)
+    .bind(record.generated_at)
+    .bind(record.ingest_path)
+    .bind(sqlx::types::Json(record.payload))
+    .bind(sqlx::types::Json(record.provenance))
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn list_gateway_registry_entries(

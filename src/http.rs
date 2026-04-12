@@ -1,13 +1,15 @@
+use crate::collectors::collect_wattswarm_read_models;
 use crate::db;
-use crate::gateway_network::{GatewayNetworkHandle, persist_snapshot_artifact};
+use crate::gateway_network::persist_snapshot_artifact;
 use crate::models::{
-    BootstrapRegistryEntry, DiscoveredGatewayEntry, DmMessageQuery, GatewayRegistryQuery,
-    ListQuery, RegisterGatewayRequest, RegisterGatewayResponse, RegisterNodeRequest,
-    RegisterNodeResponse, ReviewGatewayRequest, SelfRegisterGatewayBatchResponse,
-    SelfRegisterGatewayRequest, SelfRegisterGatewayResponse, SignedPublicClientSnapshot,
-    SyncRequest, SyncResult, TopicMessageQuery, TopicQuery,
+    BootstrapRegistryEntry, DiscoveredGatewayEntry, GatewayRegistryQuery, RegisterGatewayRequest,
+    RegisterGatewayResponse, RegisterNodeRequest, RegisterNodeResponse, ReviewGatewayRequest,
+    SelfRegisterGatewayBatchResponse, SelfRegisterGatewayRequest, SelfRegisterGatewayResponse,
+    SignedPublicClientSnapshot, SyncRequest, SyncResult,
 };
+use crate::read_models::persist_snapshot_read_models;
 use crate::state::AppState;
+use crate::streaming;
 use crate::verify::{verify_signed_gateway_manifest, verify_signed_snapshot};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -19,7 +21,6 @@ use axum::{
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
-use wattswarm_network_transport_core::{PeerTransportCapabilities, TransferIntent, TransferKind};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -27,6 +28,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/nodes/register", post(register_node))
         .route("/api/nodes/sync", post(sync_nodes))
         .route("/api/ingest/snapshot", post(ingest_snapshot))
+        .route("/api/ingest/event", post(streaming::ingest_node_event))
+        .route("/api/stream", get(streaming::stream))
         .route("/api/registry/self-manifest", get(self_manifest))
         .route("/api/registry/self-register", post(self_register_gateway))
         .route("/api/registry/bootstrap", get(list_bootstrap_registries))
@@ -43,27 +46,40 @@ pub fn router(state: AppState) -> Router {
             post(review_gateway),
         )
         .route("/api/nodes", get(list_nodes))
-        .route("/api/network/status", get(network_status))
-        .route("/api/peers", get(peers))
-        .route("/api/topics", get(public_topics))
-        .route("/api/topic-messages", get(public_topic_messages))
-        .route("/api/friends", get(friend_relationships))
-        .route("/api/friend-requests", get(pending_friend_requests))
-        .route("/api/blocks", get(public_blocks))
-        .route("/api/dm/threads", get(dm_threads))
-        .route("/api/dm/messages", get(dm_messages))
-        .route("/api/tasks", get(tasks))
-        .route("/api/organizations", get(organizations))
-        .route("/api/leaderboard", get(leaderboard))
+        .route(
+            "/api/network/status",
+            get(crate::public_api::network_status),
+        )
+        .route("/api/peers", get(crate::public_api::peers))
+        .route("/api/topics", get(crate::public_api::public_topics))
+        .route(
+            "/api/topic-messages",
+            get(crate::public_api::public_topic_messages),
+        )
+        .route("/api/friends", get(crate::public_api::friend_relationships))
+        .route(
+            "/api/friend-requests",
+            get(crate::public_api::pending_friend_requests),
+        )
+        .route("/api/blocks", get(crate::public_api::public_blocks))
+        .route("/api/dm/threads", get(crate::public_api::dm_threads))
+        .route("/api/dm/messages", get(crate::public_api::dm_messages))
+        .route("/api/tasks", get(crate::public_api::tasks))
+        .route("/api/organizations", get(crate::public_api::organizations))
+        .route("/api/leaderboard", get(crate::public_api::leaderboard))
         .with_state(state)
 }
 
 async fn healthz(State(state): State<AppState>) -> Response {
     match db::counts(&state.pool).await {
-        Ok((source_count, snapshot_count)) => Json(json!({
+        Ok(counts) => Json(json!({
             "status": "ok",
-            "sources": source_count,
-            "snapshots": snapshot_count,
+            "sources": counts.source_count,
+            "active_sources": counts.active_source_count,
+            "snapshots": counts.snapshot_count,
+            "projections": counts.projection_count,
+            "ui_events": counts.ui_event_count,
+            "backfill_events": counts.backfill_event_count,
         }))
         .into_response(),
         Err(error) => (
@@ -78,22 +94,51 @@ async fn register_node(
     State(state): State<AppState>,
     Json(body): Json<RegisterNodeRequest>,
 ) -> Response {
-    if body.name.trim().is_empty() || body.export_url.trim().is_empty() {
+    let snapshot_export_url = body
+        .wattetheria_snapshot_export_url
+        .as_deref()
+        .or(body.export_url.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if body.name.trim().is_empty() || snapshot_export_url.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "name and export_url are required"})),
+            Json(json!({"error": "name and a wattetheria snapshot export URL are required"})),
         )
             .into_response();
     }
+    let export_url = snapshot_export_url.expect("validated snapshot export url");
     let source_id = Uuid::new_v4();
     match db::insert_node_source(
         &state.pool,
         db::InsertNodeSourceRecord {
             id: source_id,
             name: body.name.trim(),
-            export_url: body.export_url.trim(),
+            export_url,
+            wattetheria_snapshot_export_url: Some(export_url),
+            wattetheria_events_export_url: body
+                .wattetheria_events_export_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            wattswarm_ui_base_url: body
+                .wattswarm_ui_base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            wattswarm_sync_grpc_endpoint: body
+                .wattswarm_sync_grpc_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
             region: body.region.as_deref(),
             expected_signer_agent_did: body.expected_signer_agent_did.as_deref(),
+            expected_wattswarm_node_id: body.expected_wattswarm_node_id.as_deref(),
+            source_status: match body.source_status.unwrap_or_default() {
+                crate::contracts::SourceStatus::Active => "active",
+                crate::contracts::SourceStatus::Suspended => "suspended",
+                crate::contracts::SourceStatus::Rejected => "rejected",
+            },
             transport_capabilities: body
                 .transport_capabilities
                 .as_ref()
@@ -117,7 +162,7 @@ async fn register_node(
                 "event": "gateway.node.registered",
                 "source_id": source_id,
                 "name": body.name.trim(),
-                "export_url": body.export_url.trim(),
+                "export_url": export_url,
                 "region": body.region,
                 "timestamp": db::now_rfc3339(),
             });
@@ -127,7 +172,8 @@ async fn register_node(
                 Json(RegisterNodeResponse {
                     source_id,
                     name: body.name,
-                    export_url: body.export_url,
+                    export_url: export_url.to_string(),
+                    source_status: body.source_status.unwrap_or_default(),
                 }),
             )
                 .into_response()
@@ -571,12 +617,25 @@ async fn sync_nodes(State(state): State<AppState>, Json(body): Json<SyncRequest>
             )
                 .into_response();
         }
-        let _ = db::update_source_sync_status(&state.pool, source.id, "ok", None).await;
+        let (sync_status, wattswarm_collect_error) = if let Err(error) =
+            collect_wattswarm_read_models(&state, &source).await
+        {
+            let message = error.to_string();
+            let _ =
+                db::update_source_sync_status(&state.pool, source.id, "partial", Some(&message))
+                    .await;
+            ("partial".to_string(), Some(message))
+        } else {
+            let _ = db::update_source_sync_status(&state.pool, source.id, "ok", None).await;
+            ("ok".to_string(), None)
+        };
         results.push(SyncResult {
             source_id: Some(source.id),
             node_id: fetched.payload.node_id,
             signer_agent_did: fetched.signer_agent_did,
             generated_at: fetched.payload.generated_at,
+            sync_status,
+            wattswarm_collect_error,
         });
     }
     Json(results).into_response()
@@ -592,7 +651,12 @@ async fn fetch_snapshot_for_source(
     }
     state
         .node_client
-        .fetch_signed_snapshot(&source.export_url)
+        .fetch_signed_snapshot(
+            source
+                .wattetheria_snapshot_export_url
+                .as_deref()
+                .unwrap_or(&source.export_url),
+        )
         .await
 }
 
@@ -695,8 +759,43 @@ async fn ingest_snapshot(
     State(state): State<AppState>,
     Json(snapshot): Json<SignedPublicClientSnapshot>,
 ) -> Response {
-    match ingest_signed_snapshot(&state, &snapshot, None, None).await {
-        Ok(()) => Json(json!({
+    let resolved_source = match db::find_node_source_for_identity(
+        &state.pool,
+        &snapshot.payload.node_id,
+        &snapshot.signer_agent_did,
+    )
+    .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if resolved_source
+        .as_ref()
+        .is_some_and(|source| source.source_status != "active")
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "source is not active for push ingest"})),
+        )
+            .into_response();
+    }
+    match ingest_signed_snapshot(
+        &state,
+        &snapshot,
+        resolved_source.as_ref().map(|source| source.id),
+        resolved_source
+            .as_ref()
+            .and_then(|source| source.expected_signer_agent_did.as_deref()),
+    )
+    .await
+    {
+        Ok(_) => Json(json!({
             "status": "ok",
             "node_id": snapshot.payload.node_id,
             "signer_agent_did": snapshot.signer_agent_did,
@@ -734,14 +833,20 @@ async fn list_nodes(State(state): State<AppState>) -> Response {
                         "source_id": source.id,
                         "name": source.name,
                         "export_url": source.export_url,
+                        "wattetheria_snapshot_export_url": source.wattetheria_snapshot_export_url,
+                        "wattetheria_events_export_url": source.wattetheria_events_export_url,
+                        "wattswarm_ui_base_url": source.wattswarm_ui_base_url,
+                        "wattswarm_sync_grpc_endpoint": source.wattswarm_sync_grpc_endpoint,
                         "region": source.region,
                         "expected_signer_agent_did": source.expected_signer_agent_did,
+                        "expected_wattswarm_node_id": source.expected_wattswarm_node_id,
+                        "source_status": source.source_status,
                         "last_sync_at": source.last_sync_at,
                         "last_sync_status": source.last_sync_status,
                         "last_error": source.last_error,
                         "transport_capabilities": source.transport_capabilities.as_ref().map(|value| json!(value.0)),
                         "transport_contact_material": source.transport_contact_material.as_ref().map(|value| json!(value.0)),
-                        "recommended_routes": source.transport_capabilities.as_ref().map(|value| recommended_routes(&value.0)),
+                        "recommended_routes": source.transport_capabilities.as_ref().map(|value| crate::public_api::recommended_routes(&value.0)),
                         "snapshot": snapshot.map(|row| json!({
                             "node_id": row.node_id,
                             "signer_agent_did": row.signer_agent_did,
@@ -761,8 +866,14 @@ async fn list_nodes(State(state): State<AppState>) -> Response {
                                 "source_id": Value::Null,
                                 "name": row.node_id,
                                 "export_url": Value::Null,
+                                "wattetheria_snapshot_export_url": Value::Null,
+                                "wattetheria_events_export_url": Value::Null,
+                                "wattswarm_ui_base_url": Value::Null,
+                                "wattswarm_sync_grpc_endpoint": Value::Null,
                                 "region": Value::Null,
                                 "expected_signer_agent_did": Value::Null,
+                                "expected_wattswarm_node_id": Value::Null,
+                                "source_status": "push",
                                 "last_sync_at": row.ingested_at,
                                 "last_sync_status": "push",
                                 "last_error": Value::Null,
@@ -791,18 +902,18 @@ async fn list_nodes(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn ingest_signed_snapshot(
+pub(crate) async fn ingest_signed_snapshot(
     state: &AppState,
     snapshot: &SignedPublicClientSnapshot,
     source_id: Option<Uuid>,
     expected_signer_agent_did: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     verify_signed_snapshot(snapshot, expected_signer_agent_did)?;
     let payload_json = serde_json::to_value(&snapshot.payload)?;
     if let Some(handle) = &state.gateway_network {
         persist_snapshot_artifact(&handle.state_dir, snapshot)?;
     }
-    db::upsert_snapshot(
+    let applied = db::upsert_snapshot(
         &state.pool,
         db::UpsertSnapshotRecord {
             source_id,
@@ -815,564 +926,21 @@ async fn ingest_signed_snapshot(
         },
     )
     .await?;
-    let event = json!({
-        "event": "gateway.snapshot.ingested",
-        "source_id": source_id,
-        "node_id": snapshot.payload.node_id,
-        "signer_agent_did": snapshot.signer_agent_did,
-        "generated_at": snapshot.payload.generated_at,
-        "timestamp": db::now_rfc3339(),
-    });
-    let _ = state
-        .publish_event("gateway.snapshot.ingested", &event)
-        .await;
-    Ok(())
-}
-
-async fn network_status(State(state): State<AppState>) -> Response {
-    match db::list_snapshots(&state.pool).await {
-        Ok(rows) => {
-            let snapshots = rows.iter().map(|row| &row.payload.0).collect::<Vec<_>>();
-            let network_name = single_shared_string(&snapshots, "network_name");
-            let network_org_name = single_shared_string(&snapshots, "network_org_name");
-            let total_nodes = snapshots.len();
-            let total_peers = snapshots
-                .iter()
-                .map(|payload| payload["peers"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            let total_tasks = snapshots
-                .iter()
-                .map(|payload| payload["tasks"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            let total_organizations = snapshots
-                .iter()
-                .map(|payload| payload["organizations"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            let total_topics = snapshots
-                .iter()
-                .map(|payload| payload["public_topics"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            let total_topic_messages = snapshots
-                .iter()
-                .map(|payload| {
-                    payload["public_topic_messages"]
-                        .as_array()
-                        .map_or(0, Vec::len)
-                })
-                .sum::<usize>();
-            let total_friend_relationships = snapshots
-                .iter()
-                .map(|payload| {
-                    payload["friend_relationships"]
-                        .as_array()
-                        .map_or(0, Vec::len)
-                })
-                .sum::<usize>();
-            let total_pending_friend_requests = snapshots
-                .iter()
-                .map(|payload| {
-                    payload["pending_friend_requests"]
-                        .as_array()
-                        .map_or(0, Vec::len)
-                })
-                .sum::<usize>();
-            let total_public_blocks = snapshots
-                .iter()
-                .map(|payload| payload["public_blocks"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            let total_dm_threads = snapshots
-                .iter()
-                .map(|payload| payload["dm_threads"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            let total_dm_messages = snapshots
-                .iter()
-                .map(|payload| payload["dm_messages"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            Json(json!({
-                "status": "ok",
-                "nodes": total_nodes,
-                "peers": total_peers,
-                "tasks": total_tasks,
-                "organizations": total_organizations,
-                "topics": total_topics,
-                "topic_messages": total_topic_messages,
-                "friend_relationships": total_friend_relationships,
-                "pending_friend_requests": total_pending_friend_requests,
-                "public_blocks": total_public_blocks,
-                "dm_threads": total_dm_threads,
-                "dm_messages": total_dm_messages,
-                "network_name": network_name,
-                "network_org_name": network_org_name,
-                "gateway_runtime": state.gateway_network.as_ref().map(gateway_runtime_status),
-                "updated_at": db::now_rfc3339(),
-            }))
-            .into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
+    if applied {
+        persist_snapshot_read_models(&state.pool, source_id, &snapshot.payload).await?;
+        let event = json!({
+            "event": "gateway.snapshot.ingested",
+            "source_id": source_id,
+            "node_id": snapshot.payload.node_id,
+            "signer_agent_did": snapshot.signer_agent_did,
+            "generated_at": snapshot.payload.generated_at,
+            "timestamp": db::now_rfc3339(),
+        });
+        let _ = state
+            .publish_event("gateway.snapshot.ingested", &event)
+            .await;
     }
-}
-
-fn gateway_runtime_status(runtime: &GatewayNetworkHandle) -> Value {
-    json!({
-        "peer_id": runtime.info.peer_id,
-        "listen_addrs": runtime.info.listen_addrs,
-        "transport_capabilities": runtime.info.transport_capabilities,
-        "transport_contact_material": runtime.info.transport_contact_material,
-        "nat_status": runtime.info.nat_status,
-        "nat_public_address": runtime.info.nat_public_address,
-        "nat_confidence": runtime.info.nat_confidence,
-        "relay_reservations": runtime.info.relay_reservations,
-        "peer_health": runtime.info.peer_health.iter().map(|entry| json!({
-            "peer": entry.peer,
-            "score": entry.score,
-            "blacklisted": entry.blacklisted,
-            "reputation_tier": entry.reputation_tier,
-            "quarantined": entry.quarantined,
-            "quarantine_remaining_ms": entry.quarantine_remaining_ms,
-            "ban_remaining_ms": entry.ban_remaining_ms,
-            "throttle_factor_percent": entry.throttle_factor_percent,
-        })).collect::<Vec<_>>(),
-    })
-}
-
-fn recommended_routes(capabilities: &PeerTransportCapabilities) -> Value {
-    json!({
-        "control_message": route_for(capabilities, TransferKind::ControlMessage, 512, false),
-        "backfill_chunk": route_for(capabilities, TransferKind::BackfillChunk, 128 * 1024, false),
-        "artifact_blob": route_for(capabilities, TransferKind::ArtifactBlob, 128 * 1024, true),
-        "checkpoint_snapshot": route_for(capabilities, TransferKind::CheckpointSnapshot, 128 * 1024, true),
-    })
-}
-
-fn route_for(
-    capabilities: &PeerTransportCapabilities,
-    kind: TransferKind,
-    payload_bytes: usize,
-    requires_streaming: bool,
-) -> &'static str {
-    wattswarm_network_transport_core::TransportRouter::select(
-        &TransferIntent {
-            kind,
-            payload_bytes,
-            requires_streaming,
-        },
-        Some(capabilities),
-    )
-    .as_str()
-}
-
-fn single_shared_string(snapshots: &[&Value], key: &str) -> Value {
-    let mut values = snapshots
-        .iter()
-        .filter_map(|payload| payload[key].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    values.sort();
-    values.dedup();
-    match values.as_slice() {
-        [value] => Value::String(value.clone()),
-        _ => Value::Null,
-    }
-}
-
-async fn peers(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "peers",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
-async fn public_topics(State(state): State<AppState>, Query(query): Query<TopicQuery>) -> Response {
-    aggregate_public_topics_endpoint(&state, query).await
-}
-
-async fn public_topic_messages(
-    State(state): State<AppState>,
-    Query(query): Query<TopicMessageQuery>,
-) -> Response {
-    aggregate_public_topic_messages_endpoint(&state, query).await
-}
-
-async fn tasks(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "tasks",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
-async fn friend_relationships(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> Response {
-    aggregate_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "friend_relationships",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
-async fn pending_friend_requests(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> Response {
-    aggregate_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "pending_friend_requests",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
-async fn public_blocks(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "public_blocks",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
-async fn dm_threads(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "dm_threads",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
-async fn dm_messages(
-    State(state): State<AppState>,
-    Query(query): Query<DmMessageQuery>,
-) -> Response {
-    match db::list_snapshots(&state.pool).await {
-        Ok(rows) => {
-            let mut values = Vec::new();
-            for row in rows {
-                if let Some(entries) = row.payload.0["dm_messages"].as_array() {
-                    for entry in entries.iter().cloned() {
-                        let message = attach_snapshot_metadata(
-                            attach_source(entry, row.node_id.clone()),
-                            row.generated_at,
-                        );
-                        if matches_dm_message_filters(&message, &query) {
-                            values.push(message);
-                        }
-                    }
-                }
-            }
-            sort_values_desc_by_timestamp_with_fallback(&mut values, &["created_at"]);
-            dedupe_values_by_key(&mut values, dm_message_identity_key);
-            values.truncate(query.limit.unwrap_or(500));
-            Json(values).into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-async fn organizations(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "organizations",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
-async fn leaderboard(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "leaderboard",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
-async fn aggregate_public_topics_endpoint(state: &AppState, query: TopicQuery) -> Response {
-    match db::list_snapshots(&state.pool).await {
-        Ok(rows) => {
-            let mut values = Vec::new();
-            for row in rows {
-                if let Some(entries) = row.payload.0["public_topics"].as_array() {
-                    for entry in entries.iter().cloned() {
-                        let topic = attach_snapshot_metadata(
-                            attach_source(entry, row.node_id.clone()),
-                            row.generated_at,
-                        );
-                        if matches_topic_filters(&topic, &query) {
-                            values.push(topic);
-                        }
-                    }
-                }
-            }
-            sort_values_desc_by_timestamp(&mut values);
-            dedupe_values_by_key(&mut values, topic_identity_key);
-            values.truncate(query.limit.unwrap_or(200));
-            Json(values).into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-async fn aggregate_public_topic_messages_endpoint(
-    state: &AppState,
-    query: TopicMessageQuery,
-) -> Response {
-    match db::list_snapshots(&state.pool).await {
-        Ok(rows) => {
-            let mut values = Vec::new();
-            for row in rows {
-                if let Some(entries) = row.payload.0["public_topic_messages"].as_array() {
-                    for entry in entries.iter().cloned() {
-                        let message = attach_snapshot_metadata(
-                            attach_source(entry, row.node_id.clone()),
-                            row.generated_at,
-                        );
-                        if matches_topic_message_filters(&message, &query) {
-                            values.push(message);
-                        }
-                    }
-                }
-            }
-            sort_values_desc_by_timestamp(&mut values);
-            dedupe_values_by_key(&mut values, topic_message_identity_key);
-            values.truncate(query.limit.unwrap_or(500));
-            Json(values).into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-async fn aggregate_array_endpoint<F>(
-    state: &AppState,
-    limit: usize,
-    key: &str,
-    transform: F,
-) -> Response
-where
-    F: Fn(String, Value) -> Value,
-{
-    match db::list_snapshots(&state.pool).await {
-        Ok(rows) => {
-            let mut values = Vec::new();
-            for row in rows {
-                if let Some(entries) = row.payload.0[key].as_array() {
-                    values.extend(
-                        entries
-                            .iter()
-                            .take(limit)
-                            .cloned()
-                            .map(|value| transform(row.node_id.clone(), value)),
-                    );
-                }
-            }
-            values.truncate(limit);
-            Json(values).into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-fn attach_source(mut value: Value, source_node_id: String) -> Value {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("source_node_id".to_string(), Value::String(source_node_id));
-    }
-    value
-}
-
-fn attach_snapshot_metadata(mut value: Value, generated_at: i64) -> Value {
-    if let Some(object) = value.as_object_mut()
-        && !object.contains_key("snapshot_generated_at")
-    {
-        object.insert(
-            "snapshot_generated_at".to_string(),
-            Value::Number(generated_at.into()),
-        );
-    }
-    value
-}
-
-fn matches_topic_filters(value: &Value, query: &TopicQuery) -> bool {
-    matches_optional_string_filter(value, &["topic_id", "id"], query.topic_id.as_deref())
-        && matches_optional_string_filter(
-            value,
-            &["organization_id", "organizationId"],
-            query.organization_id.as_deref(),
-        )
-}
-
-fn matches_topic_message_filters(value: &Value, query: &TopicMessageQuery) -> bool {
-    matches_optional_string_filter(value, &["topic_id", "topicId"], query.topic_id.as_deref())
-        && matches_optional_string_filter(
-            value,
-            &["organization_id", "organizationId"],
-            query.organization_id.as_deref(),
-        )
-        && matches_optional_string_filter(
-            value,
-            &["author_id", "authorId", "sender_id", "senderId"],
-            query.author_id.as_deref(),
-        )
-}
-
-fn matches_dm_message_filters(value: &Value, query: &DmMessageQuery) -> bool {
-    matches_optional_string_filter(value, &["thread_id"], query.thread_id.as_deref())
-        && matches_optional_string_filter(
-            value,
-            &["counterpart_public_id"],
-            query.counterpart_public_id.as_deref(),
-        )
-}
-
-fn matches_optional_string_filter(value: &Value, keys: &[&str], expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return true;
-    };
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .is_some_and(|actual| actual == expected)
-}
-
-fn sort_values_desc_by_timestamp(values: &mut [Value]) {
-    values.sort_by_key(|value| std::cmp::Reverse(topic_sort_timestamp(value)));
-}
-
-fn sort_values_desc_by_timestamp_with_fallback(values: &mut [Value], fallback_keys: &[&str]) {
-    values.sort_by_key(|value| std::cmp::Reverse(timestamp_with_fallback(value, fallback_keys)));
-}
-
-fn topic_sort_timestamp(value: &Value) -> i64 {
-    for key in [
-        "last_message_at",
-        "updated_at",
-        "created_at",
-        "timestamp",
-        "sent_at",
-        "snapshot_generated_at",
-    ] {
-        if let Some(number) = value.get(key).and_then(value_to_timestamp) {
-            return number;
-        }
-    }
-    0
-}
-
-fn timestamp_with_fallback(value: &Value, fallback_keys: &[&str]) -> i64 {
-    let primary = topic_sort_timestamp(value);
-    if primary != 0 {
-        return primary;
-    }
-    for key in fallback_keys {
-        if let Some(number) = value.get(*key).and_then(value_to_timestamp) {
-            return number;
-        }
-    }
-    0
-}
-
-fn value_to_timestamp(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_str().and_then(parse_timestamp_str))
-}
-
-fn parse_timestamp_str(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|timestamp| timestamp.timestamp())
-}
-
-fn dedupe_values_by_key<F>(values: &mut Vec<Value>, key_fn: F)
-where
-    F: Fn(&Value) -> Option<String>,
-{
-    let mut seen = std::collections::BTreeSet::new();
-    values.retain(|value| {
-        let Some(identity) = key_fn(value) else {
-            return true;
-        };
-        seen.insert(identity)
-    });
-}
-
-fn topic_identity_key(value: &Value) -> Option<String> {
-    topic_key_from_value(value, &["topic_id", "id"])
-}
-
-fn topic_message_identity_key(value: &Value) -> Option<String> {
-    topic_key_from_value(value, &["message_id", "id"]).or_else(|| {
-        let topic_id = value
-            .get("topic_id")
-            .or_else(|| value.get("topicId"))
-            .and_then(Value::as_str)?;
-        let author_id = value
-            .get("author_id")
-            .or_else(|| value.get("authorId"))
-            .or_else(|| value.get("sender_id"))
-            .or_else(|| value.get("senderId"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let timestamp = topic_sort_timestamp(value);
-        let body = value
-            .get("body")
-            .or_else(|| value.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        Some(format!("{topic_id}:{author_id}:{timestamp}:{body}"))
-    })
-}
-
-fn dm_message_identity_key(value: &Value) -> Option<String> {
-    topic_key_from_value(value, &["message_id", "id"]).or_else(|| {
-        let thread_id = value.get("thread_id").and_then(Value::as_str)?;
-        let created_at = timestamp_with_fallback(value, &["created_at"]);
-        let direction = value
-            .get("direction")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        Some(format!("{thread_id}:{direction}:{created_at}"))
-    })
-}
-
-fn topic_key_from_value(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .map(str::to_string)
+    Ok(applied)
 }
 
 async fn resolve_sources(
@@ -1381,7 +949,12 @@ async fn resolve_sources(
 ) -> Result<Vec<crate::models::NodeSourceRow>, Response> {
     match source_id {
         Some(source_id) => match db::get_node_source(&state.pool, source_id).await {
-            Ok(Some(source)) => Ok(vec![source]),
+            Ok(Some(source)) if source.source_status == "active" => Ok(vec![source]),
+            Ok(Some(_)) => Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "source is not active"})),
+            )
+                .into_response()),
             Ok(None) => Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "unknown source_id"})),
@@ -1394,12 +967,21 @@ async fn resolve_sources(
                 .into_response()),
         },
         None => match db::list_node_sources(&state.pool).await {
-            Ok(sources) if !sources.is_empty() => Ok(sources),
-            Ok(_) => Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "no node sources registered"})),
-            )
-                .into_response()),
+            Ok(sources) => {
+                let active = sources
+                    .into_iter()
+                    .filter(|source| source.source_status == "active")
+                    .collect::<Vec<_>>();
+                if !active.is_empty() {
+                    Ok(active)
+                } else {
+                    Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "no active node sources registered"})),
+                    )
+                        .into_response())
+                }
+            }
             Err(error) => Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": error.to_string()})),

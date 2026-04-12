@@ -1,3 +1,4 @@
+use crate::contracts::{DataKind, EventScope, GatewayUiEvent, SourceStatus, Visibility};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::FromRow;
@@ -39,6 +40,8 @@ pub struct PublicClientSnapshot {
     pub public_topics: Vec<Value>,
     #[serde(default)]
     pub public_topic_messages: Vec<Value>,
+    #[serde(default)]
+    pub swarm_task_activity: Value,
     pub tasks: Vec<Value>,
     pub organizations: Vec<Value>,
     pub leaderboard: Vec<Value>,
@@ -71,8 +74,14 @@ pub struct NodeSourceRow {
     pub id: Uuid,
     pub name: String,
     pub export_url: String,
+    pub wattetheria_snapshot_export_url: Option<String>,
+    pub wattetheria_events_export_url: Option<String>,
+    pub wattswarm_ui_base_url: Option<String>,
+    pub wattswarm_sync_grpc_endpoint: Option<String>,
     pub region: Option<String>,
     pub expected_signer_agent_did: Option<String>,
+    pub expected_wattswarm_node_id: Option<String>,
+    pub source_status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -92,6 +101,64 @@ pub struct SnapshotRow {
     pub ingested_at: chrono::DateTime<chrono::Utc>,
     pub payload: sqlx::types::Json<Value>,
     pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ProjectionRow {
+    pub data_kind: String,
+    pub identity_key: String,
+    pub source_node_id: String,
+    pub source_id: Option<Uuid>,
+    pub generated_at: i64,
+    pub ingested_at: chrono::DateTime<chrono::Utc>,
+    pub visibility: String,
+    pub payload: sqlx::types::Json<Value>,
+    pub provenance: sqlx::types::Json<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct UiEventRow {
+    pub cursor: i64,
+    pub event_id: String,
+    pub source_id: Option<Uuid>,
+    pub node_id: String,
+    pub signer_agent_did: String,
+    pub data_kind: String,
+    pub event_kind: String,
+    pub visibility: String,
+    pub provisional: bool,
+    pub topic_id: Option<String>,
+    pub organization_id: Option<String>,
+    pub task_id: Option<String>,
+    pub generated_at: i64,
+    pub ingested_at: chrono::DateTime<chrono::Utc>,
+    pub payload: sqlx::types::Json<Value>,
+    pub ingest_path: String,
+    pub source_cursor_or_seq: Option<i64>,
+}
+
+impl TryFrom<UiEventRow> for GatewayUiEvent {
+    type Error = anyhow::Error;
+
+    fn try_from(value: UiEventRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            cursor: value.cursor,
+            event_id: value.event_id,
+            node_id: value.node_id,
+            data_kind: serde_json::from_value::<DataKind>(Value::String(value.data_kind))?,
+            event_kind: value.event_kind,
+            visibility: serde_json::from_value::<Visibility>(Value::String(value.visibility))?,
+            provisional: value.provisional,
+            scope: EventScope {
+                node_id: None,
+                topic_id: value.topic_id,
+                organization_id: value.organization_id,
+                task_id: value.task_id,
+            },
+            generated_at: value.generated_at,
+            payload: value.payload.0,
+        })
+    }
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -169,10 +236,23 @@ impl From<GatewayRegistryDbRow> for GatewayRegistryEntry {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterNodeRequest {
     pub name: String,
-    pub export_url: String,
+    #[serde(default)]
+    pub export_url: Option<String>,
+    #[serde(default)]
+    pub wattetheria_snapshot_export_url: Option<String>,
+    #[serde(default)]
+    pub wattetheria_events_export_url: Option<String>,
+    #[serde(default)]
+    pub wattswarm_ui_base_url: Option<String>,
+    #[serde(default)]
+    pub wattswarm_sync_grpc_endpoint: Option<String>,
     pub region: Option<String>,
     #[serde(alias = "expected_signer_agent_id")]
     pub expected_signer_agent_did: Option<String>,
+    #[serde(default)]
+    pub expected_wattswarm_node_id: Option<String>,
+    #[serde(default)]
+    pub source_status: Option<SourceStatus>,
     #[serde(default)]
     pub transport_capabilities: Option<PeerTransportCapabilities>,
     #[serde(default)]
@@ -184,6 +264,7 @@ pub struct RegisterNodeResponse {
     pub source_id: Uuid,
     pub name: String,
     pub export_url: String,
+    pub source_status: SourceStatus,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -197,6 +278,9 @@ pub struct SyncResult {
     pub node_id: String,
     pub signer_agent_did: String,
     pub generated_at: i64,
+    pub sync_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wattswarm_collect_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

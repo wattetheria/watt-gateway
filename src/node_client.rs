@@ -1,6 +1,7 @@
 use crate::models::SignedPublicClientSnapshot;
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::de::DeserializeOwned;
 use std::path::Path;
 use std::time::Duration;
 use wattswarm_network_substrate::PeerId;
@@ -29,16 +30,7 @@ impl NodeClient {
         &self,
         export_url: &str,
     ) -> Result<SignedPublicClientSnapshot> {
-        self.client
-            .get(export_url)
-            .send()
-            .await
-            .context("request node export")?
-            .error_for_status()
-            .context("node export returned error status")?
-            .json::<SignedPublicClientSnapshot>()
-            .await
-            .context("parse signed client export")
+        self.fetch_json(export_url, None).await
     }
 
     pub async fn fetch_signed_snapshot_via_iroh(
@@ -62,5 +54,24 @@ impl NodeClient {
             },
         )?;
         serde_json::from_slice(&response.bytes).context("parse signed snapshot from iroh fetch")
+    }
+
+    pub async fn fetch_json<T>(&self, url: &str, query: Option<&[(&str, String)]>) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let mut request = self.client.get(url);
+        if let Some(query) = query {
+            request = request.query(query);
+        }
+        request
+            .send()
+            .await
+            .with_context(|| format!("request {url}"))?
+            .error_for_status()
+            .with_context(|| format!("request {url} returned error status"))?
+            .json::<T>()
+            .await
+            .with_context(|| format!("parse response from {url}"))
     }
 }

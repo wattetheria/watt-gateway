@@ -12,6 +12,9 @@ use std::process::Command;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use tower::util::ServiceExt;
+use wattetheria_gateway::contracts::{
+    DataKind, EventScope, NodeEventPayload, ProvisionalExportPolicy, SignedNodeEvent, Visibility,
+};
 use wattetheria_gateway::db::{self, UpsertSnapshotRecord};
 use wattetheria_gateway::gateway_identity::{GatewayIdentity, GatewayIdentityConfig};
 use wattetheria_gateway::gateway_network::{
@@ -77,6 +80,10 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
                 "body":"Relay stable",
                 "created_at":"2026-03-18T01:00:00Z"
             })],
+            swarm_task_activity: json!({
+                "generated_at": 1_710_000_000,
+                "tasks": [{"task_id":"task-1","terminal_state":"finalized"}]
+            }),
             tasks: &[json!({"id":"task-1","title":"Relay Repair"})],
             organizations: &[json!({"id":"org-1","name":"Aurora Guild"})],
             leaderboard: &[json!({"agent_did":"did:key:agent-1","score":9})],
@@ -231,6 +238,7 @@ async fn sync_rejects_invalid_signature_and_marks_source_invalid() {
             dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
+            swarm_task_activity: json!({}),
             tasks: &[json!({"id":"task-bad"})],
             organizations: &[],
             leaderboard: &[],
@@ -277,8 +285,14 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
             id: source_id,
             name: "source-a",
             export_url: "http://127.0.0.1:7777/v1/client/export",
+            wattetheria_snapshot_export_url: Some("http://127.0.0.1:7777/v1/client/export"),
+            wattetheria_events_export_url: None,
+            wattswarm_ui_base_url: None,
+            wattswarm_sync_grpc_endpoint: None,
             region: Some("test"),
             expected_signer_agent_did: None,
+            expected_wattswarm_node_id: None,
+            source_status: "active",
             transport_capabilities: None,
             transport_contact_material: None,
         },
@@ -375,6 +389,7 @@ async fn ingest_snapshot_accepts_push_without_registered_source() {
             public_topic_messages: &[
                 json!({"message_id":"msg-9","topic_id":"topic-9","body":"hello"}),
             ],
+            swarm_task_activity: json!({}),
             tasks: &[json!({"id":"task-9"})],
             organizations: &[json!({"id":"org-9"})],
             leaderboard: &[json!({"agent_did":"did:key:agent-9","score":99})],
@@ -435,6 +450,7 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
                 "body":"first",
                 "created_at":"2026-03-18T02:00:00Z"
             })],
+            swarm_task_activity: json!({}),
             tasks: &[],
             organizations: &[],
             leaderboard: &[],
@@ -483,6 +499,7 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
                     "created_at":"2026-03-18T03:00:00Z"
                 }),
             ],
+            swarm_task_activity: json!({}),
             tasks: &[],
             organizations: &[],
             leaderboard: &[],
@@ -550,6 +567,7 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
             dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
+            swarm_task_activity: json!({}),
             tasks: &[json!({"id":"task-new"})],
             organizations: &[],
             leaderboard: &[],
@@ -569,6 +587,7 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
             dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
+            swarm_task_activity: json!({}),
             tasks: &[json!({"id":"task-old"})],
             organizations: &[],
             leaderboard: &[],
@@ -597,6 +616,148 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1[0]["id"].as_str(), Some("task-new"));
 
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn suspended_registered_source_is_hidden_from_public_reads_and_rejects_push_ingest() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    let snapshot = signed_snapshot(
+        "node-suspend",
+        SnapshotContents {
+            network_name: Some("Watt Etheria"),
+            network_org_name: Some("Aether Prime"),
+            peers: &[json!({"id":"peer-hidden"})],
+            friend_relationships: &[],
+            pending_friend_requests: &[],
+            public_blocks: &[],
+            dm_threads: &[],
+            dm_messages: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[json!({"id":"task-hidden"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    let export_server = MockExportServer::spawn(snapshot.clone()).await;
+    let app = test_app(&db.database_url).await;
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/nodes/register",
+        json!({
+            "name": "suspended-node",
+            "export_url": export_server.export_url(),
+            "expected_signer_agent_did": snapshot.signer_agent_did,
+        }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+
+    let sync = request_json(&app, "POST", "/api/nodes/sync", json!({})).await;
+    assert_eq!(sync.0, StatusCode::OK);
+
+    let source_id = uuid::Uuid::parse_str(register.1["source_id"].as_str().unwrap()).unwrap();
+    sqlx::query("update node_sources set source_status = 'suspended' where id = $1")
+        .bind(source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let network_status = request(&app, "GET", "/api/network/status").await;
+    assert_eq!(network_status.0, StatusCode::OK);
+    assert_eq!(network_status.1["nodes"].as_u64(), Some(0));
+
+    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    assert_eq!(tasks.0, StatusCode::OK);
+    assert_eq!(tasks.1.as_array().unwrap().len(), 0);
+
+    let push_snapshot = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&snapshot).unwrap(),
+    )
+    .await;
+    assert_eq!(push_snapshot.0, StatusCode::CONFLICT);
+
+    let event = signed_node_event(
+        "node-suspend",
+        DataKind::TaskRoundUpdate,
+        "task.round.updated",
+        json!({"task_id":"task-hidden","round_id":"round-1"}),
+    );
+    let push_event = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(push_event.0, StatusCode::BAD_REQUEST);
+
+    drop(app);
+    export_server.abort();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn sync_nodes_reports_partial_when_wattswarm_collection_fails() {
+    let db = TestDatabase::new().await;
+    let snapshot = signed_snapshot(
+        "node-partial",
+        SnapshotContents {
+            network_name: Some("Watt Etheria"),
+            network_org_name: Some("Aether Prime"),
+            peers: &[],
+            friend_relationships: &[],
+            pending_friend_requests: &[],
+            public_blocks: &[],
+            dm_threads: &[],
+            dm_messages: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[json!({"id":"task-partial"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    let export_server = MockExportServer::spawn(snapshot.clone()).await;
+    let app = test_app(&db.database_url).await;
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/nodes/register",
+        json!({
+            "name": "partial-node",
+            "export_url": export_server.export_url(),
+            "expected_signer_agent_did": snapshot.signer_agent_did,
+            "wattswarm_ui_base_url": "http://127.0.0.1:9"
+        }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+
+    let sync = request_json(&app, "POST", "/api/nodes/sync", json!({})).await;
+    assert_eq!(sync.0, StatusCode::OK);
+    assert_eq!(sync.1.as_array().unwrap().len(), 1);
+    assert_eq!(sync.1[0]["node_id"].as_str(), Some("node-partial"));
+    assert_eq!(sync.1[0]["sync_status"].as_str(), Some("partial"));
+    assert!(sync.1[0]["wattswarm_collect_error"].as_str().is_some());
+
+    let nodes = request(&app, "GET", "/api/nodes").await;
+    assert_eq!(nodes.0, StatusCode::OK);
+    assert_eq!(nodes.1.as_array().unwrap().len(), 1);
+    assert_eq!(nodes.1[0]["last_sync_status"].as_str(), Some("partial"));
+
+    drop(app);
+    export_server.abort();
     db.cleanup().await;
 }
 
@@ -965,6 +1126,7 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
             dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
+            swarm_task_activity: json!({}),
             tasks: &[json!({"id":"task-iroh"})],
             organizations: &[],
             leaderboard: &[],
@@ -1036,6 +1198,7 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
 async fn test_app(database_url: &str) -> Router {
     let pool = db::connect(database_url).await.unwrap();
     db::init_schema(&pool).await.unwrap();
+    let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
     http::router(AppState {
         pool,
         node_client: NodeClient::new(5).unwrap(),
@@ -1045,12 +1208,14 @@ async fn test_app(database_url: &str) -> Router {
         bootstrap_registry_urls: Vec::new(),
         gateway_identity: None,
         gateway_network: None,
+        ui_stream_tx,
     })
 }
 
 async fn test_app_with_identity(database_url: &str) -> Router {
     let pool = db::connect(database_url).await.unwrap();
     db::init_schema(&pool).await.unwrap();
+    let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
     let gateway_identity = GatewayIdentity::from_config(GatewayIdentityConfig {
         gateway_id: Some("gw-self-1".to_string()),
         display_name: Some("Self Gateway".to_string()),
@@ -1073,6 +1238,7 @@ async fn test_app_with_identity(database_url: &str) -> Router {
         bootstrap_registry_urls: Vec::new(),
         gateway_identity,
         gateway_network: None,
+        ui_stream_tx,
     })
 }
 
@@ -1082,6 +1248,7 @@ async fn test_app_with_identity_and_bootstrap(
 ) -> Router {
     let pool = db::connect(database_url).await.unwrap();
     db::init_schema(&pool).await.unwrap();
+    let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
     let gateway_identity = GatewayIdentity::from_config(GatewayIdentityConfig {
         gateway_id: Some("gw-self-1".to_string()),
         display_name: Some("Self Gateway".to_string()),
@@ -1104,6 +1271,7 @@ async fn test_app_with_identity_and_bootstrap(
         bootstrap_registry_urls,
         gateway_identity,
         gateway_network: None,
+        ui_stream_tx,
     })
 }
 
@@ -1112,6 +1280,7 @@ async fn test_app_with_network(
 ) -> (Router, GatewayNetworkRuntime, GatewayNetworkHandle) {
     let pool = db::connect(database_url).await.unwrap();
     db::init_schema(&pool).await.unwrap();
+    let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
     let runtime = GatewayNetworkRuntime::new(
         GatewayNetworkNode::generate(wattetheria_gateway::config::GatewayP2pConfig {
             enabled: true,
@@ -1134,6 +1303,7 @@ async fn test_app_with_network(
         bootstrap_registry_urls: Vec::new(),
         gateway_identity: None,
         gateway_network: Some(gateway_network.clone()),
+        ui_stream_tx,
     });
     (app, runtime, gateway_network)
 }
@@ -1341,6 +1511,7 @@ struct SnapshotContents<'a> {
     dm_messages: &'a [Value],
     public_topics: &'a [Value],
     public_topic_messages: &'a [Value],
+    swarm_task_activity: Value,
     tasks: &'a [Value],
     organizations: &'a [Value],
     leaderboard: &'a [Value],
@@ -1386,6 +1557,7 @@ fn signed_snapshot_at(
         dm_messages: contents.dm_messages.to_vec(),
         public_topics: contents.public_topics.to_vec(),
         public_topic_messages: contents.public_topic_messages.to_vec(),
+        swarm_task_activity: contents.swarm_task_activity,
         tasks: contents.tasks.to_vec(),
         organizations: contents.organizations.to_vec(),
         leaderboard: contents.leaderboard.to_vec(),
@@ -1436,6 +1608,43 @@ fn signed_gateway_manifest(
             .to_bytes(),
     );
     SignedGatewayManifest { payload, signature }
+}
+
+fn signed_node_event(
+    node_id: &str,
+    data_kind: DataKind,
+    event_kind: &str,
+    payload: Value,
+) -> SignedNodeEvent {
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    let public_key =
+        base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+    let payload = NodeEventPayload {
+        event_id: format!("{node_id}:1"),
+        node_id: node_id.to_string(),
+        public_key: public_key.clone(),
+        signer_agent_did: did_key_from_public_key_b64(&public_key),
+        seq: 1,
+        timestamp: 1_710_000_000,
+        data_kind,
+        event_kind: event_kind.to_string(),
+        visibility: Visibility::Public,
+        provisional_policy: ProvisionalExportPolicy::ProvisionalWithDowngrade,
+        scope: EventScope {
+            node_id: Some(node_id.to_string()),
+            topic_id: None,
+            organization_id: None,
+            task_id: Some("task-hidden".to_string()),
+        },
+        identity_key: Some("task-hidden".to_string()),
+        payload,
+    };
+    let signature = base64::engine::general_purpose::STANDARD.encode(
+        signing_key
+            .sign(&canonical_bytes(&payload).unwrap())
+            .to_bytes(),
+    );
+    SignedNodeEvent { payload, signature }
 }
 
 fn did_key_from_public_key_b64(public_key_b64: &str) -> String {

@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    let (ui_stream_tx, _) = tokio::sync::broadcast::channel(512);
 
     let app_state = AppState {
         pool,
@@ -65,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         bootstrap_registry_urls: config.bootstrap_registry_urls,
         gateway_identity,
         gateway_network,
+        ui_stream_tx,
     };
     let app = http::router(app_state);
 

@@ -1,0 +1,466 @@
+use crate::contracts::{GatewayUiEvent, SignedNodeEvent, UiStreamQuery, allows_public_stream};
+use crate::db;
+use crate::http::ingest_signed_snapshot;
+use crate::state::AppState;
+use crate::verify::verify_signed_node_event;
+use anyhow::{Result, bail};
+use axum::Json;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use chrono::Utc;
+use serde_json::json;
+use uuid::Uuid;
+
+pub async fn ingest_node_event(
+    State(state): State<AppState>,
+    Json(event): Json<SignedNodeEvent>,
+) -> Response {
+    match persist_signed_node_event(&state, &event, None, None).await {
+        Ok(Some(cursor)) => Json(json!({
+            "status": "ok",
+            "event_id": event.payload.event_id,
+            "cursor": cursor,
+            "node_id": event.payload.node_id,
+            "data_kind": event.payload.data_kind,
+        }))
+        .into_response(),
+        Ok(None) => Json(json!({
+            "status": "duplicate",
+            "event_id": event.payload.event_id,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn stream(
+    State(state): State<AppState>,
+    Query(query): Query<UiStreamQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let allow_protected = query
+        .token
+        .as_deref()
+        .zip(state.registry_admin_token.as_deref())
+        .is_some_and(|(token, expected)| token == expected);
+    if query
+        .data_kind
+        .is_some_and(|kind| !allows_public_stream(kind) && !allow_protected)
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "protected stream kinds require an authorized token"})),
+        )
+            .into_response();
+    }
+    ws.on_upgrade(move |socket| handle_ws(socket, state, query, allow_protected))
+        .into_response()
+}
+
+pub async fn persist_signed_node_event(
+    state: &AppState,
+    event: &SignedNodeEvent,
+    source_id: Option<Uuid>,
+    expected_signer_agent_did: Option<&str>,
+) -> Result<Option<i64>> {
+    let resolved_source = if source_id.is_none() && expected_signer_agent_did.is_none() {
+        db::find_node_source_for_identity(
+            &state.pool,
+            &event.payload.node_id,
+            &event.payload.signer_agent_did,
+        )
+        .await?
+    } else {
+        None
+    };
+    if resolved_source
+        .as_ref()
+        .is_some_and(|source| source.source_status != "active")
+    {
+        bail!("source is not active for event push ingest");
+    }
+    let source_id = source_id.or_else(|| resolved_source.as_ref().map(|source| source.id));
+    let expected_signer_agent_did = expected_signer_agent_did.or_else(|| {
+        resolved_source
+            .as_ref()
+            .and_then(|source| source.expected_signer_agent_did.as_deref())
+    });
+    verify_signed_node_event(event, expected_signer_agent_did)?;
+    if let Some(last_seq) =
+        db::max_ui_event_source_seq(&state.pool, &event.payload.node_id, source_id).await?
+        && i64::try_from(event.payload.seq)
+            .ok()
+            .is_some_and(|current_seq| current_seq > last_seq + 1)
+    {
+        try_backfill_gap(
+            state,
+            resolved_source.as_ref(),
+            &event.payload.node_id,
+            expected_signer_agent_did,
+            last_seq + 1,
+            event.payload.seq.saturating_sub(1),
+        )
+        .await;
+    }
+    let data_kind = serde_json::to_string(&event.payload.data_kind)?
+        .trim_matches('"')
+        .to_string();
+    let visibility = serde_json::to_string(&event.payload.visibility)?
+        .trim_matches('"')
+        .to_string();
+    let inserted = db::insert_ui_event(
+        &state.pool,
+        db::InsertUiEventRecord {
+            event_id: &event.payload.event_id,
+            source_id,
+            node_id: &event.payload.node_id,
+            signer_agent_did: &event.payload.signer_agent_did,
+            data_kind: &data_kind,
+            event_kind: &event.payload.event_kind,
+            visibility: &visibility,
+            provisional: !matches!(
+                event.payload.provisional_policy,
+                crate::contracts::ProvisionalExportPolicy::NeverBeforeConfirmation
+            ),
+            topic_id: event.payload.scope.topic_id.as_deref(),
+            organization_id: event.payload.scope.organization_id.as_deref(),
+            task_id: event.payload.scope.task_id.as_deref(),
+            generated_at: event.payload.timestamp,
+            payload: &event.payload.payload,
+            ingest_path: "event_push",
+            source_cursor_or_seq: i64::try_from(event.payload.seq).ok(),
+        },
+    )
+    .await?;
+    let Some(row) = inserted else {
+        return Ok(None);
+    };
+    let ui_event = GatewayUiEvent::try_from(row.clone())?;
+    state.publish_ui_event(ui_event);
+    let bus_event = json!({
+        "event": "gateway.event.ingested",
+        "cursor": row.cursor,
+        "event_id": row.event_id,
+        "node_id": row.node_id,
+        "data_kind": row.data_kind,
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+    let _ = state
+        .publish_event("gateway.event.ingested", &bus_event)
+        .await;
+    Ok(Some(row.cursor))
+}
+
+async fn try_backfill_gap(
+    state: &AppState,
+    source: Option<&crate::models::NodeSourceRow>,
+    node_id: &str,
+    expected_signer_agent_did: Option<&str>,
+    missing_from_seq: i64,
+    missing_to_seq: u64,
+) {
+    let Some(source) = source else {
+        return;
+    };
+    let snapshot_url = source
+        .wattetheria_snapshot_export_url
+        .as_deref()
+        .unwrap_or(&source.export_url);
+    let outcome = async {
+        let snapshot = state
+            .node_client
+            .fetch_signed_snapshot(snapshot_url)
+            .await?;
+        ingest_signed_snapshot(state, &snapshot, Some(source.id), expected_signer_agent_did).await
+    }
+    .await;
+    let subject = match outcome.as_ref() {
+        Ok(true) => "gateway.event.gap_snapshot_refresh_applied",
+        Ok(false) => "gateway.event.gap_snapshot_refresh_skipped",
+        Err(_) => "gateway.event.gap_snapshot_refresh_failed",
+    };
+    let payload = json!({
+        "event": subject,
+        "source_id": source.id,
+        "node_id": node_id,
+        "missing_from_seq": missing_from_seq,
+        "missing_to_seq": missing_to_seq,
+        "snapshot_url": snapshot_url,
+        "timestamp": Utc::now().to_rfc3339(),
+        "error": outcome.as_ref().err().map(|error| error.to_string()),
+    });
+    let audit_payload = json!({
+        "node_id": node_id,
+        "missing_from_seq": missing_from_seq,
+        "missing_to_seq": missing_to_seq,
+        "snapshot_url": snapshot_url,
+    });
+    let _ = db::insert_audit_record(
+        &state.pool,
+        db::InsertAuditRecord {
+            record_kind: subject,
+            data_kind: None,
+            identity_key: Some(node_id),
+            source_id: Some(source.id),
+            source_node_id: Some(node_id),
+            generated_at: None,
+            ingest_path: "gap_snapshot_refresh",
+            payload: &audit_payload,
+            provenance: &payload,
+        },
+    )
+    .await;
+    let _ = state.publish_event(subject, &payload).await;
+    let _ = db::update_source_sync_status(
+        &state.pool,
+        source.id,
+        match outcome.as_ref() {
+            Ok(true) => "gap_snapshot_refresh",
+            Ok(false) => "gap_snapshot_refresh_skipped",
+            Err(_) => "gap_snapshot_refresh_error",
+        },
+        payload["error"].as_str(),
+    )
+    .await;
+}
+
+async fn handle_ws(
+    mut socket: WebSocket,
+    state: AppState,
+    query: UiStreamQuery,
+    allow_protected: bool,
+) {
+    let mut receiver = state.ui_stream_tx.subscribe();
+    let earliest_available_cursor = db::earliest_ui_event_cursor(&state.pool)
+        .await
+        .ok()
+        .flatten();
+    let resume_rejection_reason = resume_rejection_reason(query.cursor, earliest_available_cursor);
+    let hello = json!({
+        "kind": "hello",
+        "timestamp": Utc::now().timestamp(),
+        "cursor": query.cursor.unwrap_or_default(),
+        "earliest_available_cursor": earliest_available_cursor,
+        "replay_supported": true,
+        "requires_client_cursor": true,
+        "resume_cursor_owner": "client",
+        "replay_persisted_across_restart": true,
+        "bootstrap_contract": "rest_snapshot_then_ws_then_cursor_resume",
+        "retry_backoff_ms": {
+            "min": 500,
+            "max": 10000,
+        },
+        "rebootstrap_required_when": "cursor_missing_or_server_rejects_resume",
+        "auth_mode": if allow_protected { "authorized" } else { "public_only" },
+    });
+    if socket
+        .send(Message::Text(hello.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    if let Some(reason) = resume_rejection_reason {
+        let rejection = json!({
+            "kind": "resume_rejected",
+            "reason": reason,
+            "requested_cursor": query.cursor,
+            "earliest_available_cursor": earliest_available_cursor,
+            "rebootstrap_required": true,
+        });
+        let _ = socket
+            .send(Message::Text(rejection.to_string().into()))
+            .await;
+        return;
+    }
+
+    if let Ok(rows) = db::list_ui_events_after(
+        &state.pool,
+        db::ListUiEventsQuery {
+            cursor: query.cursor.unwrap_or_default(),
+            data_kind: query
+                .data_kind
+                .as_ref()
+                .map(|kind| serde_json::to_string(kind).unwrap_or_default())
+                .as_deref()
+                .map(|value| value.trim_matches('"'))
+                .filter(|value| !value.is_empty()),
+            node_id: query.node_id.as_deref(),
+            topic_id: query.topic_id.as_deref(),
+            organization_id: query.organization_id.as_deref(),
+            task_id: query.task_id.as_deref(),
+            limit: query.limit.unwrap_or(200) as i64,
+        },
+    )
+    .await
+    {
+        for row in rows {
+            let Ok(event) = GatewayUiEvent::try_from(row) else {
+                continue;
+            };
+            if event_matches_query(&event, &query, allow_protected)
+                && socket
+                    .send(Message::Text(
+                        serde_json::to_string(&event).unwrap_or_default().into(),
+                    ))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    while let Ok(event) = receiver.recv().await {
+        if !event_matches_query(&event, &query, allow_protected) {
+            continue;
+        }
+        let Ok(payload) = serde_json::to_string(&event) else {
+            continue;
+        };
+        if socket.send(Message::Text(payload.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn event_matches_query(
+    event: &GatewayUiEvent,
+    query: &UiStreamQuery,
+    allow_protected: bool,
+) -> bool {
+    if !allow_protected && !allows_public_stream(event.data_kind) {
+        return false;
+    }
+    if query.data_kind.is_some_and(|kind| kind != event.data_kind) {
+        return false;
+    }
+    if query
+        .node_id
+        .as_deref()
+        .is_some_and(|expected| event.node_id != expected)
+    {
+        return false;
+    }
+    if query
+        .topic_id
+        .as_deref()
+        .is_some_and(|expected| event.scope.topic_id.as_deref() != Some(expected))
+    {
+        return false;
+    }
+    if query
+        .organization_id
+        .as_deref()
+        .is_some_and(|expected| event.scope.organization_id.as_deref() != Some(expected))
+    {
+        return false;
+    }
+    if query
+        .task_id
+        .as_deref()
+        .is_some_and(|expected| event.scope.task_id.as_deref() != Some(expected))
+    {
+        return false;
+    }
+    true
+}
+
+fn resume_rejection_reason(
+    requested_cursor: Option<i64>,
+    earliest_available_cursor: Option<i64>,
+) -> Option<&'static str> {
+    match (requested_cursor, earliest_available_cursor) {
+        (Some(requested), Some(earliest)) if requested > 0 && requested < earliest => {
+            Some("cursor_aged_out")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::{
+        DataKind, EventScope, ProvisionalExportPolicy, UiStreamQuery, Visibility,
+    };
+
+    fn sample_event(data_kind: DataKind) -> GatewayUiEvent {
+        GatewayUiEvent {
+            cursor: 1,
+            event_id: "evt-1".to_string(),
+            node_id: "node-a".to_string(),
+            data_kind,
+            event_kind: "topic.message.posted".to_string(),
+            visibility: Visibility::Public,
+            provisional: matches!(
+                ProvisionalExportPolicy::ProvisionalWithDowngrade,
+                ProvisionalExportPolicy::ProvisionalWithDowngrade
+            ),
+            scope: EventScope {
+                node_id: Some("node-a".to_string()),
+                topic_id: Some("topic-1".to_string()),
+                organization_id: None,
+                task_id: None,
+            },
+            generated_at: 1,
+            payload: json!({"topic_id":"topic-1"}),
+        }
+    }
+
+    #[test]
+    fn protected_kinds_are_filtered_without_token() {
+        let query = UiStreamQuery {
+            token: None,
+            cursor: None,
+            limit: None,
+            data_kind: None,
+            node_id: None,
+            topic_id: None,
+            organization_id: None,
+            task_id: None,
+        };
+        assert!(!event_matches_query(
+            &sample_event(DataKind::DmSummary),
+            &query,
+            false
+        ));
+    }
+
+    #[test]
+    fn query_filters_by_topic_id() {
+        let query = UiStreamQuery {
+            token: None,
+            cursor: None,
+            limit: None,
+            data_kind: Some(DataKind::HiveActivity),
+            node_id: None,
+            topic_id: Some("topic-1".to_string()),
+            organization_id: None,
+            task_id: None,
+        };
+        assert!(event_matches_query(
+            &sample_event(DataKind::HiveActivity),
+            &query,
+            false
+        ));
+    }
+
+    #[test]
+    fn resume_is_rejected_when_requested_cursor_aged_out() {
+        assert_eq!(
+            resume_rejection_reason(Some(4), Some(10)),
+            Some("cursor_aged_out")
+        );
+        assert_eq!(resume_rejection_reason(Some(10), Some(10)), None);
+        assert_eq!(resume_rejection_reason(Some(12), Some(10)), None);
+        assert_eq!(resume_rejection_reason(None, Some(10)), None);
+    }
+}

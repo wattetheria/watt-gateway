@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 async-nats = "0.39"
-axum = { version = "0.8", features = ["json"] }
+axum = { version = "0.8", features = ["json", "ws"] }
 base64 = "0.22"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }
 watt-did = { path = "../watt-did" }
 wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }
 wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }
