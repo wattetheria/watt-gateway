@@ -114,6 +114,28 @@ pub async fn persist_signed_node_event(
     let visibility = serde_json::to_string(&event.payload.visibility)?
         .trim_matches('"')
         .to_string();
+    let provisional = !matches!(
+        event.payload.provisional_policy,
+        crate::contracts::ProvisionalExportPolicy::NeverBeforeConfirmation
+    );
+    if matches!(
+        event.payload.provisional_policy,
+        crate::contracts::ProvisionalExportPolicy::EphemeralOnly
+    ) {
+        state.publish_ui_event(GatewayUiEvent {
+            cursor: 0,
+            event_id: event.payload.event_id.clone(),
+            node_id: event.payload.node_id.clone(),
+            data_kind: event.payload.data_kind,
+            event_kind: event.payload.event_kind.clone(),
+            visibility: event.payload.visibility,
+            provisional,
+            scope: event.payload.scope.clone(),
+            generated_at: event.payload.timestamp,
+            payload: event.payload.payload.clone(),
+        });
+        return Ok(None);
+    }
     let inserted = db::insert_ui_event(
         &state.pool,
         db::InsertUiEventRecord {
@@ -124,10 +146,7 @@ pub async fn persist_signed_node_event(
             data_kind: &data_kind,
             event_kind: &event.payload.event_kind,
             visibility: &visibility,
-            provisional: !matches!(
-                event.payload.provisional_policy,
-                crate::contracts::ProvisionalExportPolicy::NeverBeforeConfirmation
-            ),
+            provisional,
             topic_id: event.payload.scope.topic_id.as_deref(),
             organization_id: event.payload.scope.organization_id.as_deref(),
             task_id: event.payload.scope.task_id.as_deref(),
@@ -388,9 +407,7 @@ fn resume_rejection_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{
-        DataKind, EventScope, ProvisionalExportPolicy, UiStreamQuery, Visibility,
-    };
+    use crate::contracts::{DataKind, EventScope, UiStreamQuery, Visibility};
 
     fn sample_event(data_kind: DataKind) -> GatewayUiEvent {
         GatewayUiEvent {
@@ -400,10 +417,7 @@ mod tests {
             data_kind,
             event_kind: "topic.message.posted".to_string(),
             visibility: Visibility::Public,
-            provisional: matches!(
-                ProvisionalExportPolicy::ProvisionalWithDowngrade,
-                ProvisionalExportPolicy::ProvisionalWithDowngrade
-            ),
+            provisional: true,
             scope: EventScope {
                 node_id: Some("node-a".to_string()),
                 topic_id: Some("topic-1".to_string()),

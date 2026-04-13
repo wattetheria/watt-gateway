@@ -706,6 +706,115 @@ async fn suspended_registered_source_is_hidden_from_public_reads_and_rejects_pus
 }
 
 #[tokio::test]
+async fn find_node_source_returns_first_match_when_multiple_sources_match_identity() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+
+    db::insert_node_source(
+        &pool,
+        db::InsertNodeSourceRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "first-match",
+            export_url: "https://first.example/export",
+            wattetheria_snapshot_export_url: None,
+            wattetheria_events_export_url: None,
+            wattswarm_ui_base_url: None,
+            wattswarm_sync_grpc_endpoint: None,
+            region: None,
+            expected_signer_agent_did: Some("did:key:shared"),
+            expected_wattswarm_node_id: Some("node-shared"),
+            source_status: "active",
+            transport_capabilities: None,
+            transport_contact_material: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_node_source(
+        &pool,
+        db::InsertNodeSourceRecord {
+            id: uuid::Uuid::new_v4(),
+            name: "second-match",
+            export_url: "https://second.example/export",
+            wattetheria_snapshot_export_url: None,
+            wattetheria_events_export_url: None,
+            wattswarm_ui_base_url: None,
+            wattswarm_sync_grpc_endpoint: None,
+            region: None,
+            expected_signer_agent_did: Some("did:key:shared"),
+            expected_wattswarm_node_id: Some("node-shared"),
+            source_status: "active",
+            transport_capabilities: None,
+            transport_contact_material: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let source = db::find_node_source_for_identity(&pool, "node-shared", "did:key:shared")
+        .await
+        .unwrap()
+        .expect("source should resolve");
+    assert_eq!(source.name, "first-match");
+
+    drop(pool);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn ephemeral_only_events_are_streamed_without_persisting_ui_rows() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let (ui_stream_tx, mut ui_stream_rx) = tokio::sync::broadcast::channel(64);
+    let state = AppState {
+        pool: pool.clone(),
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity: None,
+        gateway_network: None,
+        ui_stream_tx,
+    };
+
+    let mut event = signed_node_event(
+        "node-ephemeral",
+        DataKind::HiveMessagePosted,
+        "topic.message.posted",
+        json!({"topic_id":"topic-ephemeral","body":"transient"}),
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::EphemeralOnly;
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    event.signature = base64::engine::general_purpose::STANDARD.encode(
+        signing_key
+            .sign(&canonical_bytes(&event.payload).unwrap())
+            .to_bytes(),
+    );
+
+    let cursor =
+        wattetheria_gateway::streaming::persist_signed_node_event(&state, &event, None, None)
+            .await
+            .unwrap();
+    assert_eq!(cursor, None);
+
+    let streamed = ui_stream_rx.recv().await.unwrap();
+    assert_eq!(streamed.event_id, event.payload.event_id);
+    assert_eq!(streamed.cursor, 0);
+
+    let persisted_count: i64 = sqlx::query_scalar("select count(*) from gateway_ui_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(persisted_count, 0);
+
+    drop(pool);
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn sync_nodes_reports_partial_when_wattswarm_collection_fails() {
     let db = TestDatabase::new().await;
     let snapshot = signed_snapshot(

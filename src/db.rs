@@ -616,10 +616,7 @@ pub async fn find_node_source_for_identity(
     .bind(node_id)
     .fetch_all(pool)
     .await?;
-    match matches.as_slice() {
-        [row] => Ok(Some(row.clone())),
-        _ => Ok(None),
-    }
+    Ok(matches.first().cloned())
 }
 
 pub async fn update_source_sync_status(
