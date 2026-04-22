@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      secrets:
+        - github_token
     environment:
       WATTETHERIA_GATEWAY_BIND: 0.0.0.0:8080
       WATTETHERIA_GATEWAY_DATABASE_URL: postgres://postgres:postgres@postgres:5432/wattetheria_gateway
@@ -45,3 +47,7 @@ services:
 
 volumes:
   gateway-postgres-data:
+
+secrets:
+  github_token:
+    environment: GITHUB_TOKEN
