@@ -124,6 +124,63 @@ pub async fn tasks(State(state): State<AppState>, Query(query): Query<ListQuery>
     aggregate_projection_endpoint(&state, query.limit.unwrap_or(200), DataKind::TaskSummary).await
 }
 
+pub async fn task_activity(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    match db::list_visible_snapshots(&state.pool).await {
+        Ok(rows) => {
+            let limit = query.limit.unwrap_or(200);
+            let mut tasks = Vec::new();
+            let mut runs = Vec::new();
+            for row in rows {
+                let generated_at = row.payload.0["swarm_task_activity"]["generated_at"]
+                    .as_i64()
+                    .unwrap_or(row.generated_at);
+                if let Some(entries) = row.payload.0["swarm_task_activity"]["tasks"].as_array() {
+                    tasks.extend(entries.iter().cloned().map(|value| {
+                        attach_source(
+                            attach_snapshot_generated_at(value, generated_at),
+                            row.node_id.clone(),
+                        )
+                    }));
+                }
+                if let Some(entries) = row.payload.0["swarm_task_activity"]["runs"].as_array() {
+                    runs.extend(entries.iter().cloned().map(|value| {
+                        attach_source(
+                            attach_snapshot_generated_at(value, generated_at),
+                            row.node_id.clone(),
+                        )
+                    }));
+                }
+            }
+            sort_values_desc_by_timestamp_with_fallback(
+                &mut tasks,
+                &["updated_at", "created_at", "snapshot_generated_at"],
+            );
+            sort_values_desc_by_timestamp_with_fallback(
+                &mut runs,
+                &["updated_at", "created_at", "snapshot_generated_at"],
+            );
+            dedupe_values_by_key(&mut tasks, task_activity_task_identity_key);
+            dedupe_values_by_key(&mut runs, task_activity_run_identity_key);
+            tasks.truncate(limit);
+            runs.truncate(limit);
+            axum::Json(json!({
+                "generated_at": db::now_rfc3339(),
+                "tasks": tasks,
+                "runs": runs,
+            }))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn friend_relationships(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
@@ -333,6 +390,18 @@ fn attach_source(mut value: Value, source_node_id: String) -> Value {
     value
 }
 
+fn attach_snapshot_generated_at(mut value: Value, generated_at: i64) -> Value {
+    if let Some(object) = value.as_object_mut()
+        && !object.contains_key("snapshot_generated_at")
+    {
+        object.insert(
+            "snapshot_generated_at".to_string(),
+            Value::Number(generated_at.into()),
+        );
+    }
+    value
+}
+
 fn matches_topic_filters(value: &Value, query: &TopicQuery) -> bool {
     matches_optional_string_filter(value, &["topic_id", "id"], query.topic_id.as_deref())
         && matches_optional_string_filter(
@@ -472,6 +541,25 @@ fn dm_message_identity_key(value: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         Some(format!("{thread_id}:{direction}:{created_at}"))
+    })
+}
+
+fn task_activity_task_identity_key(value: &Value) -> Option<String> {
+    topic_key_from_value(value, &["task_id", "id"])
+}
+
+fn task_activity_run_identity_key(value: &Value) -> Option<String> {
+    topic_key_from_value(value, &["run_id", "id"]).or_else(|| {
+        let task_id = value
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let updated_at = timestamp_with_fallback(value, &["updated_at", "created_at"]);
+        Some(format!("{task_id}:{status}:{updated_at}"))
     })
 }
 

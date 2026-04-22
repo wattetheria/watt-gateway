@@ -82,7 +82,13 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
             })],
             swarm_task_activity: json!({
                 "generated_at": 1_710_000_000,
-                "tasks": [{"task_id":"task-1","terminal_state":"finalized"}]
+                "tasks": [{"task_id":"task-1","terminal_state":"finalized"}],
+                "runs": [{
+                    "run_id":"run-1",
+                    "task_id":"task-1",
+                    "status":"QUEUED",
+                    "updated_at":"2026-03-18T01:03:00Z"
+                }]
             }),
             tasks: &[json!({"id":"task-1","title":"Relay Repair"})],
             organizations: &[json!({"id":"org-1","name":"Aurora Guild"})],
@@ -208,6 +214,16 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["source_node_id"].as_str(), Some("node-alpha"));
+
+    let task_activity = request(&app, "GET", "/api/task-activity?limit=10").await;
+    assert_eq!(task_activity.0, StatusCode::OK);
+    assert_eq!(task_activity.1["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(task_activity.1["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        task_activity.1["tasks"][0]["task_id"].as_str(),
+        Some("task-1")
+    );
+    assert_eq!(task_activity.1["runs"][0]["run_id"].as_str(), Some("run-1"));
 
     let organizations = request(&app, "GET", "/api/organizations?limit=10").await;
     assert_eq!(organizations.0, StatusCode::OK);

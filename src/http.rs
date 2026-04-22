@@ -65,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dm/threads", get(crate::public_api::dm_threads))
         .route("/api/dm/messages", get(crate::public_api::dm_messages))
         .route("/api/tasks", get(crate::public_api::tasks))
+        .route("/api/task-activity", get(crate::public_api::task_activity))
         .route("/api/organizations", get(crate::public_api::organizations))
         .route("/api/leaderboard", get(crate::public_api::leaderboard))
         .with_state(state)
