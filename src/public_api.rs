@@ -110,28 +110,118 @@ pub async fn network_nodes(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    match projection_values(&state, DataKind::NetworkProjection).await {
-        Ok(mut values) => {
-            sort_values_desc_by_timestamp_with_fallback(&mut values, &["snapshot_generated_at"]);
-            values.retain(has_valid_geo);
-            if let Some(limit) = query.limit {
-                values.truncate(limit);
-            }
-            axum::Json(values).into_response()
+    let mut values = match projection_values(&state, DataKind::NetworkProjection).await {
+        Ok(values) => values,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
         }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
+    };
+    let rows = match db::list_visible_snapshots(&state.pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    for row in rows {
+        values.extend(snapshot_geo_nodes(
+            &row.payload.0,
+            &row.node_id,
+            row.generated_at.timestamp(),
+        ));
     }
+    sort_values_desc_by_timestamp_with_fallback(&mut values, &["snapshot_generated_at"]);
+    values.retain(has_valid_geo);
+    dedupe_nodes_by_id(&mut values);
+    if let Some(limit) = query.limit {
+        values.truncate(limit);
+    }
+    axum::Json(values).into_response()
 }
 
 fn has_valid_geo(value: &Value) -> bool {
-    let latitude = value.get("latitude").and_then(Value::as_f64);
-    let longitude = value.get("longitude").and_then(Value::as_f64);
+    let Some((latitude, longitude)) = geo_pair(value) else {
+        return false;
+    };
     matches!(latitude, Some(value) if (-90.0..=90.0).contains(&value))
         && matches!(longitude, Some(value) if (-180.0..=180.0).contains(&value))
+}
+
+fn geo_pair(value: &Value) -> Option<(Option<f64>, Option<f64>)> {
+    let latitude = value
+        .get("latitude")
+        .or_else(|| value.get("lat"))
+        .and_then(Value::as_f64);
+    let longitude = value
+        .get("longitude")
+        .or_else(|| value.get("lng"))
+        .or_else(|| value.get("lon"))
+        .and_then(Value::as_f64);
+    Some((latitude, longitude))
+}
+
+fn snapshot_geo_nodes(payload: &Value, source_node_id: &str, generated_at: i64) -> Vec<Value> {
+    let mut nodes = Vec::new();
+    if let Some(operator) = payload.get("operator") {
+        nodes.push(snapshot_geo_node(
+            operator.clone(),
+            source_node_id,
+            source_node_id,
+            generated_at,
+        ));
+    }
+    if let Some(peers) = payload.get("peers").and_then(Value::as_array) {
+        nodes.extend(peers.iter().cloned().map(|peer| {
+            let id = peer
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(source_node_id)
+                .to_string();
+            snapshot_geo_node(peer, &id, source_node_id, generated_at)
+        }));
+    }
+    nodes
+}
+
+fn snapshot_geo_node(
+    mut value: Value,
+    node_id: &str,
+    source_node_id: &str,
+    generated_at: i64,
+) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("node_id")
+            .or_insert_with(|| Value::String(node_id.to_string()));
+        object
+            .entry("source_node_id")
+            .or_insert_with(|| Value::String(source_node_id.to_string()));
+        object
+            .entry("snapshot_generated_at")
+            .or_insert_with(|| Value::Number(generated_at.into()));
+    }
+    value
+}
+
+fn dedupe_nodes_by_id(values: &mut Vec<Value>) {
+    let mut seen = std::collections::HashSet::new();
+    values.retain(|value| {
+        let id = value
+            .get("node_id")
+            .or_else(|| value.get("id"))
+            .or_else(|| value.get("source_node_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        !id.is_empty() && seen.insert(id)
+    });
 }
 
 pub async fn public_topics(
@@ -164,7 +254,7 @@ pub async fn task_activity(
             for row in rows {
                 let generated_at = row.payload.0["swarm_task_activity"]["generated_at"]
                     .as_i64()
-                    .unwrap_or(row.generated_at);
+                    .unwrap_or_else(|| row.generated_at.timestamp());
                 if let Some(entries) = row.payload.0["swarm_task_activity"]["tasks"].as_array() {
                     tasks.extend(entries.iter().cloned().map(|value| {
                         attach_source(
@@ -642,6 +732,7 @@ fn single_shared_string(snapshots: &[&Value], key: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::has_valid_geo;
+    use super::snapshot_geo_nodes;
     use serde_json::json;
 
     #[test]
@@ -654,5 +745,31 @@ mod tests {
         ));
         assert!(!has_valid_geo(&json!({"latitude": 37.7749})));
         assert!(!has_valid_geo(&json!({"longitude": -122.4194})));
+    }
+
+    #[test]
+    fn snapshot_geo_nodes_includes_operator_and_peers() {
+        let payload = json!({
+            "operator": {
+                "id": "citizen-node",
+                "lat": -33.8399,
+                "lng": 151.0583,
+                "status": "online"
+            },
+            "peers": [{
+                "id": "peer-1",
+                "lat": -30.8491,
+                "lng": -77.3826,
+                "status": "online"
+            }]
+        });
+
+        let nodes = snapshot_geo_nodes(&payload, "did:key:z6Local", 1777098979);
+
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.iter().all(has_valid_geo));
+        assert_eq!(nodes[0]["node_id"].as_str(), Some("did:key:z6Local"));
+        assert_eq!(nodes[1]["node_id"].as_str(), Some("peer-1"));
+        assert_eq!(nodes[1]["source_node_id"].as_str(), Some("did:key:z6Local"));
     }
 }

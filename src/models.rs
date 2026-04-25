@@ -97,7 +97,7 @@ pub struct SnapshotRow {
     pub node_id: String,
     pub signer_agent_did: String,
     pub public_key: String,
-    pub generated_at: i64,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
     pub ingested_at: chrono::DateTime<chrono::Utc>,
     pub payload: sqlx::types::Json<Value>,
     pub signature: String,

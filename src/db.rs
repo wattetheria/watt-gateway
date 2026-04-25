@@ -347,11 +347,33 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             source_id uuid null references node_sources(id) on delete set null,
             signer_agent_did text not null,
             public_key text not null,
-            generated_at bigint not null,
+            generated_at timestamptz not null,
             ingested_at timestamptz not null default now(),
             payload jsonb not null,
             signature text not null
         );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        do $$
+        begin
+            if exists (
+                select 1
+                from information_schema.columns
+                where table_name = 'node_snapshots'
+                  and column_name = 'generated_at'
+                  and data_type = 'bigint'
+            ) then
+                alter table node_snapshots
+                alter column generated_at type timestamptz
+                using to_timestamp(generated_at::double precision);
+            end if;
+        end
+        $$;
         "#,
     )
     .execute(pool)
@@ -650,7 +672,7 @@ pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) ->
         insert into node_snapshots (
             node_id, source_id, signer_agent_did, public_key, generated_at, ingested_at, payload, signature
         )
-        values ($1, $2, $3, $4, $5, now(), $6, $7)
+        values ($1, $2, $3, $4, to_timestamp($5::double precision), now(), $6, $7)
         on conflict (node_id) do update
         set
             source_id = coalesce(excluded.source_id, node_snapshots.source_id),

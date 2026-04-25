@@ -376,7 +376,7 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
 
     let snapshots = db::list_snapshots(&pool).await.unwrap();
     assert_eq!(snapshots.len(), 1);
-    assert_eq!(snapshots[0].generated_at, 2);
+    assert_eq!(snapshots[0].generated_at.timestamp(), 2);
     assert_eq!(snapshots[0].signature, "sig-2");
     assert_eq!(
         snapshots[0].payload.0["tasks"][0]["id"].as_str(),
