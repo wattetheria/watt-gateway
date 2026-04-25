@@ -800,25 +800,6 @@ pub async fn upsert_projection_row(
     .bind(sqlx::types::Json(record.provenance))
     .execute(pool)
     .await?;
-    insert_audit_record(
-        pool,
-        InsertAuditRecord {
-            record_kind: "projection_upsert",
-            data_kind: Some(record.data_kind),
-            identity_key: Some(record.identity_key),
-            source_id: record.source_id,
-            source_node_id: Some(record.source_node_id),
-            generated_at: Some(record.generated_at),
-            ingest_path: record
-                .provenance
-                .get("ingest_path")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown"),
-            payload: record.payload,
-            provenance: record.provenance,
-        },
-    )
-    .await?;
     Ok(())
 }
 

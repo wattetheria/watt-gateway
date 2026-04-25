@@ -15,7 +15,7 @@ use tower::util::ServiceExt;
 use wattetheria_gateway::contracts::{
     DataKind, EventScope, NodeEventPayload, ProvisionalExportPolicy, SignedNodeEvent, Visibility,
 };
-use wattetheria_gateway::db::{self, UpsertSnapshotRecord};
+use wattetheria_gateway::db::{self, UpsertProjectionRecord, UpsertSnapshotRecord};
 use wattetheria_gateway::gateway_identity::{GatewayIdentity, GatewayIdentityConfig};
 use wattetheria_gateway::gateway_network::{
     self, GatewayNetworkHandle, GatewayNetworkNode, GatewayNetworkRuntime,
@@ -382,6 +382,41 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
         snapshots[0].payload.0["tasks"][0]["id"].as_str(),
         Some("task-2")
     );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn upsert_projection_row_does_not_write_ingest_audit() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let payload = json!({"node_id": "node-a", "network_status": {"total_nodes": 1}});
+    let provenance = json!({"ingest_path": "snapshot_push"});
+    db::upsert_projection_row(
+        &pool,
+        UpsertProjectionRecord {
+            data_kind: "network_projection",
+            identity_key: "node-a",
+            source_node_id: "node-a",
+            source_id: None,
+            generated_at: 1_710_000_000,
+            visibility: "public",
+            payload: &payload,
+            provenance: &provenance,
+        },
+    )
+    .await
+    .unwrap();
+
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from gateway_ingest_audit where record_kind = $1")
+            .bind("projection_upsert")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
 
     db.cleanup().await;
 }
