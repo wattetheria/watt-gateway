@@ -18,9 +18,9 @@ pub struct PublicClientSnapshot {
     pub generated_at: i64,
     pub node_id: String,
     pub public_key: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_org_name: Option<String>,
     pub network_status: Value,
     pub peers: Vec<Value>,

@@ -223,6 +223,45 @@ mod tests {
     }
 
     #[test]
+    fn signed_snapshot_verifies_when_optional_network_names_are_absent() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let public_key = STANDARD.encode(signing_key.verifying_key().as_bytes());
+        let payload_json = json!({
+            "generated_at": 1_710_000_000,
+            "node_id": did_key_from_public_key_b64(&public_key),
+            "public_key": public_key,
+            "network_status": {"total_nodes": 1, "active_nodes": 1, "health_percent": 100, "avg_latency_ms": 0},
+            "peers": [],
+            "operator": {"id": "agent-root", "display_name": "Agent Root"},
+            "rpc_logs": [],
+            "friend_relationships": [],
+            "pending_friend_requests": [],
+            "public_blocks": [],
+            "dm_threads": [],
+            "dm_messages": [],
+            "public_topics": [],
+            "public_topic_messages": [],
+            "swarm_task_activity": {},
+            "tasks": [],
+            "organizations": [],
+            "leaderboard": []
+        });
+        let signature = STANDARD.encode(
+            signing_key
+                .sign(&canonical_bytes(&payload_json).unwrap())
+                .to_bytes(),
+        );
+        let snapshot_json = json!({
+            "payload": payload_json,
+            "signature": signature,
+            "signer_agent_did": did_key_from_public_key_b64(&public_key)
+        });
+        let snapshot: SignedPublicClientSnapshot = serde_json::from_value(snapshot_json).unwrap();
+
+        verify_signed_snapshot(&snapshot, None).unwrap();
+    }
+
+    #[test]
     fn signed_gateway_manifest_verifies() {
         let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
         let public_key = STANDARD.encode(signing_key.verifying_key().as_bytes());
