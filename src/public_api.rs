@@ -106,6 +106,34 @@ pub async fn peers(State(state): State<AppState>, Query(query): Query<ListQuery>
     .await
 }
 
+pub async fn network_nodes(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    match projection_values(&state, DataKind::NetworkProjection).await {
+        Ok(mut values) => {
+            sort_values_desc_by_timestamp_with_fallback(&mut values, &["snapshot_generated_at"]);
+            values.retain(has_valid_geo);
+            if let Some(limit) = query.limit {
+                values.truncate(limit);
+            }
+            axum::Json(values).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+fn has_valid_geo(value: &Value) -> bool {
+    let latitude = value.get("latitude").and_then(Value::as_f64);
+    let longitude = value.get("longitude").and_then(Value::as_f64);
+    matches!(latitude, Some(value) if (-90.0..=90.0).contains(&value))
+        && matches!(longitude, Some(value) if (-180.0..=180.0).contains(&value))
+}
+
 pub async fn public_topics(
     State(state): State<AppState>,
     Query(query): Query<TopicQuery>,
@@ -608,5 +636,23 @@ fn single_shared_string(snapshots: &[&Value], key: &str) -> Value {
     match values.as_slice() {
         [value] => Value::String(value.clone()),
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_valid_geo;
+    use serde_json::json;
+
+    #[test]
+    fn network_node_geo_requires_valid_coordinates() {
+        assert!(has_valid_geo(
+            &json!({"latitude": 37.7749, "longitude": -122.4194})
+        ));
+        assert!(!has_valid_geo(
+            &json!({"latitude": 91.0, "longitude": -122.4194})
+        ));
+        assert!(!has_valid_geo(&json!({"latitude": 37.7749})));
+        assert!(!has_valid_geo(&json!({"longitude": -122.4194})));
     }
 }

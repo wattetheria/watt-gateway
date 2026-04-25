@@ -38,9 +38,82 @@ ClickHouse and Typesense are intentionally deferred until later phases:
 
 They are roadmap items, not part of the initial gateway baseline.
 
-## How It Talks To Wattetheria
+## Data Flow: Wattswarm, Wattetheria, Gateway
 
-Each `wattetheria` node already exposes a public signed export at:
+The gateway sits above two different data planes:
+
+- `wattswarm` is the foundation/P2P layer. It exposes live network and task
+  projections through its UI HTTP API and, when enabled, a gRPC streaming API.
+- `wattetheria` is the application/rules layer. It subscribes to the Wattswarm
+  gRPC stream, folds that data into the node's local application state, signs
+  public snapshots/events, and can push those signed records to a gateway.
+- `wattetheria-gateway` is non-authoritative. It verifies signed Wattetheria
+  data, optionally pulls Wattswarm read models directly from a configured
+  Wattswarm UI endpoint, persists read models in Postgres, and serves public
+  query APIs.
+
+There are three distinct sync paths:
+
+1. `Wattswarm -> Wattetheria`: Wattetheria runs as a client of the Wattswarm
+   sync service. It pulls/subscribes to Wattswarm projection streams through
+   the gRPC endpoint derived from `wattswarm_ui_base_url` or explicitly
+   configured with a sync gRPC endpoint.
+2. `Wattetheria -> Gateway`: Wattetheria can push signed public snapshots to
+   `POST /api/ingest/snapshot` on a configured gateway URL. It can also push
+   signed public events to `POST /api/ingest/event`.
+3. `Gateway -> Wattetheria / Wattswarm`: Gateway pull mode is exposed through
+   `POST /api/nodes/sync`. For each registered node source, the gateway pulls
+   the Wattetheria signed export. If the node source also has
+   `wattswarm_ui_base_url`, the gateway directly pulls Wattswarm HTTP read
+   models from that URL.
+
+Gateway pull mode is trigger-based in the current implementation: an operator,
+deployment scheduler, or external automation calls `POST /api/nodes/sync`.
+The gateway process does not currently run an internal periodic sync loop.
+
+```mermaid
+flowchart LR
+    subgraph WS["Wattswarm node"]
+        WS_P2P["P2P transport, gossip, tasks"]
+        WS_HTTP["HTTP read models\n/api/wattetheria/network/snapshot\n/api/wattetheria/task-run/snapshot\n/api/wattetheria/topic/activity"]
+        WS_GRPC["gRPC projection streams\nnetwork/task/topic/social"]
+        WS_P2P --> WS_HTTP
+        WS_P2P --> WS_GRPC
+    end
+
+    subgraph WT["Wattetheria node"]
+        WT_SYNC["Wattswarm sync bridge\ngRPC client"]
+        WT_STATE["Application state\nidentity, governance, orgs, topics"]
+        WT_EXPORT["Signed public export\nGET /v1/client/export"]
+        WT_PUSH["Gateway dispatch\nsnapshot interval + event stream"]
+        WT_SYNC --> WT_STATE
+        WT_STATE --> WT_EXPORT
+        WT_STATE --> WT_PUSH
+    end
+
+    subgraph GW["wattetheria-gateway"]
+        GW_REGISTER["Node source registry\n/api/nodes/register"]
+        GW_SYNC["Triggered pull\nPOST /api/nodes/sync"]
+        GW_INGEST["Push ingest\n/api/ingest/snapshot\n/api/ingest/event"]
+        GW_VERIFY["Signature verification"]
+        GW_DB["Postgres\nnode_snapshots + projection rows"]
+        GW_API["Public APIs\n/api/network/status\n/api/network/nodes\n/api/tasks\n/api/topics"]
+        GW_REGISTER --> GW_SYNC
+        GW_SYNC --> GW_VERIFY
+        GW_INGEST --> GW_VERIFY
+        GW_VERIFY --> GW_DB
+        GW_DB --> GW_API
+    end
+
+    WT_SYNC -- "subscribes/pulls gRPC" --> WS_GRPC
+    WT_PUSH -- "pushes signed snapshots/events" --> GW_INGEST
+    GW_SYNC -- "pulls signed export" --> WT_EXPORT
+    GW_SYNC -- "optionally pulls direct Wattswarm HTTP read models\nwhen wattswarm_ui_base_url is configured" --> WS_HTTP
+```
+
+## Wattetheria Signed Snapshot Ingest
+
+Each `wattetheria` node exposes a public signed export at:
 
 ```text
 GET /v1/client/export
@@ -60,17 +133,41 @@ That export contains a signed snapshot with:
 
 `wattetheria-gateway` supports two ingestion modes:
 
-- pull: poll a registered node's `GET /v1/client/export`
+- pull: fetch a registered node's `GET /v1/client/export` through
+  `POST /api/nodes/sync`
 - push: accept a node-published snapshot at `POST /api/ingest/snapshot`
 
 In both modes the gateway verifies the Ed25519 signature against the node's declared public key
 and stores the latest verified snapshot per node in Postgres.
 
+## Direct Wattswarm Read Models
+
+A registered node source may also include:
+
+- `wattswarm_ui_base_url`: a Wattswarm UI base URL used by the gateway to pull
+  Wattswarm HTTP read models directly.
+- `wattswarm_sync_grpc_endpoint`: reserved endpoint metadata for the Wattswarm
+  sync gRPC service. The current gateway collector stores this field but reads
+  Wattswarm data through `wattswarm_ui_base_url`.
+
+When `wattswarm_ui_base_url` is configured, `POST /api/nodes/sync` also pulls:
+
+- `GET /api/wattetheria/network/snapshot`
+- `GET /api/wattetheria/task-run/snapshot`
+- `GET /api/wattetheria/topic/activity`
+
+Those projections are persisted as gateway read models such as network
+projection, task summaries, and public topic activity.
+
 ## MVP Responsibilities
 
-- register upstream `wattetheria` node export URLs
+- register upstream `wattetheria` node export URLs and optional Wattswarm UI
+  endpoints
 - sync signed public snapshots from registered nodes
+- pull Wattswarm network/task/topic read models directly when
+  `wattswarm_ui_base_url` is configured
 - accept direct signed snapshot pushes from user-local nodes
+- accept signed event pushes from user-local nodes
 - accept signed gateway manifest registration
 - expose bootstrap registry lists for node and client discovery
 - aggregate approved gateway discovery from multiple upstream registries
@@ -100,6 +197,7 @@ and stores the latest verified snapshot per node in Postgres.
 - `POST /api/admin/registry/gateways/:gateway_id/review`
 - `GET /api/nodes`
 - `GET /api/network/status`
+- `GET /api/network/nodes`
 - `GET /api/peers`
 - `GET /api/topics`
 - `GET /api/topic-messages`
@@ -180,11 +278,12 @@ cargo run
 
 1. Start `wattetheria-gateway`, Postgres, and NATS.
 2. Register a node source pointing at a `wattetheria` node's `/v1/client/export`, or receive direct pushes from user-local nodes.
-3. Trigger a sync when using pull mode.
-4. Register signed gateway manifests for discovery.
-5. Review and approve the gateways you want exposed in the public discovery list.
-6. Optionally configure bootstrap registries so this gateway can discover upstream registries and self-register automatically.
-7. Query aggregated gateway endpoints from `wattetheria-client` or another gateway.
+3. Optionally include the same node's Wattswarm UI base URL so the gateway can pull Wattswarm read models directly.
+4. Trigger a sync when using pull mode.
+5. Register signed gateway manifests for discovery.
+6. Review and approve the gateways you want exposed in the public discovery list.
+7. Optionally configure bootstrap registries so this gateway can discover upstream registries and self-register automatically.
+8. Query aggregated gateway endpoints from `wattetheria-client` or another gateway.
 
 Register a local `wattetheria` node:
 
@@ -194,6 +293,7 @@ curl -X POST http://127.0.0.1:8080/api/nodes/register \
   -d '{
     "name": "local-alpha",
     "export_url": "http://127.0.0.1:7777/v1/client/export",
+    "wattswarm_ui_base_url": "http://127.0.0.1:7788",
     "region": "local-dev"
   }'
 ```

@@ -50,6 +50,7 @@ pub fn router(state: AppState) -> Router {
             "/api/network/status",
             get(crate::public_api::network_status),
         )
+        .route("/api/network/nodes", get(crate::public_api::network_nodes))
         .route("/api/peers", get(crate::public_api::peers))
         .route("/api/topics", get(crate::public_api::public_topics))
         .route(

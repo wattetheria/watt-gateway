@@ -6,14 +6,19 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WattswarmNetworkProjectionSnapshot {
     pub generated_at: u64,
     pub node_id: String,
+    pub display_name: String,
     pub org_id: String,
     pub network_id: String,
     pub running: bool,
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
     pub peer_protocol_distribution: std::collections::BTreeMap<String, u64>,
     pub peers: Vec<String>,
 }
@@ -100,10 +105,13 @@ async fn persist_network_projection(
 ) -> Result<()> {
     let payload = json!({
         "node_id": snapshot.node_id,
+        "display_name": snapshot.display_name,
         "org_id": snapshot.org_id,
         "network_id": snapshot.network_id,
         "running": snapshot.running,
         "mode": snapshot.mode,
+        "latitude": snapshot.latitude,
+        "longitude": snapshot.longitude,
         "peer_protocol_distribution": snapshot.peer_protocol_distribution,
         "peers": snapshot.peers,
         "snapshot_generated_at": snapshot.generated_at,
@@ -271,8 +279,14 @@ mod tests {
     fn network_projection_payload_carries_snapshot_timestamp() {
         let payload = json!({
             "node_id": "node-a",
+            "display_name": "Captain Aurora",
+            "latitude": 37.7749,
+            "longitude": -122.4194,
             "snapshot_generated_at": 12_u64,
         });
         assert_eq!(payload["snapshot_generated_at"].as_u64(), Some(12));
+        assert_eq!(payload["display_name"].as_str(), Some("Captain Aurora"));
+        assert_eq!(payload["latitude"].as_f64(), Some(37.7749));
+        assert_eq!(payload["longitude"].as_f64(), Some(-122.4194));
     }
 }
