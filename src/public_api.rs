@@ -40,33 +40,9 @@ pub async fn network_status(State(state): State<AppState>) -> Response {
                         .map_or(0, Vec::len)
                 })
                 .sum::<usize>();
-            let total_friend_relationships = snapshots
-                .iter()
-                .map(|payload| {
-                    payload["friend_relationships"]
-                        .as_array()
-                        .map_or(0, Vec::len)
-                })
-                .sum::<usize>();
-            let total_pending_friend_requests = snapshots
-                .iter()
-                .map(|payload| {
-                    payload["pending_friend_requests"]
-                        .as_array()
-                        .map_or(0, Vec::len)
-                })
-                .sum::<usize>();
             let total_public_blocks = snapshots
                 .iter()
                 .map(|payload| payload["public_blocks"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            let total_dm_threads = snapshots
-                .iter()
-                .map(|payload| payload["dm_threads"].as_array().map_or(0, Vec::len))
-                .sum::<usize>();
-            let total_dm_messages = snapshots
-                .iter()
-                .map(|payload| payload["dm_messages"].as_array().map_or(0, Vec::len))
                 .sum::<usize>();
             axum::Json(json!({
                 "status": "ok",
@@ -76,11 +52,7 @@ pub async fn network_status(State(state): State<AppState>) -> Response {
                 "organizations": total_organizations,
                 "topics": total_topics,
                 "topic_messages": total_topic_messages,
-                "friend_relationships": total_friend_relationships,
-                "pending_friend_requests": total_pending_friend_requests,
                 "public_blocks": total_public_blocks,
-                "dm_threads": total_dm_threads,
-                "dm_messages": total_dm_messages,
                 "network_name": network_name,
                 "network_org_name": network_org_name,
                 "gateway_runtime": state.gateway_network.as_ref().map(gateway_runtime_status),

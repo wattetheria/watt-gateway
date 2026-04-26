@@ -27,15 +27,7 @@ pub struct PublicClientSnapshot {
     pub operator: Value,
     pub rpc_logs: Vec<Value>,
     #[serde(default)]
-    pub friend_relationships: Vec<Value>,
-    #[serde(default)]
-    pub pending_friend_requests: Vec<Value>,
-    #[serde(default)]
     pub public_blocks: Vec<Value>,
-    #[serde(default)]
-    pub dm_threads: Vec<Value>,
-    #[serde(default)]
-    pub dm_messages: Vec<Value>,
     #[serde(default)]
     pub public_topics: Vec<Value>,
     #[serde(default)]

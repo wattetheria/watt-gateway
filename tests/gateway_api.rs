@@ -42,29 +42,9 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
             network_name: Some("Watt Etheria"),
             network_org_name: Some("Aether Prime"),
             peers: &[json!({"id":"peer-1"}), json!({"id":"peer-2"})],
-            friend_relationships: &[json!({
-                "counterpart_public_id":"did:key:friend-1",
-                "relationship_state":"accepted"
-            })],
-            pending_friend_requests: &[json!({
-                "counterpart_public_id":"did:key:friend-2",
-                "pending_inbound": true
-            })],
             public_blocks: &[json!({
                 "counterpart_public_id":"did:key:blocked-1",
                 "relationship_state":"blocked"
-            })],
-            dm_threads: &[json!({
-                "thread_id":"dm:thread-1",
-                "counterpart_public_id":"did:key:friend-1",
-                "updated_at":"2026-03-18T01:02:00Z"
-            })],
-            dm_messages: &[json!({
-                "message_id":"dm-msg-1",
-                "thread_id":"dm:thread-1",
-                "counterpart_public_id":"did:key:friend-1",
-                "content":{"text":"hello"},
-                "created_at":"2026-03-18T01:02:00Z"
             })],
             public_topics: &[json!({
                 "topic_id":"topic-public-1",
@@ -141,14 +121,7 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     assert_eq!(network_status.1["organizations"].as_u64(), Some(1));
     assert_eq!(network_status.1["topics"].as_u64(), Some(1));
     assert_eq!(network_status.1["topic_messages"].as_u64(), Some(1));
-    assert_eq!(network_status.1["friend_relationships"].as_u64(), Some(1));
-    assert_eq!(
-        network_status.1["pending_friend_requests"].as_u64(),
-        Some(1)
-    );
     assert_eq!(network_status.1["public_blocks"].as_u64(), Some(1));
-    assert_eq!(network_status.1["dm_threads"].as_u64(), Some(1));
-    assert_eq!(network_status.1["dm_messages"].as_u64(), Some(1));
     assert_eq!(
         network_status.1["network_name"].as_str(),
         Some("Watt Etheria")
@@ -233,11 +206,7 @@ async fn sync_rejects_invalid_signature_and_marks_source_invalid() {
             network_name: None,
             network_org_name: None,
             peers: &[],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
             swarm_task_activity: json!({}),
@@ -417,11 +386,7 @@ async fn ingest_snapshot_accepts_push_without_registered_source() {
             network_name: None,
             network_org_name: None,
             peers: &[json!({"id":"peer-9"})],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[json!({"topic_id":"topic-9","title":"Public Topic 9"})],
             public_topic_messages: &[
                 json!({"message_id":"msg-9","topic_id":"topic-9","body":"hello"}),
@@ -468,11 +433,7 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
             network_name: None,
             network_org_name: None,
             peers: &[],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[json!({
                 "topic_id":"topic-a",
                 "organization_id":"org-1",
@@ -499,11 +460,7 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
             network_name: None,
             network_org_name: None,
             peers: &[],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[
                 json!({
                     "topic_id":"topic-a",
@@ -597,11 +554,7 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
             network_name: None,
             network_org_name: None,
             peers: &[],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
             swarm_task_activity: json!({}),
@@ -617,11 +570,7 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
             network_name: None,
             network_org_name: None,
             peers: &[],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
             swarm_task_activity: json!({}),
@@ -666,11 +615,7 @@ async fn suspended_registered_source_is_hidden_from_public_reads_and_rejects_pus
             network_name: Some("Watt Etheria"),
             network_org_name: Some("Aether Prime"),
             peers: &[json!({"id":"peer-hidden"})],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
             swarm_task_activity: json!({}),
@@ -860,11 +805,7 @@ async fn sync_nodes_reports_partial_when_wattswarm_collection_fails() {
             network_name: Some("Watt Etheria"),
             network_org_name: Some("Aether Prime"),
             peers: &[],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
             swarm_task_activity: json!({}),
@@ -1265,11 +1206,7 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
             network_name: Some("Watt Etheria"),
             network_org_name: Some("Iroh Mesh"),
             peers: &[json!({"id":"peer-iroh"})],
-            friend_relationships: &[],
-            pending_friend_requests: &[],
             public_blocks: &[],
-            dm_threads: &[],
-            dm_messages: &[],
             public_topics: &[],
             public_topic_messages: &[],
             swarm_task_activity: json!({}),
@@ -1664,11 +1601,7 @@ struct SnapshotContents<'a> {
     network_name: Option<&'a str>,
     network_org_name: Option<&'a str>,
     peers: &'a [Value],
-    friend_relationships: &'a [Value],
-    pending_friend_requests: &'a [Value],
     public_blocks: &'a [Value],
-    dm_threads: &'a [Value],
-    dm_messages: &'a [Value],
     public_topics: &'a [Value],
     public_topic_messages: &'a [Value],
     swarm_task_activity: Value,
@@ -1710,11 +1643,7 @@ fn signed_snapshot_at(
         rpc_logs: vec![
             json!({"timestamp":"2026-03-18T00:00:00Z","message":"Agent connected","level":"success"}),
         ],
-        friend_relationships: contents.friend_relationships.to_vec(),
-        pending_friend_requests: contents.pending_friend_requests.to_vec(),
         public_blocks: contents.public_blocks.to_vec(),
-        dm_threads: contents.dm_threads.to_vec(),
-        dm_messages: contents.dm_messages.to_vec(),
         public_topics: contents.public_topics.to_vec(),
         public_topic_messages: contents.public_topic_messages.to_vec(),
         swarm_task_activity: contents.swarm_task_activity,

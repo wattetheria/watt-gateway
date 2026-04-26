@@ -93,48 +93,8 @@ pub fn snapshot_projection_seeds(
         source_id,
         &source_node_id,
         generated_at,
-        DataKind::FriendRelationship,
-        &snapshot.friend_relationships,
-    );
-    fanout_array(
-        &mut seeds,
-        source_id,
-        &source_node_id,
-        generated_at,
-        DataKind::FriendRequestPending,
-        &snapshot.pending_friend_requests,
-    );
-    fanout_array(
-        &mut seeds,
-        source_id,
-        &source_node_id,
-        generated_at,
         DataKind::PublicBlock,
         &snapshot.public_blocks,
-    );
-    fanout_array(
-        &mut seeds,
-        source_id,
-        &source_node_id,
-        generated_at,
-        DataKind::SocialThread,
-        &snapshot.dm_threads,
-    );
-    fanout_array(
-        &mut seeds,
-        source_id,
-        &source_node_id,
-        generated_at,
-        DataKind::DmSummary,
-        &snapshot.dm_threads,
-    );
-    fanout_array(
-        &mut seeds,
-        source_id,
-        &source_node_id,
-        generated_at,
-        DataKind::DmMessage,
-        &snapshot.dm_messages,
     );
     fanout_array(
         &mut seeds,
@@ -257,11 +217,7 @@ mod tests {
             peers: vec![json!({"id":"peer-1"})],
             operator: json!({"id":"operator-1"}),
             rpc_logs: vec![],
-            friend_relationships: vec![json!({"counterpart_public_id":"friend-1"})],
-            pending_friend_requests: vec![],
-            public_blocks: vec![],
-            dm_threads: vec![json!({"thread_id":"thread-1"})],
-            dm_messages: vec![json!({"message_id":"msg-1","thread_id":"thread-1"})],
+            public_blocks: vec![json!({"counterpart_public_id":"blocked-1"})],
             public_topics: vec![json!({"topic_id":"topic-1"})],
             public_topic_messages: vec![json!({"message_id":"topic-msg-1","topic_id":"topic-1"})],
             swarm_task_activity: json!({}),
@@ -272,17 +228,12 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_fanout_includes_social_and_task_rows() {
+    fn snapshot_fanout_includes_public_block_and_task_rows() {
         let seeds = snapshot_projection_seeds(None, &sample_snapshot());
         assert!(
             seeds
                 .iter()
-                .any(|seed| seed.data_kind == DataKind::FriendRelationship)
-        );
-        assert!(
-            seeds
-                .iter()
-                .any(|seed| seed.data_kind == DataKind::DmMessage)
+                .any(|seed| seed.data_kind == DataKind::PublicBlock)
         );
         assert!(
             seeds
@@ -296,8 +247,8 @@ mod tests {
         let seeds = snapshot_projection_seeds(None, &sample_snapshot());
         let message = seeds
             .into_iter()
-            .find(|seed| seed.data_kind == DataKind::DmMessage)
-            .expect("dm message seed");
+            .find(|seed| seed.data_kind == DataKind::TaskSummary)
+            .expect("task summary seed");
         assert_eq!(
             message.payload["snapshot_generated_at"].as_i64(),
             Some(1_710_000_000)
