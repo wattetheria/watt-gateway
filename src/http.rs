@@ -57,14 +57,7 @@ pub fn router(state: AppState) -> Router {
             "/api/topic-messages",
             get(crate::public_api::public_topic_messages),
         )
-        .route("/api/friends", get(crate::public_api::friend_relationships))
-        .route(
-            "/api/friend-requests",
-            get(crate::public_api::pending_friend_requests),
-        )
         .route("/api/blocks", get(crate::public_api::public_blocks))
-        .route("/api/dm/threads", get(crate::public_api::dm_threads))
-        .route("/api/dm/messages", get(crate::public_api::dm_messages))
         .route("/api/tasks", get(crate::public_api::tasks))
         .route("/api/task-activity", get(crate::public_api::task_activity))
         .route("/api/organizations", get(crate::public_api::organizations))

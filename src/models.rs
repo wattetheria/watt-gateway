@@ -303,13 +303,6 @@ pub struct TopicMessageQuery {
     pub author_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DmMessageQuery {
-    pub limit: Option<usize>,
-    pub thread_id: Option<String>,
-    pub counterpart_public_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterGatewayRequest {
     pub manifest: SignedGatewayManifest,

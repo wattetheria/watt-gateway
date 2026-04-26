@@ -176,21 +176,11 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
         Some("topic-public-1")
     );
 
-    let friends = request(&app, "GET", "/api/friends?limit=10").await;
-    assert_eq!(friends.0, StatusCode::OK);
-    assert_eq!(friends.1.as_array().unwrap().len(), 1);
-    assert_eq!(
-        friends.1[0]["counterpart_public_id"].as_str(),
-        Some("did:key:friend-1")
-    );
+    let friends = request_status(&app, "GET", "/api/friends?limit=10").await;
+    assert_eq!(friends, StatusCode::NOT_FOUND);
 
-    let pending_requests = request(&app, "GET", "/api/friend-requests?limit=10").await;
-    assert_eq!(pending_requests.0, StatusCode::OK);
-    assert_eq!(pending_requests.1.as_array().unwrap().len(), 1);
-    assert_eq!(
-        pending_requests.1[0]["counterpart_public_id"].as_str(),
-        Some("did:key:friend-2")
-    );
+    let pending_requests = request_status(&app, "GET", "/api/friend-requests?limit=10").await;
+    assert_eq!(pending_requests, StatusCode::NOT_FOUND);
 
     let blocks = request(&app, "GET", "/api/blocks?limit=10").await;
     assert_eq!(blocks.0, StatusCode::OK);
@@ -200,15 +190,11 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
         Some("did:key:blocked-1")
     );
 
-    let dm_threads = request(&app, "GET", "/api/dm/threads?limit=10").await;
-    assert_eq!(dm_threads.0, StatusCode::OK);
-    assert_eq!(dm_threads.1.as_array().unwrap().len(), 1);
-    assert_eq!(dm_threads.1[0]["thread_id"].as_str(), Some("dm:thread-1"));
+    let dm_threads = request_status(&app, "GET", "/api/dm/threads?limit=10").await;
+    assert_eq!(dm_threads, StatusCode::NOT_FOUND);
 
-    let dm_messages = request(&app, "GET", "/api/dm/messages?limit=10").await;
-    assert_eq!(dm_messages.0, StatusCode::OK);
-    assert_eq!(dm_messages.1.as_array().unwrap().len(), 1);
-    assert_eq!(dm_messages.1[0]["message_id"].as_str(), Some("dm-msg-1"));
+    let dm_messages = request_status(&app, "GET", "/api/dm/messages?limit=10").await;
+    assert_eq!(dm_messages, StatusCode::NOT_FOUND);
 
     let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
@@ -1487,6 +1473,20 @@ async fn request(app: &Router, method: &str, uri: &str) -> (StatusCode, Value) {
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn request_status(app: &Router, method: &str, uri: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
 }
 
 async fn request_json(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {

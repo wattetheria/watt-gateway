@@ -1,7 +1,7 @@
 use crate::contracts::DataKind;
 use crate::db;
 use crate::gateway_network::GatewayNetworkHandle;
-use crate::models::{DmMessageQuery, ListQuery, TopicMessageQuery, TopicQuery};
+use crate::models::{ListQuery, TopicMessageQuery, TopicQuery};
 use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -299,59 +299,11 @@ pub async fn task_activity(
     }
 }
 
-pub async fn friend_relationships(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> Response {
-    aggregate_projection_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        DataKind::FriendRelationship,
-    )
-    .await
-}
-
-pub async fn pending_friend_requests(
-    State(state): State<AppState>,
-    Query(query): Query<ListQuery>,
-) -> Response {
-    aggregate_projection_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        DataKind::FriendRequestPending,
-    )
-    .await
-}
-
 pub async fn public_blocks(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Response {
     aggregate_projection_endpoint(&state, query.limit.unwrap_or(200), DataKind::PublicBlock).await
-}
-
-pub async fn dm_threads(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_projection_endpoint(&state, query.limit.unwrap_or(200), DataKind::SocialThread).await
-}
-
-pub async fn dm_messages(
-    State(state): State<AppState>,
-    Query(query): Query<DmMessageQuery>,
-) -> Response {
-    match projection_values(&state, DataKind::DmMessage).await {
-        Ok(mut values) => {
-            values.retain(|value| matches_dm_message_filters(value, &query));
-            sort_values_desc_by_timestamp_with_fallback(&mut values, &["created_at"]);
-            dedupe_values_by_key(&mut values, dm_message_identity_key);
-            values.truncate(query.limit.unwrap_or(500));
-            axum::Json(values).into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
 }
 
 pub async fn organizations(
@@ -543,15 +495,6 @@ fn matches_topic_message_filters(value: &Value, query: &TopicMessageQuery) -> bo
         )
 }
 
-fn matches_dm_message_filters(value: &Value, query: &DmMessageQuery) -> bool {
-    matches_optional_string_filter(value, &["thread_id"], query.thread_id.as_deref())
-        && matches_optional_string_filter(
-            value,
-            &["counterpart_public_id"],
-            query.counterpart_public_id.as_deref(),
-        )
-}
-
 fn matches_optional_string_filter(value: &Value, keys: &[&str], expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -647,18 +590,6 @@ fn topic_message_identity_key(value: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         Some(format!("{topic_id}:{author_id}:{timestamp}:{body}"))
-    })
-}
-
-fn dm_message_identity_key(value: &Value) -> Option<String> {
-    topic_key_from_value(value, &["message_id", "id"]).or_else(|| {
-        let thread_id = value.get("thread_id").and_then(Value::as_str)?;
-        let created_at = timestamp_with_fallback(value, &["created_at"]);
-        let direction = value
-            .get("direction")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        Some(format!("{thread_id}:{direction}:{created_at}"))
     })
 }
 
