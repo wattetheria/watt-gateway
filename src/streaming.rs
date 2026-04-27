@@ -1,4 +1,6 @@
-use crate::contracts::{GatewayUiEvent, SignedNodeEvent, UiStreamQuery, allows_public_stream};
+use crate::contracts::{
+    DataKind, EventScope, GatewayUiEvent, SignedNodeEvent, UiStreamQuery, allows_public_stream,
+};
 use crate::db;
 use crate::http::ingest_signed_snapshot;
 use crate::state::AppState;
@@ -118,6 +120,7 @@ pub async fn persist_signed_node_event(
         event.payload.provisional_policy,
         crate::contracts::ProvisionalExportPolicy::NeverBeforeConfirmation
     );
+    let scope = normalized_event_scope(event);
     if matches!(
         event.payload.provisional_policy,
         crate::contracts::ProvisionalExportPolicy::EphemeralOnly
@@ -130,7 +133,7 @@ pub async fn persist_signed_node_event(
             event_kind: event.payload.event_kind.clone(),
             visibility: event.payload.visibility,
             provisional,
-            scope: event.payload.scope.clone(),
+            scope,
             generated_at: event.payload.timestamp,
             payload: event.payload.payload.clone(),
         });
@@ -147,9 +150,9 @@ pub async fn persist_signed_node_event(
             event_kind: &event.payload.event_kind,
             visibility: &visibility,
             provisional,
-            topic_id: event.payload.scope.topic_id.as_deref(),
-            organization_id: event.payload.scope.organization_id.as_deref(),
-            task_id: event.payload.scope.task_id.as_deref(),
+            topic_id: scope.topic_id.as_deref(),
+            organization_id: scope.organization_id.as_deref(),
+            task_id: scope.task_id.as_deref(),
             generated_at: event.payload.timestamp,
             payload: &event.payload.payload,
             ingest_path: "event_push",
@@ -174,6 +177,27 @@ pub async fn persist_signed_node_event(
         .publish_event("gateway.event.ingested", &bus_event)
         .await;
     Ok(Some(row.cursor))
+}
+
+fn normalized_event_scope(event: &SignedNodeEvent) -> EventScope {
+    let mut scope = event.payload.scope.clone();
+    if event.payload.data_kind == DataKind::MissionLifecycle
+        && scope.organization_id.as_deref()
+            == event
+                .payload
+                .payload
+                .get("publisher")
+                .and_then(|value| value.as_str())
+        && event
+            .payload
+            .payload
+            .get("publisher_kind")
+            .and_then(|value| value.as_str())
+            .is_some_and(|kind| kind != "organization")
+    {
+        scope.organization_id = None;
+    }
+    scope
 }
 
 async fn try_backfill_gap(
@@ -407,7 +431,9 @@ fn resume_rejection_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{DataKind, EventScope, UiStreamQuery, Visibility};
+    use crate::contracts::{
+        DataKind, EventScope, NodeEventPayload, ProvisionalExportPolicy, UiStreamQuery, Visibility,
+    };
 
     fn sample_event(data_kind: DataKind) -> GatewayUiEvent {
         GatewayUiEvent {
@@ -476,5 +502,75 @@ mod tests {
         assert_eq!(resume_rejection_reason(Some(10), Some(10)), None);
         assert_eq!(resume_rejection_reason(Some(12), Some(10)), None);
         assert_eq!(resume_rejection_reason(None, Some(10)), None);
+    }
+
+    #[test]
+    fn mission_scope_drops_player_publisher_from_organization_id() {
+        let event = SignedNodeEvent {
+            payload: NodeEventPayload {
+                event_id: "event-1".to_string(),
+                node_id: "node-1".to_string(),
+                public_key: "public-key".to_string(),
+                signer_agent_did: "did:key:agent".to_string(),
+                seq: 1,
+                timestamp: 1_710_000_000,
+                data_kind: DataKind::MissionLifecycle,
+                event_kind: "mission.published".to_string(),
+                visibility: Visibility::Public,
+                provisional_policy: ProvisionalExportPolicy::NeverBeforeConfirmation,
+                scope: EventScope {
+                    node_id: None,
+                    topic_id: None,
+                    organization_id: Some("Citizen-citizen-b2HM".to_string()),
+                    task_id: Some("mission-1".to_string()),
+                },
+                identity_key: Some("mission-1".to_string()),
+                payload: json!({
+                    "mission_id": "mission-1",
+                    "publisher": "Citizen-citizen-b2HM",
+                    "publisher_kind": "player",
+                }),
+            },
+            signature: "signature".to_string(),
+        };
+
+        let scope = normalized_event_scope(&event);
+        assert_eq!(scope.organization_id, None);
+        assert_eq!(scope.task_id.as_deref(), Some("mission-1"));
+    }
+
+    #[test]
+    fn mission_scope_keeps_organization_publisher() {
+        let event = SignedNodeEvent {
+            payload: NodeEventPayload {
+                event_id: "event-1".to_string(),
+                node_id: "node-1".to_string(),
+                public_key: "public-key".to_string(),
+                signer_agent_did: "did:key:agent".to_string(),
+                seq: 1,
+                timestamp: 1_710_000_000,
+                data_kind: DataKind::MissionLifecycle,
+                event_kind: "mission.published".to_string(),
+                visibility: Visibility::Public,
+                provisional_policy: ProvisionalExportPolicy::NeverBeforeConfirmation,
+                scope: EventScope {
+                    node_id: None,
+                    topic_id: None,
+                    organization_id: Some("aurora-consortium".to_string()),
+                    task_id: Some("mission-1".to_string()),
+                },
+                identity_key: Some("mission-1".to_string()),
+                payload: json!({
+                    "mission_id": "mission-1",
+                    "publisher": "aurora-consortium",
+                    "publisher_kind": "organization",
+                }),
+            },
+            signature: "signature".to_string(),
+        };
+
+        let scope = normalized_event_scope(&event);
+        assert_eq!(scope.organization_id.as_deref(), Some("aurora-consortium"));
+        assert_eq!(scope.task_id.as_deref(), Some("mission-1"));
     }
 }
