@@ -373,6 +373,64 @@ async fn upsert_projection_row_does_not_write_ingest_audit() {
             .unwrap();
     assert_eq!(count, 0);
 
+    let stored_generated_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select generated_at from gateway_projection_rows where data_kind = $1")
+            .bind("network_projection")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_generated_at.timestamp(), 1_710_000_000);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn generated_at_columns_use_timestamptz() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        select table_name, data_type
+        from information_schema.columns
+        where table_schema = current_schema()
+          and table_name in (
+              'gateway_ingest_audit',
+              'gateway_projection_rows',
+              'gateway_ui_events',
+              'node_snapshots'
+          )
+          and column_name = 'generated_at'
+        order by table_name
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "gateway_ingest_audit".to_string(),
+                "timestamp with time zone".to_string()
+            ),
+            (
+                "gateway_projection_rows".to_string(),
+                "timestamp with time zone".to_string()
+            ),
+            (
+                "gateway_ui_events".to_string(),
+                "timestamp with time zone".to_string()
+            ),
+            (
+                "node_snapshots".to_string(),
+                "timestamp with time zone".to_string()
+            ),
+        ]
+    );
+
     db.cleanup().await;
 }
 

@@ -130,6 +130,37 @@ pub async fn connect(database_url: &str) -> Result<PgPool> {
         .await?)
 }
 
+async fn migrate_generated_at_column_to_timestamptz(pool: &PgPool, table_name: &str) -> Result<()> {
+    let query = format!(
+        r#"
+        do $$
+        begin
+            if exists (
+                select 1
+                from information_schema.columns
+                where table_schema = current_schema()
+                  and table_name = '{table_name}'
+                  and column_name = 'generated_at'
+                  and data_type in ('bigint', 'integer', 'numeric', 'double precision')
+            ) then
+                alter table {table_name}
+                alter column generated_at type timestamptz
+                using to_timestamp(
+                    case
+                        when abs(generated_at::double precision) >= 100000000000.0
+                            then generated_at::double precision / 1000.0
+                        else generated_at::double precision
+                    end
+                );
+            end if;
+        end
+        $$;
+        "#
+    );
+    sqlx::query(&query).execute(pool).await?;
+    Ok(())
+}
+
 pub async fn init_schema(pool: &PgPool) -> Result<()> {
     sqlx::query(
         r#"
@@ -247,7 +278,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             identity_key text not null,
             source_node_id text not null,
             source_id uuid null references node_sources(id) on delete set null,
-            generated_at bigint not null,
+            generated_at timestamptz not null,
             ingested_at timestamptz not null default now(),
             visibility text not null,
             payload jsonb not null,
@@ -258,6 +289,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    migrate_generated_at_column_to_timestamptz(pool, "gateway_projection_rows").await?;
 
     sqlx::query(
         r#"
@@ -283,7 +315,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             topic_id text null,
             organization_id text null,
             task_id text null,
-            generated_at bigint not null,
+            generated_at timestamptz not null,
             ingested_at timestamptz not null default now(),
             payload jsonb not null,
             ingest_path text not null,
@@ -293,6 +325,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    migrate_generated_at_column_to_timestamptz(pool, "gateway_ui_events").await?;
 
     sqlx::query(
         r#"
@@ -320,7 +353,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             identity_key text null,
             source_id uuid null references node_sources(id) on delete set null,
             source_node_id text null,
-            generated_at bigint null,
+            generated_at timestamptz null,
             ingest_path text not null,
             payload jsonb not null,
             provenance jsonb not null,
@@ -330,6 +363,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    migrate_generated_at_column_to_timestamptz(pool, "gateway_ingest_audit").await?;
 
     sqlx::query(
         r#"
@@ -356,28 +390,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
-
-    sqlx::query(
-        r#"
-        do $$
-        begin
-            if exists (
-                select 1
-                from information_schema.columns
-                where table_name = 'node_snapshots'
-                  and column_name = 'generated_at'
-                  and data_type = 'bigint'
-            ) then
-                alter table node_snapshots
-                alter column generated_at type timestamptz
-                using to_timestamp(generated_at::double precision);
-            end if;
-        end
-        $$;
-        "#,
-    )
-    .execute(pool)
-    .await?;
+    migrate_generated_at_column_to_timestamptz(pool, "node_snapshots").await?;
 
     sqlx::query(
         r#"
@@ -386,6 +399,8 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    migrate_generated_at_column_to_timestamptz(pool, "gateway_registry_entries").await?;
+    migrate_generated_at_column_to_timestamptz(pool, "node_sources").await?;
 
     sqlx::query(
         r#"
@@ -672,7 +687,17 @@ pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) ->
         insert into node_snapshots (
             node_id, source_id, signer_agent_did, public_key, generated_at, ingested_at, payload, signature
         )
-        values ($1, $2, $3, $4, to_timestamp($5::double precision), now(), $6, $7)
+        values (
+            $1, $2, $3, $4,
+            to_timestamp(
+                case
+                    when abs($5::bigint::double precision) >= 100000000000.0
+                        then $5::bigint::double precision / 1000.0
+                    else $5::bigint::double precision
+                end
+            ),
+            now(), $6, $7
+        )
         on conflict (node_id) do update
         set
             source_id = coalesce(excluded.source_id, node_snapshots.source_id),
@@ -778,7 +803,17 @@ pub async fn upsert_projection_row(
             data_kind, identity_key, source_node_id, source_id, generated_at,
             ingested_at, visibility, payload, provenance
         )
-        values ($1, $2, $3, $4, $5, now(), $6, $7, $8)
+        values (
+            $1, $2, $3, $4,
+            to_timestamp(
+                case
+                    when abs($5::bigint::double precision) >= 100000000000.0
+                        then $5::bigint::double precision / 1000.0
+                    else $5::bigint::double precision
+                end
+            ),
+            now(), $6, $7, $8
+        )
         on conflict (data_kind, identity_key, source_node_id) do update
         set
             source_id = coalesce(excluded.source_id, gateway_projection_rows.source_id),
@@ -849,7 +884,14 @@ pub async fn insert_ui_event(
         values (
             $1, $2, $3, $4, $5, $6,
             $7, $8, $9, $10, $11,
-            $12, $13, $14, $15
+            to_timestamp(
+                case
+                    when abs($12::bigint::double precision) >= 100000000000.0
+                        then $12::bigint::double precision / 1000.0
+                    else $12::bigint::double precision
+                end
+            ),
+            $13, $14, $15
         )
         on conflict (event_id) do nothing
         returning
@@ -1098,7 +1140,17 @@ pub async fn insert_audit_record(pool: &PgPool, record: InsertAuditRecord<'_>) -
             provenance,
             created_at
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+        values (
+            $1, $2, $3, $4, $5,
+            to_timestamp(
+                case
+                    when abs($6::bigint::double precision) >= 100000000000.0
+                        then $6::bigint::double precision / 1000.0
+                    else $6::bigint::double precision
+                end
+            ),
+            $7, $8, $9, now()
+        )
         "#,
     )
     .bind(record.record_kind)

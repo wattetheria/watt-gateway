@@ -101,7 +101,7 @@ pub struct ProjectionRow {
     pub identity_key: String,
     pub source_node_id: String,
     pub source_id: Option<Uuid>,
-    pub generated_at: i64,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
     pub ingested_at: chrono::DateTime<chrono::Utc>,
     pub visibility: String,
     pub payload: sqlx::types::Json<Value>,
@@ -122,7 +122,7 @@ pub struct UiEventRow {
     pub topic_id: Option<String>,
     pub organization_id: Option<String>,
     pub task_id: Option<String>,
-    pub generated_at: i64,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
     pub ingested_at: chrono::DateTime<chrono::Utc>,
     pub payload: sqlx::types::Json<Value>,
     pub ingest_path: String,
@@ -147,7 +147,7 @@ impl TryFrom<UiEventRow> for GatewayUiEvent {
                 organization_id: value.organization_id,
                 task_id: value.task_id,
             },
-            generated_at: value.generated_at,
+            generated_at: value.generated_at.timestamp(),
             payload: value.payload.0,
         })
     }
