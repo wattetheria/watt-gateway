@@ -180,15 +180,20 @@ async fn collect_topic_activity_read_models(
         let Some(scope_hint) = row.payload.0.get("scope_hint").and_then(Value::as_str) else {
             continue;
         };
+        let network_id = row.payload.0.get("network_id").and_then(Value::as_str);
+        let mut query = vec![
+            ("feed_key", feed_key.to_string()),
+            ("scope_hint", scope_hint.to_string()),
+            ("limit", "50".to_string()),
+        ];
+        if let Some(network_id) = network_id.map(str::trim).filter(|value| !value.is_empty()) {
+            query.push(("network_id", network_id.to_string()));
+        }
         let activity: WattswarmTopicActivitySnapshot = state
             .node_client
             .fetch_json(
                 &format!("{base_url}/api/wattetheria/topic/activity"),
-                Some(&[
-                    ("feed_key", feed_key.to_string()),
-                    ("scope_hint", scope_hint.to_string()),
-                    ("limit", "50".to_string()),
-                ]),
+                Some(&query),
             )
             .await?;
         let generated_at = i64::try_from(activity.generated_at).unwrap_or(i64::MAX);

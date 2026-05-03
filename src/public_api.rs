@@ -445,7 +445,11 @@ fn attach_snapshot_generated_at(mut value: Value, generated_at: i64) -> Value {
 }
 
 fn matches_topic_filters(value: &Value, query: &TopicQuery) -> bool {
-    matches_optional_string_filter(value, &["topic_id", "id"], query.topic_id.as_deref())
+    matches_optional_string_filter(
+        value,
+        &["network_id", "networkId"],
+        query.network_id.as_deref(),
+    ) && matches_optional_string_filter(value, &["topic_id", "id"], query.topic_id.as_deref())
         && matches_optional_string_filter(
             value,
             &["organization_id", "organizationId"],
@@ -454,7 +458,11 @@ fn matches_topic_filters(value: &Value, query: &TopicQuery) -> bool {
 }
 
 fn matches_topic_message_filters(value: &Value, query: &TopicMessageQuery) -> bool {
-    matches_optional_string_filter(value, &["topic_id", "topicId"], query.topic_id.as_deref())
+    matches_optional_string_filter(
+        value,
+        &["network_id", "networkId"],
+        query.network_id.as_deref(),
+    ) && matches_optional_string_filter(value, &["topic_id", "topicId"], query.topic_id.as_deref())
         && matches_optional_string_filter(
             value,
             &["organization_id", "organizationId"],
@@ -539,15 +547,12 @@ where
 }
 
 fn topic_identity_key(value: &Value) -> Option<String> {
-    topic_key_from_value(value, &["topic_id", "id"])
+    network_scoped_topic_key(value, &["topic_id", "id"])
 }
 
 fn topic_message_identity_key(value: &Value) -> Option<String> {
     topic_key_from_value(value, &["message_id", "id"]).or_else(|| {
-        let topic_id = value
-            .get("topic_id")
-            .or_else(|| value.get("topicId"))
-            .and_then(Value::as_str)?;
+        let topic_id = network_scoped_topic_key(value, &["topic_id", "topicId"])?;
         let author_id = value
             .get("author_id")
             .or_else(|| value.get("authorId"))
@@ -588,6 +593,20 @@ fn topic_key_from_value(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
         .map(str::to_string)
+}
+
+fn network_scoped_topic_key(value: &Value, keys: &[&str]) -> Option<String> {
+    let topic_id = topic_key_from_value(value, keys)?;
+    let Some(network_id) = value
+        .get("network_id")
+        .or_else(|| value.get("networkId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Some(topic_id);
+    };
+    Some(format!("{network_id}:{topic_id}"))
 }
 
 pub(crate) fn recommended_routes(capabilities: &PeerTransportCapabilities) -> Value {
