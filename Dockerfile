@@ -7,6 +7,8 @@ RUN cargo install cargo-chef --locked
 FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
+COPY crates/gateway/Cargo.toml crates/gateway/Cargo.toml
+COPY crates/gateway-p2p/Cargo.toml crates/gateway-p2p/Cargo.toml
 
 # Replace local path dependencies with repository sources so Docker builds do
 # not depend on sibling directories from the host machine.
@@ -19,9 +21,10 @@ RUN sed -i \
     -e 's|wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }|wattswarm-network-transport-iroh = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-transport-iroh" }|' \
     Cargo.toml
 
-RUN mkdir -p src \
-    && printf "pub fn _planner_stub() {}\n" > src/lib.rs \
-    && printf "fn main() {}\n" > src/main.rs
+RUN mkdir -p crates/gateway/src crates/gateway-p2p/src \
+    && printf "pub fn _planner_stub() {}\n" > crates/gateway/src/lib.rs \
+    && printf "fn main() {}\n" > crates/gateway/src/main.rs \
+    && printf "pub fn _planner_stub() {}\n" > crates/gateway-p2p/src/lib.rs
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -58,7 +61,7 @@ RUN --mount=type=secret,id=github_token \
     if [ -f /run/secrets/github_token ]; then \
       git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/"; \
     fi \
-    && cargo build --release
+    && cargo build --release -p wattetheria-gateway
 
 FROM debian:bookworm-slim
 RUN apt-get update \

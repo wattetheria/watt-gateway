@@ -673,15 +673,13 @@ async fn try_fetch_snapshot_via_iroh(
     let Some(snapshot) = known_snapshot else {
         return Ok(None);
     };
-    let fetched = state
-        .node_client
-        .fetch_signed_snapshot_via_iroh(
-            &handle.state_dir,
-            &handle.local_peer_id,
-            &contact,
-            &snapshot.node_id,
-        )
-        .await?;
+    let fetched = crate::gateway_network::fetch_signed_snapshot_via_iroh(
+        &handle.state_dir,
+        &handle.local_peer_id,
+        &contact,
+        &snapshot.node_id,
+    )
+    .await?;
     Ok(Some(fetched))
 }
 

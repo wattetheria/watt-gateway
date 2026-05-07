@@ -1,25 +1,77 @@
-use crate::config::GatewayP2pConfig;
-use crate::models::SignedPublicClientSnapshot;
 use anyhow::{Result, anyhow};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_substrate::{
-    NetworkRuntimeObservabilitySnapshot, PeerId, SubstrateNode, SubstrateRuntime, SwarmScope,
-    TrafficGuardPeerHealth,
+    NetworkNodeId, NetworkRuntimeObservabilitySnapshot, SubstrateConfig, SubstrateNode,
+    SubstrateRuntime, SwarmScope, TopicNamespace, TrafficGuardPeerHealth,
 };
 use wattswarm_network_transport_core::{
-    PeerTransportCapabilities, TransferIntent, TransportContactMaterial, TransportRoute,
-    TransportRouter,
+    DirectDataFetchRequest, DirectDataObjectKind, PeerTransportCapabilities, TransferIntent,
+    TransportContactMaterial, TransportRoute, TransportRouter,
 };
 use wattswarm_network_transport_iroh::{
-    export_local_contact_material, shutdown_local_iroh_data_plane,
+    export_local_contact_material_for_network_peer_id, fetch_direct_data_for_network_peer_id,
+    shutdown_local_iroh_data_plane,
 };
 
 const NODE_SEED_FILE: &str = "node_seed.hex";
 const STATE_LOCK_FILE: &str = ".wattetheria-gateway-p2p.lock";
 pub const PUBLIC_CLIENT_SNAPSHOT_SCOPE: &str = "public-client-snapshot";
+
+#[derive(Debug, Clone)]
+pub struct GatewayP2pConfig {
+    pub enabled: bool,
+    pub state_dir: PathBuf,
+    pub namespace: TopicNamespace,
+    pub protocol_version: String,
+    pub listen_addrs: Vec<String>,
+    pub bootstrap_peers: Vec<String>,
+    pub max_backfill_events: usize,
+    pub max_backfill_events_hard_limit: usize,
+}
+
+impl Default for GatewayP2pConfig {
+    fn default() -> Self {
+        let mut config = Self::from_substrate(SubstrateConfig::default());
+        config.enabled = false;
+        config.namespace.network = "wattetheria-gateway".to_owned();
+        config.protocol_version = "/wattetheria-gateway/0.1.0".to_owned();
+        config
+    }
+}
+
+impl GatewayP2pConfig {
+    fn from_substrate(config: SubstrateConfig) -> Self {
+        Self {
+            enabled: false,
+            state_dir: PathBuf::from(".wattetheria-gateway-p2p-state"),
+            namespace: config.namespace,
+            protocol_version: config.protocol_version,
+            listen_addrs: config.listen_addrs,
+            bootstrap_peers: config.bootstrap_peers,
+            max_backfill_events: config.max_backfill_events,
+            max_backfill_events_hard_limit: config.max_backfill_events_hard_limit,
+        }
+    }
+
+    pub fn as_substrate(&self) -> SubstrateConfig {
+        SubstrateConfig {
+            namespace: self.namespace.clone(),
+            protocol_version: self.protocol_version.clone(),
+            listen_addrs: self.listen_addrs.clone(),
+            bootstrap_peers: self.bootstrap_peers.clone(),
+            max_backfill_events: self.max_backfill_events,
+            max_backfill_events_hard_limit: self.max_backfill_events_hard_limit,
+            control_request_timeout_ms: SubstrateConfig::default().control_request_timeout_ms,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.as_substrate().validate()
+    }
+}
 
 pub struct GatewayNetworkNode {
     inner: SubstrateNode,
@@ -32,9 +84,13 @@ impl GatewayNetworkNode {
     pub fn generate(config: GatewayP2pConfig) -> Result<Self> {
         initialize_state_dir(&config.state_dir)?;
         let (lock_path, lock_file) = acquire_state_dir_lock(&config.state_dir)?;
-        let local_key = load_or_create_identity_keypair(&config.state_dir.join(NODE_SEED_FILE))?;
+        let local_seed = load_or_create_identity_seed(&config.state_dir.join(NODE_SEED_FILE))?;
         Ok(Self {
-            inner: SubstrateNode::new(config.as_substrate(), local_key)?,
+            inner: SubstrateNode::from_seed_bytes(
+                config.as_substrate(),
+                config.state_dir.clone(),
+                local_seed,
+            )?,
             state_dir: config.state_dir,
             lock_path,
             lock_file,
@@ -53,7 +109,7 @@ pub struct GatewayNetworkRuntime {
 pub struct GatewayNetworkHandle {
     pub info: GatewayNetworkInfo,
     pub state_dir: PathBuf,
-    pub local_peer_id: PeerId,
+    pub local_peer_id: NetworkNodeId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,7 +164,7 @@ impl GatewayNetworkRuntime {
         })
     }
 
-    pub fn local_peer_id(&self) -> PeerId {
+    pub fn local_peer_id(&self) -> NetworkNodeId {
         self.inner.local_peer_id()
     }
 
@@ -136,7 +192,11 @@ impl GatewayNetworkRuntime {
         &self,
         generated_at: u64,
     ) -> Result<TransportContactMaterial> {
-        export_local_contact_material(&self.state_dir, &self.local_peer_id(), generated_at)
+        export_local_contact_material_for_network_peer_id(
+            &self.state_dir,
+            self.local_peer_id().as_str(),
+            generated_at,
+        )
     }
 
     pub fn recommended_transfer_route(
@@ -179,20 +239,57 @@ impl Drop for GatewayNetworkRuntime {
     }
 }
 
-pub fn persist_snapshot_artifact(
+pub async fn fetch_signed_snapshot_via_iroh<T>(
     state_dir: &Path,
-    snapshot: &SignedPublicClientSnapshot,
+    local_peer_id: &NetworkNodeId,
+    remote_contact: &TransportContactMaterial,
+    snapshot_id: &str,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let response = fetch_direct_data_for_network_peer_id(
+        state_dir,
+        local_peer_id.as_str(),
+        remote_contact,
+        &DirectDataFetchRequest {
+            object_kind: DirectDataObjectKind::SnapshotJson,
+            object_id: snapshot_id.to_owned(),
+            scope: Some(PUBLIC_CLIENT_SNAPSHOT_SCOPE.to_owned()),
+            source_uri: None,
+            expected_digest: None,
+            expected_size: None,
+        },
+    )?;
+    Ok(serde_json::from_slice(&response.bytes)?)
+}
+
+pub fn persist_snapshot_artifact_bytes(
+    state_dir: &Path,
+    snapshot_node_id: &str,
+    bytes: &[u8],
 ) -> Result<PathBuf> {
-    let bytes = serde_json::to_vec(snapshot)?;
     let artifact_store = open_local_artifact_store(state_dir)?;
     artifact_store.write_validated_bytes(
         ArtifactKind::Snapshot,
-        &snapshot.payload.node_id,
+        snapshot_node_id,
         Some(PUBLIC_CLIENT_SNAPSHOT_SCOPE),
-        &bytes,
+        bytes,
         None,
         Some(bytes.len() as u64),
     )
+}
+
+pub fn persist_json_snapshot_artifact<T>(
+    state_dir: &Path,
+    snapshot_node_id: &str,
+    snapshot: &T,
+) -> Result<PathBuf>
+where
+    T: Serialize,
+{
+    let bytes = serde_json::to_vec(snapshot)?;
+    persist_snapshot_artifact_bytes(state_dir, snapshot_node_id, &bytes)
 }
 
 fn initialize_state_dir(state_dir: &Path) -> Result<()> {
@@ -211,13 +308,15 @@ fn acquire_state_dir_lock(state_dir: &Path) -> Result<(PathBuf, File)> {
     Ok((lock_path, lock_file))
 }
 
-fn load_or_create_identity_keypair(seed_file: &Path) -> Result<libp2p_identity::Keypair> {
+fn load_or_create_identity_seed(seed_file: &Path) -> Result<[u8; 32]> {
     if seed_file.exists() {
-        let mut bytes = hex::decode(fs::read_to_string(seed_file)?.trim())?;
+        let bytes = hex::decode(fs::read_to_string(seed_file)?.trim())?;
         if bytes.len() != 32 {
             anyhow::bail!("seed must be 32 bytes");
         }
-        return Ok(libp2p_identity::Keypair::ed25519_from_bytes(&mut bytes)?);
+        let mut seed = [0_u8; 32];
+        seed.copy_from_slice(&bytes);
+        return Ok(seed);
     }
 
     let seed: [u8; 32] = rand::random();
@@ -225,7 +324,7 @@ fn load_or_create_identity_keypair(seed_file: &Path) -> Result<libp2p_identity::
         fs::create_dir_all(parent)?;
     }
     fs::write(seed_file, hex::encode(seed))?;
-    Ok(libp2p_identity::Keypair::ed25519_from_bytes(seed.to_vec())?)
+    Ok(seed)
 }
 
 fn artifact_store_path(state_dir: &Path) -> PathBuf {

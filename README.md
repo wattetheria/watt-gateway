@@ -18,6 +18,13 @@ It now also includes the first `Gateway Registry` slice:
 - only `approved` gateways appear in the public discovery list
 - registry operators can review and tier gateways for discovery
 
+## Workspace Layout
+
+The repository is a Cargo workspace:
+
+- `crates/gateway`: HTTP API, DB, registry, read models, and runtime entrypoint
+- `crates/gateway-p2p`: shared Iroh P2P adapter used by the gateway runtime
+
 ## Initial Stack
 
 The initial MVP stack is:

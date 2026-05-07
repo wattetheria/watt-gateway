@@ -3,9 +3,7 @@ use anyhow::{Context, Result};
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use wattswarm_network_substrate::{PeerHandshakeMetadata, SubstrateConfig, TopicNamespace};
-
-pub const GATEWAY_IDENTIFY_AGENT_PREFIX: &str = "wattetheria-gateway-p2p";
+pub use wattetheria_gateway_p2p::GatewayP2pConfig;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -17,84 +15,6 @@ pub struct Config {
     pub bootstrap_registry_urls: Vec<String>,
     pub gateway_identity: GatewayIdentityConfig,
     pub p2p: GatewayP2pConfig,
-}
-
-#[derive(Debug, Clone)]
-pub struct GatewayP2pConfig {
-    pub enabled: bool,
-    pub state_dir: PathBuf,
-    pub namespace: TopicNamespace,
-    pub protocol_version: String,
-    pub identify_agent_version: String,
-    pub listen_addrs: Vec<String>,
-    pub bootstrap_peers: Vec<String>,
-    pub enable_mdns: bool,
-    pub max_established_per_peer: u32,
-    pub gossipsub_d: usize,
-    pub gossipsub_d_low: usize,
-    pub gossipsub_d_high: usize,
-    pub gossipsub_heartbeat_ms: u64,
-    pub gossipsub_max_transmit_size: usize,
-    pub max_backfill_events: usize,
-    pub max_backfill_events_hard_limit: usize,
-}
-
-impl Default for GatewayP2pConfig {
-    fn default() -> Self {
-        let mut config = Self::from_substrate(SubstrateConfig::default());
-        config.enabled = false;
-        config.namespace.network = "wattetheria-gateway".to_owned();
-        config.protocol_version = "/wattetheria-gateway/0.1.0".to_owned();
-        config.identify_agent_version =
-            encode_gateway_agent_version(&PeerHandshakeMetadata::default());
-        config
-    }
-}
-
-impl GatewayP2pConfig {
-    fn from_substrate(config: SubstrateConfig) -> Self {
-        Self {
-            enabled: false,
-            state_dir: PathBuf::from(".wattetheria-gateway-p2p-state"),
-            namespace: config.namespace,
-            protocol_version: config.protocol_version,
-            identify_agent_version: config.identify_agent_version,
-            listen_addrs: config.listen_addrs,
-            bootstrap_peers: config.bootstrap_peers,
-            enable_mdns: config.enable_mdns,
-            max_established_per_peer: config.max_established_per_peer,
-            gossipsub_d: config.gossipsub_d,
-            gossipsub_d_low: config.gossipsub_d_low,
-            gossipsub_d_high: config.gossipsub_d_high,
-            gossipsub_heartbeat_ms: config.gossipsub_heartbeat_ms,
-            gossipsub_max_transmit_size: config.gossipsub_max_transmit_size,
-            max_backfill_events: config.max_backfill_events,
-            max_backfill_events_hard_limit: config.max_backfill_events_hard_limit,
-        }
-    }
-
-    pub fn as_substrate(&self) -> SubstrateConfig {
-        SubstrateConfig {
-            namespace: self.namespace.clone(),
-            protocol_version: self.protocol_version.clone(),
-            identify_agent_version: self.identify_agent_version.clone(),
-            listen_addrs: self.listen_addrs.clone(),
-            bootstrap_peers: self.bootstrap_peers.clone(),
-            enable_mdns: self.enable_mdns,
-            max_established_per_peer: self.max_established_per_peer,
-            gossipsub_d: self.gossipsub_d,
-            gossipsub_d_low: self.gossipsub_d_low,
-            gossipsub_d_high: self.gossipsub_d_high,
-            gossipsub_heartbeat_ms: self.gossipsub_heartbeat_ms,
-            gossipsub_max_transmit_size: self.gossipsub_max_transmit_size,
-            max_backfill_events: self.max_backfill_events,
-            max_backfill_events_hard_limit: self.max_backfill_events_hard_limit,
-        }
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        self.as_substrate().validate()
-    }
 }
 
 impl Config {
@@ -176,8 +96,4 @@ fn parse_csv(value: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-fn encode_gateway_agent_version(metadata: &PeerHandshakeMetadata) -> String {
-    metadata.encode_agent_version_with_prefix(GATEWAY_IDENTIFY_AGENT_PREFIX)
 }

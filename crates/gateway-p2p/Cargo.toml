@@ -1,0 +1,15 @@
+[package]
+name = "wattetheria-gateway-p2p"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wattswarm-artifact-store.workspace = true
+wattswarm-network-substrate.workspace = true
+wattswarm-network-transport-core.workspace = true
+wattswarm-network-transport-iroh.workspace = true
