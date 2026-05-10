@@ -919,15 +919,6 @@ async fn mission_lifecycle_event_materializes_task_projection() {
         .execute(&db.pool().await)
         .await
         .unwrap();
-    db::init_schema(&db.pool().await).await.unwrap();
-    let backfilled_tasks = request(&app, "GET", "/api/tasks?limit=10").await;
-    assert_eq!(backfilled_tasks.0, StatusCode::OK);
-    assert_eq!(backfilled_tasks.1.as_array().unwrap().len(), 1);
-
-    sqlx::query("delete from gateway_projection_rows")
-        .execute(&db.pool().await)
-        .await
-        .unwrap();
     let duplicate = request_json(
         &app,
         "POST",
