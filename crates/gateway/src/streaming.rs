@@ -1,5 +1,6 @@
 use crate::contracts::{
     DataKind, EventScope, GatewayUiEvent, SignedNodeEvent, UiStreamQuery, allows_public_stream,
+    projection_identity_key, visibility_for_kind,
 };
 use crate::db;
 use crate::http::ingest_signed_snapshot;
@@ -12,7 +13,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 pub async fn ingest_node_event(
@@ -161,8 +162,10 @@ pub async fn persist_signed_node_event(
     )
     .await?;
     let Some(row) = inserted else {
+        materialize_mission_lifecycle_projection(state, event, source_id, provisional).await?;
         return Ok(None);
     };
+    materialize_mission_lifecycle_projection(state, event, source_id, provisional).await?;
     let ui_event = GatewayUiEvent::try_from(row.clone())?;
     state.publish_ui_event(ui_event);
     let bus_event = json!({
@@ -177,6 +180,110 @@ pub async fn persist_signed_node_event(
         .publish_event("gateway.event.ingested", &bus_event)
         .await;
     Ok(Some(row.cursor))
+}
+
+async fn materialize_mission_lifecycle_projection(
+    state: &AppState,
+    event: &SignedNodeEvent,
+    source_id: Option<Uuid>,
+    provisional: bool,
+) -> Result<()> {
+    if event.payload.data_kind != DataKind::MissionLifecycle {
+        return Ok(());
+    }
+    let mut payload = event.payload.payload.clone();
+    let mission_id = mission_identity(&payload);
+    let Some(object) = payload.as_object_mut() else {
+        return Ok(());
+    };
+    object
+        .entry("task_type".to_string())
+        .or_insert_with(|| Value::String("wattetheria.mission".to_string()));
+    object
+        .entry("source_node_id".to_string())
+        .or_insert_with(|| Value::String(event.payload.node_id.clone()));
+    object
+        .entry("publisher_wattswarm_node_id".to_string())
+        .or_insert_with(|| Value::String(event.payload.node_id.clone()));
+    object
+        .entry("mission_scope_hint".to_string())
+        .or_insert_with(|| Value::String(format!("node:{}", event.payload.node_id)));
+    object
+        .entry("mission_feed_key".to_string())
+        .or_insert_with(|| Value::String("wattetheria.missions".to_string()));
+    object
+        .entry("status".to_string())
+        .and_modify(|status| normalize_mission_event_status(status, &event.payload.event_kind))
+        .or_insert_with(|| {
+            Value::String(status_from_mission_event_kind(&event.payload.event_kind))
+        });
+    if let Some(mission_id) = mission_id {
+        object
+            .entry("mission_id".to_string())
+            .or_insert_with(|| Value::String(mission_id.clone()));
+        object
+            .entry("task_id".to_string())
+            .or_insert_with(|| Value::String(mission_id.clone()));
+        object
+            .entry("id".to_string())
+            .or_insert_with(|| Value::String(mission_id));
+    }
+
+    let data_kind = serde_json::to_string(&DataKind::TaskSummary)?
+        .trim_matches('"')
+        .to_string();
+    let visibility = serde_json::to_string(&visibility_for_kind(DataKind::TaskSummary))?
+        .trim_matches('"')
+        .to_string();
+    let identity_key =
+        projection_identity_key(DataKind::TaskSummary, &payload, &event.payload.node_id);
+    let provenance = json!({
+        "source_node_id": event.payload.node_id,
+        "source_cursor_or_seq": event.payload.seq,
+        "ingest_path": "event_push",
+        "last_confirmed_at": if provisional { Value::Null } else { Value::Number(event.payload.timestamp.into()) },
+        "last_provisional_at": if provisional { Value::Number(event.payload.timestamp.into()) } else { Value::Null },
+    });
+    db::upsert_projection_row(
+        &state.pool,
+        db::UpsertProjectionRecord {
+            data_kind: &data_kind,
+            identity_key: &identity_key,
+            source_node_id: &event.payload.node_id,
+            source_id,
+            generated_at: event.payload.timestamp,
+            visibility: &visibility,
+            payload: &payload,
+            provenance: &provenance,
+        },
+    )
+    .await
+}
+
+fn mission_identity(payload: &Value) -> Option<String> {
+    payload
+        .get("mission_id")
+        .or_else(|| payload.get("task_id"))
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_mission_event_status(status: &mut Value, event_kind: &str) {
+    if status.as_str().is_none_or(|value| value == "open") {
+        *status = Value::String(status_from_mission_event_kind(event_kind));
+    }
+}
+
+fn status_from_mission_event_kind(event_kind: &str) -> String {
+    match event_kind {
+        "mission.claimed" => "claimed",
+        "mission.completed" => "completed",
+        "mission.settled" => "settled",
+        _ => "published",
+    }
+    .to_string()
 }
 
 fn normalized_event_scope(event: &SignedNodeEvent) -> EventScope {

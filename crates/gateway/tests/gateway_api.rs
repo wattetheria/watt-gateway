@@ -855,6 +855,96 @@ async fn ephemeral_only_events_are_streamed_without_persisting_ui_rows() {
 }
 
 #[tokio::test]
+async fn mission_lifecycle_event_materializes_task_projection() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let mut event = signed_node_event(
+        "node-mission",
+        DataKind::MissionLifecycle,
+        "mission.published",
+        json!({
+            "mission_id": "mission-event-1",
+            "title": "Gateway Event Mission",
+            "description": "Published through event push",
+            "domain": "culture",
+            "status": "open",
+            "publisher": "agent-publisher",
+            "publisher_kind": "player",
+            "reward": {
+                "agent_watt": 0,
+                "capacity": 0,
+                "reputation": 0,
+                "treasury_share_watt": 0
+            }
+        }),
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    event.payload.scope.task_id = Some("mission-event-1".to_string());
+    event.payload.identity_key = Some("mission-event-1".to_string());
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    event.signature = base64::engine::general_purpose::STANDARD.encode(
+        signing_key
+            .sign(&canonical_bytes(&event.payload).unwrap())
+            .to_bytes(),
+    );
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let persisted_events: i64 = sqlx::query_scalar("select count(*) from gateway_ui_events")
+        .fetch_one(&db.pool().await)
+        .await
+        .unwrap();
+    assert_eq!(persisted_events, 1);
+
+    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    assert_eq!(tasks.0, StatusCode::OK);
+    assert_eq!(tasks.1.as_array().unwrap().len(), 1);
+    assert_eq!(tasks.1[0]["mission_id"].as_str(), Some("mission-event-1"));
+    assert_eq!(tasks.1[0]["task_id"].as_str(), Some("mission-event-1"));
+    assert_eq!(
+        tasks.1[0]["task_type"].as_str(),
+        Some("wattetheria.mission")
+    );
+    assert_eq!(tasks.1[0]["status"].as_str(), Some("published"));
+    assert_eq!(tasks.1[0]["source_node_id"].as_str(), Some("node-mission"));
+
+    sqlx::query("delete from gateway_projection_rows")
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
+    db::init_schema(&db.pool().await).await.unwrap();
+    let backfilled_tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    assert_eq!(backfilled_tasks.0, StatusCode::OK);
+    assert_eq!(backfilled_tasks.1.as_array().unwrap().len(), 1);
+
+    sqlx::query("delete from gateway_projection_rows")
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
+    let duplicate = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(duplicate.0, StatusCode::OK);
+    assert_eq!(duplicate.1["status"].as_str(), Some("duplicate"));
+    let restored_tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    assert_eq!(restored_tasks.0, StatusCode::OK);
+    assert_eq!(restored_tasks.1.as_array().unwrap().len(), 1);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn sync_nodes_reports_partial_when_wattswarm_collection_fails() {
     let db = TestDatabase::new().await;
     let snapshot = signed_snapshot(
