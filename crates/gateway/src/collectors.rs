@@ -23,24 +23,6 @@ pub struct WattswarmNetworkProjectionSnapshot {
     pub peers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WattswarmTaskProjectionSummary {
-    pub task_id: String,
-    pub task_type: String,
-    pub epoch: u64,
-    pub terminal_state: String,
-    pub committed_candidate_id: Option<String>,
-    pub finalized_candidate_id: Option<String>,
-    pub retry_attempt: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct WattswarmTaskRunProjectionSnapshot {
-    pub generated_at: u64,
-    pub recent_tasks: Vec<WattswarmTaskProjectionSummary>,
-    pub recent_runs: Vec<Value>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WattswarmTopicMessageView {
     pub message_id: String,
@@ -82,18 +64,6 @@ pub async fn collect_wattswarm_read_models(state: &AppState, source: &NodeSource
         .await?;
     persist_network_projection(state, source, &network).await?;
 
-    let task_run: WattswarmTaskRunProjectionSnapshot = state
-        .node_client
-        .fetch_json(
-            &format!("{base_url}/api/wattetheria/task-run/snapshot"),
-            Some(&[
-                ("task_limit", "200".to_string()),
-                ("run_limit", "50".to_string()),
-            ]),
-        )
-        .await?;
-    persist_task_projection(state, source, &task_run).await?;
-
     collect_topic_activity_read_models(state, source, base_url).await?;
     Ok(())
 }
@@ -126,42 +96,6 @@ async fn persist_network_projection(
         payload,
     )
     .await
-}
-
-async fn persist_task_projection(
-    state: &AppState,
-    source: &NodeSourceRow,
-    snapshot: &WattswarmTaskRunProjectionSnapshot,
-) -> Result<()> {
-    let source_node_id = source
-        .expected_wattswarm_node_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(&source.name);
-    let generated_at = i64::try_from(snapshot.generated_at).unwrap_or(i64::MAX);
-    for task in &snapshot.recent_tasks {
-        let payload = json!({
-            "task_id": task.task_id,
-            "task_type": task.task_type,
-            "epoch": task.epoch,
-            "terminal_state": task.terminal_state,
-            "committed_candidate_id": task.committed_candidate_id,
-            "finalized_candidate_id": task.finalized_candidate_id,
-            "retry_attempt": task.retry_attempt,
-            "snapshot_generated_at": snapshot.generated_at,
-        });
-        persist_projection(
-            state,
-            DataKind::TaskSummary,
-            projection_identity_key(DataKind::TaskSummary, &payload, source_node_id),
-            source_node_id,
-            source.id,
-            generated_at,
-            payload,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 async fn collect_topic_activity_read_models(
@@ -270,15 +204,6 @@ async fn persist_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn task_projection_serializes_task_id_identity() {
-        let payload = json!({"task_id":"task-1"});
-        assert_eq!(
-            projection_identity_key(DataKind::TaskSummary, &payload, "node-a"),
-            "task-1"
-        );
-    }
 
     #[test]
     fn network_projection_payload_carries_snapshot_timestamp() {

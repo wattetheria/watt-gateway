@@ -988,6 +988,64 @@ async fn sync_nodes_reports_partial_when_wattswarm_collection_fails() {
 }
 
 #[tokio::test]
+async fn sync_nodes_does_not_require_or_import_wattswarm_task_run_snapshot() {
+    let db = TestDatabase::new().await;
+    let snapshot = signed_snapshot(
+        "node-product-tasks",
+        SnapshotContents {
+            network_name: Some("Watt Etheria"),
+            network_org_name: Some("Aether Prime"),
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[json!({
+                "id":"mission-product-1",
+                "title":"Product mission",
+                "status":"published"
+            })],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    let export_server = MockExportServer::spawn(snapshot.clone()).await;
+    let wattswarm_server = MockWattswarmReadModelServer::spawn().await;
+    let app = test_app(&db.database_url).await;
+
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/nodes/register",
+        json!({
+            "name": "product-task-node",
+            "export_url": export_server.export_url(),
+            "expected_signer_agent_did": snapshot.signer_agent_did,
+            "wattswarm_ui_base_url": wattswarm_server.base_url()
+        }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+
+    let sync = request_json(&app, "POST", "/api/nodes/sync", json!({})).await;
+    assert_eq!(sync.0, StatusCode::OK);
+    assert_eq!(sync.1[0]["sync_status"].as_str(), Some("ok"));
+    assert!(sync.1[0]["wattswarm_collect_error"].is_null());
+
+    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    assert_eq!(tasks.0, StatusCode::OK);
+    assert_eq!(tasks.1.as_array().unwrap().len(), 1);
+    assert_eq!(tasks.1[0]["id"].as_str(), Some("mission-product-1"));
+    assert_eq!(tasks.1[0]["status"].as_str(), Some("published"));
+    assert!(tasks.1[0].get("terminal_state").is_none());
+
+    drop(app);
+    wattswarm_server.abort();
+    export_server.abort();
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn gateway_registry_requires_review_before_public_discovery() {
     let db = TestDatabase::new().await;
     let app = test_app(&db.database_url).await;
@@ -1625,6 +1683,54 @@ impl MockExportServer {
 
     fn export_url(&self) -> String {
         format!("http://{}/v1/client/export", self.addr)
+    }
+
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+struct MockWattswarmReadModelServer {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MockWattswarmReadModelServer {
+    async fn spawn() -> Self {
+        let app = Router::new().route(
+            "/api/wattetheria/network/snapshot",
+            get(|| async {
+                Json(json!({
+                    "generated_at": 1_778_000_000_u64,
+                    "node_id": "wattswarm-node-1",
+                    "display_name": "Wattswarm Node",
+                    "org_id": "org-1",
+                    "network_id": "net-1",
+                    "running": true,
+                    "mode": "network",
+                    "peer_protocol_distribution": {},
+                    "peers": []
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let network_url = format!("http://{addr}/api/wattetheria/network/snapshot");
+        let client = reqwest::Client::new();
+        for _ in 0..20 {
+            if client.get(&network_url).send().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Self { addr, task }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
     }
 
     fn abort(self) {

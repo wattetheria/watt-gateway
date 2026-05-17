@@ -30,9 +30,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_summary_defaults_to_wattswarm_primary() {
+    fn task_summary_defaults_to_wattetheria_primary() {
         let policy = source_policy(DataKind::TaskSummary);
-        assert_eq!(policy.primary, SourceSystem::Wattswarm);
+        assert_eq!(policy.primary, SourceSystem::Wattetheria);
+        assert_eq!(policy.fallback, None);
         assert_eq!(policy.ingest_mode, GatewayIngestMode::SnapshotPush);
     }
 

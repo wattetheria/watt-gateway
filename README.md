@@ -49,15 +49,17 @@ They are roadmap items, not part of the initial gateway baseline.
 
 The gateway sits above two different data planes:
 
-- `wattswarm` is the foundation/P2P layer. It exposes live network and task
-  projections through its UI HTTP API and, when enabled, a gRPC streaming API.
+- `wattswarm` is the foundation/P2P layer. It exposes live network, task,
+  topic, and social projections through its node-local APIs. Gateway only pulls
+  the Wattswarm HTTP read models that are explicitly safe for public Gateway
+  aggregation.
 - `wattetheria` is the application/rules layer. It subscribes to the Wattswarm
   gRPC stream, folds that data into the node's local application state, signs
   public snapshots/events, and can push those signed records to a gateway.
 - `wattetheria-gateway` is non-authoritative. It verifies signed Wattetheria
-  data, optionally pulls Wattswarm read models directly from a configured
-  Wattswarm UI endpoint, persists read models in Postgres, and serves public
-  query APIs.
+  data, optionally pulls selected Wattswarm read models directly from a
+  configured Wattswarm UI endpoint, persists read models in Postgres, and serves
+  public query APIs.
 
 There are three distinct sync paths:
 
@@ -71,8 +73,9 @@ There are three distinct sync paths:
 3. `Gateway -> Wattetheria / Wattswarm`: Gateway pull mode is exposed through
    `POST /api/nodes/sync`. For each registered node source, the gateway pulls
    the Wattetheria signed export. If the node source also has
-   `wattswarm_ui_base_url`, the gateway directly pulls Wattswarm HTTP read
-   models from that URL.
+   `wattswarm_ui_base_url`, the gateway directly pulls selected Wattswarm HTTP
+   read models from that URL. This pull path is not the authority for task
+   marketplace lifecycle state.
 
 Gateway pull mode is trigger-based in the current implementation: an operator,
 deployment scheduler, or external automation calls `POST /api/nodes/sync`.
@@ -82,7 +85,7 @@ The gateway process does not currently run an internal periodic sync loop.
 flowchart LR
     subgraph WS["Wattswarm node"]
         WS_P2P["P2P transport, gossip, tasks"]
-        WS_HTTP["HTTP read models\n/api/wattetheria/network/snapshot\n/api/wattetheria/task-run/snapshot\n/api/wattetheria/topic/activity"]
+        WS_HTTP["HTTP read models\n/api/wattetheria/network/snapshot\n/api/wattetheria/topic/activity"]
         WS_GRPC["gRPC projection streams\nnetwork/task/topic/social"]
         WS_P2P --> WS_HTTP
         WS_P2P --> WS_GRPC
@@ -115,7 +118,7 @@ flowchart LR
     WT_SYNC -- "subscribes/pulls gRPC" --> WS_GRPC
     WT_PUSH -- "pushes signed snapshots/events" --> GW_INGEST
     GW_SYNC -- "pulls signed export" --> WT_EXPORT
-    GW_SYNC -- "optionally pulls direct Wattswarm HTTP read models\nwhen wattswarm_ui_base_url is configured" --> WS_HTTP
+    GW_SYNC -- "optionally pulls selected Wattswarm HTTP read models\nwhen wattswarm_ui_base_url is configured" --> WS_HTTP
 ```
 
 ## Wattetheria Signed Snapshot Ingest
@@ -152,7 +155,7 @@ and stores the latest verified snapshot per node in Postgres.
 A registered node source may also include:
 
 - `wattswarm_ui_base_url`: a Wattswarm UI base URL used by the gateway to pull
-  Wattswarm HTTP read models directly.
+  selected Wattswarm HTTP read models directly.
 - `wattswarm_sync_grpc_endpoint`: reserved endpoint metadata for the Wattswarm
   sync gRPC service. The current gateway collector stores this field but reads
   Wattswarm data through `wattswarm_ui_base_url`.
@@ -160,18 +163,35 @@ A registered node source may also include:
 When `wattswarm_ui_base_url` is configured, `POST /api/nodes/sync` also pulls:
 
 - `GET /api/wattetheria/network/snapshot`
-- `GET /api/wattetheria/task-run/snapshot`
 - `GET /api/wattetheria/topic/activity`
 
-Those projections are persisted as gateway read models such as network
-projection, task summaries, and public topic activity.
+Those projections are persisted as Gateway read models for public network
+projection and Hive/topic activity.
+
+Task marketplace state is intentionally excluded from this direct Wattswarm pull
+path. `/api/tasks` is fed by Wattetheria signed snapshots and signed lifecycle
+events only, because Wattetheria owns the product mission board fields such as
+`published`, `claimed`, `completed`, `settled`, publisher, claimer, rewards,
+world, domain, and client-facing lifecycle state. Wattswarm task/run projection
+is a lower-level mechanism view and must not overwrite or mix into Gateway
+`TaskSummary` rows.
+
+The current split is:
+
+| Gateway data | Source of truth | Ingest path |
+| --- | --- | --- |
+| Task marketplace `/api/tasks` | Wattetheria mission/task projection | `POST /api/ingest/snapshot`, `POST /api/ingest/event`, or Gateway pull of `GET /v1/client/export` |
+| Hive metadata `/api/topics` | Wattetheria topic registry wrapping Wattswarm topic facts | Wattetheria signed snapshot/event |
+| Hive activity `/api/topic-messages` | Wattswarm `topic_messages` / `topic_cursors` for public hives | Optional Gateway pull from `/api/wattetheria/topic/activity` after Hive metadata is known |
+| Network projection | Wattswarm node-local network view | Optional Gateway pull from `/api/wattetheria/network/snapshot` |
+| Social/DM/private relationship state | Node-local/private Wattswarm and Wattetheria state | Not part of the public Gateway collector |
 
 ## MVP Responsibilities
 
 - register upstream `wattetheria` node export URLs and optional Wattswarm UI
   endpoints
 - sync signed public snapshots from registered nodes
-- pull Wattswarm network/task/topic read models directly when
+- pull selected Wattswarm network/topic read models directly when
   `wattswarm_ui_base_url` is configured
 - accept direct signed snapshot pushes from user-local nodes
 - accept signed event pushes from user-local nodes
