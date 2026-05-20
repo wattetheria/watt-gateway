@@ -136,12 +136,17 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     assert_eq!(peers.1.as_array().unwrap().len(), 2);
     assert_eq!(peers.1[0]["source_node_id"].as_str(), Some("node-alpha"));
 
-    let topics = request(&app, "GET", "/api/topics?limit=10").await;
+    let topics = request(&app, "GET", "/v1/wattetheria/hives?limit=10").await;
     assert_eq!(topics.0, StatusCode::OK);
     assert_eq!(topics.1.as_array().unwrap().len(), 1);
     assert_eq!(topics.1[0]["source_node_id"].as_str(), Some("node-alpha"));
 
-    let topic_messages = request(&app, "GET", "/api/topic-messages?limit=10").await;
+    let topic_messages = request(
+        &app,
+        "GET",
+        "/v1/wattetheria/hives/topic-public-1/messages?limit=10",
+    )
+    .await;
     assert_eq!(topic_messages.0, StatusCode::OK);
     assert_eq!(topic_messages.1.as_array().unwrap().len(), 1);
     assert_eq!(
@@ -169,7 +174,7 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     let dm_messages = request_status(&app, "GET", "/api/dm/messages?limit=10").await;
     assert_eq!(dm_messages, StatusCode::NOT_FOUND);
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/v1/wattetheria/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["source_node_id"].as_str(), Some("node-alpha"));
@@ -255,8 +260,10 @@ async fn upsert_snapshot_replaces_existing_snapshot_for_same_source() {
         db::InsertNodeSourceRecord {
             id: source_id,
             name: "source-a",
-            export_url: "http://127.0.0.1:7777/v1/client/export",
-            wattetheria_snapshot_export_url: Some("http://127.0.0.1:7777/v1/client/export"),
+            export_url: "http://127.0.0.1:7777/v1/wattetheria/client/export",
+            wattetheria_snapshot_export_url: Some(
+                "http://127.0.0.1:7777/v1/wattetheria/client/export",
+            ),
             wattetheria_events_export_url: None,
             wattswarm_ui_base_url: None,
             wattswarm_sync_grpc_endpoint: None,
@@ -482,7 +489,7 @@ async fn ingest_snapshot_accepts_push_without_registered_source() {
 }
 
 #[tokio::test]
-async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
+async fn public_hives_and_messages_are_deduped_sorted_and_filterable() {
     let db = TestDatabase::new().await;
     let app = test_app(&db.database_url).await;
     let first = signed_snapshot(
@@ -576,24 +583,28 @@ async fn public_topics_and_messages_are_deduped_sorted_and_filterable() {
     .await;
     assert_eq!(ingest_second.0, StatusCode::OK);
 
-    let topics = request(&app, "GET", "/api/topics?limit=10").await;
+    let topics = request(&app, "GET", "/v1/wattetheria/hives?limit=10").await;
     assert_eq!(topics.0, StatusCode::OK);
     assert_eq!(topics.1.as_array().unwrap().len(), 2);
     assert_eq!(topics.1[0]["topic_id"].as_str(), Some("topic-b"));
     assert_eq!(topics.1[1]["topic_id"].as_str(), Some("topic-a"));
 
-    let filtered_topics = request(&app, "GET", "/api/topics?organization_id=org-1").await;
+    let filtered_topics = request(&app, "GET", "/v1/wattetheria/hives?organization_id=org-1").await;
     assert_eq!(filtered_topics.0, StatusCode::OK);
     assert_eq!(filtered_topics.1.as_array().unwrap().len(), 1);
     assert_eq!(filtered_topics.1[0]["topic_id"].as_str(), Some("topic-a"));
 
-    let messages = request(&app, "GET", "/api/topic-messages?limit=10").await;
+    let messages = request(
+        &app,
+        "GET",
+        "/v1/wattetheria/hives/topic-b/messages?limit=10",
+    )
+    .await;
     assert_eq!(messages.0, StatusCode::OK);
-    assert_eq!(messages.1.as_array().unwrap().len(), 2);
+    assert_eq!(messages.1.as_array().unwrap().len(), 1);
     assert_eq!(messages.1[0]["message_id"].as_str(), Some("msg-b"));
-    assert_eq!(messages.1[1]["message_id"].as_str(), Some("msg-a"));
 
-    let filtered_messages = request(&app, "GET", "/api/topic-messages?topic_id=topic-a").await;
+    let filtered_messages = request(&app, "GET", "/v1/wattetheria/hives/topic-a/messages").await;
     assert_eq!(filtered_messages.0, StatusCode::OK);
     assert_eq!(filtered_messages.1.as_array().unwrap().len(), 1);
     assert_eq!(filtered_messages.1[0]["message_id"].as_str(), Some("msg-a"));
@@ -656,7 +667,7 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
     .await;
     assert_eq!(stale.0, StatusCode::OK);
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/v1/wattetheria/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1[0]["id"].as_str(), Some("task-new"));
 
@@ -712,7 +723,7 @@ async fn suspended_registered_source_is_hidden_from_public_reads_and_rejects_pus
     assert_eq!(network_status.0, StatusCode::OK);
     assert_eq!(network_status.1["nodes"].as_u64(), Some(0));
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/v1/wattetheria/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 0);
 
@@ -903,7 +914,7 @@ async fn mission_lifecycle_event_materializes_task_projection() {
         .unwrap();
     assert_eq!(persisted_events, 1);
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/v1/wattetheria/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["mission_id"].as_str(), Some("mission-event-1"));
@@ -928,7 +939,7 @@ async fn mission_lifecycle_event_materializes_task_projection() {
     .await;
     assert_eq!(duplicate.0, StatusCode::OK);
     assert_eq!(duplicate.1["status"].as_str(), Some("duplicate"));
-    let restored_tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let restored_tasks = request(&app, "GET", "/v1/wattetheria/missions?limit=10").await;
     assert_eq!(restored_tasks.0, StatusCode::OK);
     assert_eq!(restored_tasks.1.as_array().unwrap().len(), 1);
 
@@ -1032,7 +1043,7 @@ async fn sync_nodes_does_not_require_or_import_wattswarm_task_run_snapshot() {
     assert_eq!(sync.1[0]["sync_status"].as_str(), Some("ok"));
     assert!(sync.1[0]["wattswarm_collect_error"].is_null());
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/v1/wattetheria/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["id"].as_str(), Some("mission-product-1"));
@@ -1328,7 +1339,7 @@ async fn register_node_persists_transport_material_and_routes() {
         "/api/nodes/register",
         json!({
             "name": "alpha",
-            "export_url": "https://alpha.example/v1/client/export",
+            "export_url": "https://alpha.example/v1/wattetheria/client/export",
             "transport_capabilities": PeerTransportCapabilities::iroh_direct_default(),
             "transport_contact_material": {
                 "transport": "iroh_direct",
@@ -1338,13 +1349,13 @@ async fn register_node_persists_transport_material_and_routes() {
                     "generated_at": 1710000000u64,
                     "endpoint_id": "dummy-endpoint",
                     "alpn": "/wattswarm/iroh/1",
-                    "listen_addrs": ["/ip4/127.0.0.1/tcp/0"],
+                    "listen_addrs": ["127.0.0.1:0"],
                     "capabilities": PeerTransportCapabilities::iroh_direct_default()
                 },
                 "extra": {
                     "endpoint_id": "dummy-endpoint",
                     "alpn": "/wattswarm/iroh/1",
-                    "direct_addrs": ["/ip4/127.0.0.1/tcp/0"],
+                    "direct_addrs": ["127.0.0.1:0"],
                     "relay_urls": []
                 }
             }
@@ -1391,7 +1402,7 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
         GatewayNetworkNode::generate(wattetheria_gateway::config::GatewayP2pConfig {
             enabled: true,
             state_dir: remote_state_dir.clone(),
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+            listen_addrs: vec!["127.0.0.1:0".to_string()],
             ..Default::default()
         })
         .unwrap(),
@@ -1425,7 +1436,7 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
         "/api/nodes/register",
         json!({
             "name": "iroh-source",
-            "export_url": "http://127.0.0.1:9/v1/client/export",
+            "export_url": "http://127.0.0.1:9/v1/wattetheria/client/export",
             "transport_capabilities": PeerTransportCapabilities::iroh_direct_default(),
             "transport_contact_material": remote_contact,
         }),
@@ -1455,7 +1466,7 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
     assert_eq!(sync.1.as_array().unwrap().len(), 1);
     assert_eq!(sync.1[0]["node_id"].as_str(), Some("node-iroh"));
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/v1/wattetheria/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["id"].as_str(), Some("task-iroh"));
@@ -1565,7 +1576,7 @@ async fn test_app_with_network(
         GatewayNetworkNode::generate(wattetheria_gateway::config::GatewayP2pConfig {
             enabled: true,
             state_dir: unique_state_dir("gateway-local"),
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+            listen_addrs: vec!["127.0.0.1:0".to_string()],
             ..Default::default()
         })
         .unwrap(),
@@ -1659,7 +1670,7 @@ struct MockExportServer {
 impl MockExportServer {
     async fn spawn(snapshot: SignedPublicClientSnapshot) -> Self {
         let app = Router::new().route(
-            "/v1/client/export",
+            "/v1/wattetheria/client/export",
             get({
                 let snapshot = snapshot.clone();
                 move || async move { Json(snapshot.clone()) }
@@ -1670,7 +1681,7 @@ impl MockExportServer {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let export_url = format!("http://{addr}/v1/client/export");
+        let export_url = format!("http://{addr}/v1/wattetheria/client/export");
         let client = reqwest::Client::new();
         for _ in 0..20 {
             if client.get(&export_url).send().await.is_ok() {
@@ -1682,7 +1693,7 @@ impl MockExportServer {
     }
 
     fn export_url(&self) -> String {
-        format!("http://{}/v1/client/export", self.addr)
+        format!("http://{}/v1/wattetheria/client/export", self.addr)
     }
 
     fn abort(self) {

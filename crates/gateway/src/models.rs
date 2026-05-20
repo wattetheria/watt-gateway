@@ -284,6 +284,7 @@ pub struct ListQuery {
 pub struct TopicQuery {
     pub limit: Option<usize>,
     pub network_id: Option<String>,
+    pub hive_id: Option<String>,
     pub topic_id: Option<String>,
     pub organization_id: Option<String>,
 }
@@ -292,6 +293,7 @@ pub struct TopicQuery {
 pub struct TopicMessageQuery {
     pub limit: Option<usize>,
     pub network_id: Option<String>,
+    pub hive_id: Option<String>,
     pub topic_id: Option<String>,
     pub organization_id: Option<String>,
     pub author_id: Option<String>,

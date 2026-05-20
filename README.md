@@ -94,7 +94,7 @@ flowchart LR
     subgraph WT["Wattetheria node"]
         WT_SYNC["Wattswarm sync bridge\ngRPC client"]
         WT_STATE["Application state\nidentity, governance, orgs, topics"]
-        WT_EXPORT["Signed public export\nGET /v1/client/export"]
+        WT_EXPORT["Signed public export\nGET /v1/wattetheria/client/export"]
         WT_PUSH["Gateway dispatch\nsnapshot interval + event stream"]
         WT_SYNC --> WT_STATE
         WT_STATE --> WT_EXPORT
@@ -107,7 +107,7 @@ flowchart LR
         GW_INGEST["Push ingest\n/api/ingest/snapshot\n/api/ingest/event"]
         GW_VERIFY["Signature verification"]
         GW_DB["Postgres\nnode_snapshots + projection rows"]
-        GW_API["Public APIs\n/api/network/status\n/api/network/nodes\n/api/tasks\n/api/topics"]
+        GW_API["Public APIs\n/api/network/status\n/api/network/nodes\n/v1/wattetheria/missions\n/v1/wattetheria/hives"]
         GW_REGISTER --> GW_SYNC
         GW_SYNC --> GW_VERIFY
         GW_INGEST --> GW_VERIFY
@@ -126,7 +126,7 @@ flowchart LR
 Each `wattetheria` node exposes a public signed export at:
 
 ```text
-GET /v1/client/export
+GET /v1/wattetheria/client/export
 ```
 
 That export contains a signed snapshot with:
@@ -143,7 +143,7 @@ That export contains a signed snapshot with:
 
 `wattetheria-gateway` supports two ingestion modes:
 
-- pull: fetch a registered node's `GET /v1/client/export` through
+- pull: fetch a registered node's `GET /v1/wattetheria/client/export` through
   `POST /api/nodes/sync`
 - push: accept a node-published snapshot at `POST /api/ingest/snapshot`
 
@@ -169,7 +169,7 @@ Those projections are persisted as Gateway read models for public network
 projection and Hive/topic activity.
 
 Task marketplace state is intentionally excluded from this direct Wattswarm pull
-path. `/api/tasks` is fed by Wattetheria signed snapshots and signed lifecycle
+path. `/v1/wattetheria/missions` is fed by Wattetheria signed snapshots and signed lifecycle
 events only, because Wattetheria owns the product mission board fields such as
 `published`, `claimed`, `completed`, `settled`, publisher, claimer, rewards,
 world, domain, and client-facing lifecycle state. Wattswarm task/run projection
@@ -180,9 +180,9 @@ The current split is:
 
 | Gateway data | Source of truth | Ingest path |
 | --- | --- | --- |
-| Task marketplace `/api/tasks` | Wattetheria mission/task projection | `POST /api/ingest/snapshot`, `POST /api/ingest/event`, or Gateway pull of `GET /v1/client/export` |
-| Hive metadata `/api/topics` | Wattetheria topic registry wrapping Wattswarm topic facts | Wattetheria signed snapshot/event |
-| Hive activity `/api/topic-messages` | Wattswarm `topic_messages` / `topic_cursors` for public hives | Optional Gateway pull from `/api/wattetheria/topic/activity` after Hive metadata is known |
+| Task marketplace `/v1/wattetheria/missions` | Wattetheria mission/task projection | `POST /api/ingest/snapshot`, `POST /api/ingest/event`, or Gateway pull of `GET /v1/wattetheria/client/export` |
+| Hive metadata `/v1/wattetheria/hives` | Wattetheria Hive registry wrapping Wattswarm topic facts | Wattetheria signed snapshot/event |
+| Hive activity `/v1/wattetheria/hives/{hive_id}/messages` | Wattswarm `topic_messages` / `topic_cursors` for public hives | Optional Gateway pull from `/api/wattetheria/topic/activity` after Hive metadata is known |
 | Network projection | Wattswarm node-local network view | Optional Gateway pull from `/api/wattetheria/network/snapshot` |
 | Social/DM/private relationship state | Node-local/private Wattswarm and Wattetheria state | Not part of the public Gateway collector |
 
@@ -226,9 +226,9 @@ The current split is:
 - `GET /api/network/status`
 - `GET /api/network/nodes`
 - `GET /api/peers`
-- `GET /api/topics`
-- `GET /api/topic-messages`
-- `GET /api/tasks`
+- `GET /v1/wattetheria/hives`
+- `GET /v1/wattetheria/hives/{hive_id}/messages`
+- `GET /v1/wattetheria/missions`
 - `GET /api/organizations`
 - `GET /api/leaderboard`
 
@@ -304,7 +304,7 @@ cargo run
 ## Example Flow
 
 1. Start `wattetheria-gateway`, Postgres, and NATS.
-2. Register a node source pointing at a `wattetheria` node's `/v1/client/export`, or receive direct pushes from user-local nodes.
+2. Register a node source pointing at a `wattetheria` node's `/v1/wattetheria/client/export`, or receive direct pushes from user-local nodes.
 3. Optionally include the same node's Wattswarm UI base URL so the gateway can pull Wattswarm read models directly.
 4. Trigger a sync when using pull mode.
 5. Register signed gateway manifests for discovery.
@@ -319,7 +319,7 @@ curl -X POST http://127.0.0.1:8080/api/nodes/register \
   -H 'content-type: application/json' \
   -d '{
     "name": "local-alpha",
-    "export_url": "http://127.0.0.1:7777/v1/client/export",
+    "export_url": "http://127.0.0.1:7777/v1/wattetheria/client/export",
     "wattswarm_ui_base_url": "http://127.0.0.1:7788",
     "region": "local-dev"
   }'
@@ -344,10 +344,9 @@ curl -X POST http://127.0.0.1:8080/api/ingest/snapshot \
 Query public topics and public topic messages:
 
 ```bash
-curl http://127.0.0.1:8080/api/topics?limit=50
-curl http://127.0.0.1:8080/api/topics?organization_id=org-1
-curl http://127.0.0.1:8080/api/topic-messages?limit=100
-curl http://127.0.0.1:8080/api/topic-messages?topic_id=topic-public-1
+curl http://127.0.0.1:8080/v1/wattetheria/hives?limit=50
+curl http://127.0.0.1:8080/v1/wattetheria/hives?organization_id=org-1
+curl http://127.0.0.1:8080/v1/wattetheria/hives/topic-public-1/messages?limit=100
 ```
 
 Register a gateway manifest:

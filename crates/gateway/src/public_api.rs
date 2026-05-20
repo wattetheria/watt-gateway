@@ -3,7 +3,7 @@ use crate::db;
 use crate::gateway_network::GatewayNetworkHandle;
 use crate::models::{ListQuery, TopicMessageQuery, TopicQuery};
 use crate::state::AppState;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -196,18 +196,20 @@ fn dedupe_nodes_by_id(values: &mut Vec<Value>) {
     });
 }
 
-pub async fn public_topics(
+pub async fn public_hives(
     State(state): State<AppState>,
     Query(query): Query<TopicQuery>,
 ) -> Response {
-    aggregate_public_topics_endpoint(&state, query).await
+    aggregate_public_hives_endpoint(&state, query).await
 }
 
-pub async fn public_topic_messages(
+pub async fn public_hive_messages(
     State(state): State<AppState>,
-    Query(query): Query<TopicMessageQuery>,
+    Path(hive_id): Path<String>,
+    Query(mut query): Query<TopicMessageQuery>,
 ) -> Response {
-    aggregate_public_topic_messages_endpoint(&state, query).await
+    query.hive_id = Some(hive_id);
+    aggregate_public_hive_messages_endpoint(&state, query).await
 }
 
 pub async fn tasks(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
@@ -325,13 +327,14 @@ fn gateway_runtime_status(runtime: &GatewayNetworkHandle) -> Value {
     })
 }
 
-async fn aggregate_public_topics_endpoint(state: &AppState, query: TopicQuery) -> Response {
+async fn aggregate_public_hives_endpoint(state: &AppState, query: TopicQuery) -> Response {
     match projection_values(state, DataKind::HiveMetadata).await {
         Ok(mut values) => {
-            values.retain(|value| matches_topic_filters(value, &query));
+            values.retain(|value| matches_hive_filters(value, &query));
             sort_values_desc_by_timestamp(&mut values);
             dedupe_values_by_key(&mut values, topic_identity_key);
             values.truncate(query.limit.unwrap_or(200));
+            values = values.into_iter().map(normalize_hive_value).collect();
             axum::Json(values).into_response()
         }
         Err(error) => (
@@ -342,16 +345,17 @@ async fn aggregate_public_topics_endpoint(state: &AppState, query: TopicQuery) -
     }
 }
 
-async fn aggregate_public_topic_messages_endpoint(
+async fn aggregate_public_hive_messages_endpoint(
     state: &AppState,
     query: TopicMessageQuery,
 ) -> Response {
     match projection_values(state, DataKind::HiveActivity).await {
         Ok(mut values) => {
-            values.retain(|value| matches_topic_message_filters(value, &query));
+            values.retain(|value| matches_hive_message_filters(value, &query));
             sort_values_desc_by_timestamp(&mut values);
             dedupe_values_by_key(&mut values, topic_message_identity_key);
             values.truncate(query.limit.unwrap_or(500));
+            values = values.into_iter().map(normalize_hive_value).collect();
             axum::Json(values).into_response()
         }
         Err(error) => (
@@ -444,35 +448,66 @@ fn attach_snapshot_generated_at(mut value: Value, generated_at: i64) -> Value {
     value
 }
 
-fn matches_topic_filters(value: &Value, query: &TopicQuery) -> bool {
+fn matches_hive_filters(value: &Value, query: &TopicQuery) -> bool {
     matches_optional_string_filter(
         value,
         &["network_id", "networkId"],
         query.network_id.as_deref(),
-    ) && matches_optional_string_filter(value, &["topic_id", "id"], query.topic_id.as_deref())
-        && matches_optional_string_filter(
-            value,
-            &["organization_id", "organizationId"],
-            query.organization_id.as_deref(),
-        )
+    ) && matches_optional_string_filter(
+        value,
+        &["hive_id", "topic_id", "id"],
+        query.hive_id.as_deref(),
+    ) && matches_optional_string_filter(
+        value,
+        &["topic_id", "hive_id", "id"],
+        query.topic_id.as_deref(),
+    ) && matches_optional_string_filter(
+        value,
+        &["organization_id", "organizationId"],
+        query.organization_id.as_deref(),
+    )
 }
 
-fn matches_topic_message_filters(value: &Value, query: &TopicMessageQuery) -> bool {
+fn normalize_hive_value(mut value: Value) -> Value {
+    let hive_id = value
+        .get("hive_id")
+        .or_else(|| value.get("topic_id"))
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    if let Some(hive_id) = hive_id {
+        object
+            .entry("hive_id".to_string())
+            .or_insert_with(|| Value::String(hive_id));
+    }
+    value
+}
+
+fn matches_hive_message_filters(value: &Value, query: &TopicMessageQuery) -> bool {
     matches_optional_string_filter(
         value,
         &["network_id", "networkId"],
         query.network_id.as_deref(),
-    ) && matches_optional_string_filter(value, &["topic_id", "topicId"], query.topic_id.as_deref())
-        && matches_optional_string_filter(
-            value,
-            &["organization_id", "organizationId"],
-            query.organization_id.as_deref(),
-        )
-        && matches_optional_string_filter(
-            value,
-            &["author_id", "authorId", "sender_id", "senderId"],
-            query.author_id.as_deref(),
-        )
+    ) && matches_optional_string_filter(
+        value,
+        &["hive_id", "topic_id", "topicId"],
+        query.hive_id.as_deref(),
+    ) && matches_optional_string_filter(
+        value,
+        &["topic_id", "topicId", "hive_id"],
+        query.topic_id.as_deref(),
+    ) && matches_optional_string_filter(
+        value,
+        &["organization_id", "organizationId"],
+        query.organization_id.as_deref(),
+    ) && matches_optional_string_filter(
+        value,
+        &["author_id", "authorId", "sender_id", "senderId"],
+        query.author_id.as_deref(),
+    )
 }
 
 fn matches_optional_string_filter(value: &Value, keys: &[&str], expected: Option<&str>) -> bool {
