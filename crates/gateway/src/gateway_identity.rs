@@ -72,9 +72,9 @@ impl GatewayIdentity {
             &[
                 "/api/network/status",
                 "/api/peers",
-                "/v1/wattetheria/hives",
-                "/v1/wattetheria/hives/{hive_id}/messages",
-                "/v1/wattetheria/missions",
+                "/api/topics",
+                "/api/topic-messages",
+                "/api/tasks",
                 "/api/organizations",
                 "/api/leaderboard",
                 "/api/registry/bootstrap",

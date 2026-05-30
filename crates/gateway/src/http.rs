@@ -52,16 +52,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/network/nodes", get(crate::public_api::network_nodes))
         .route("/api/peers", get(crate::public_api::peers))
+        .route("/api/topics", get(crate::public_api::public_hives))
         .route(
-            "/v1/wattetheria/hives",
-            get(crate::public_api::public_hives),
-        )
-        .route(
-            "/v1/wattetheria/hives/{hive_id}/messages",
-            get(crate::public_api::public_hive_messages),
+            "/api/topic-messages",
+            get(crate::public_api::public_hive_messages_by_query),
         )
         .route("/api/blocks", get(crate::public_api::public_blocks))
-        .route("/v1/wattetheria/missions", get(crate::public_api::tasks))
+        .route("/api/tasks", get(crate::public_api::tasks))
         .route("/api/task-activity", get(crate::public_api::task_activity))
         .route("/api/organizations", get(crate::public_api::organizations))
         .route("/api/leaderboard", get(crate::public_api::leaderboard))

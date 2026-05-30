@@ -3,7 +3,7 @@ use crate::db;
 use crate::gateway_network::GatewayNetworkHandle;
 use crate::models::{ListQuery, TopicMessageQuery, TopicQuery};
 use crate::state::AppState;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -203,12 +203,10 @@ pub async fn public_hives(
     aggregate_public_hives_endpoint(&state, query).await
 }
 
-pub async fn public_hive_messages(
+pub async fn public_hive_messages_by_query(
     State(state): State<AppState>,
-    Path(hive_id): Path<String>,
-    Query(mut query): Query<TopicMessageQuery>,
+    Query(query): Query<TopicMessageQuery>,
 ) -> Response {
-    query.hive_id = Some(hive_id);
     aggregate_public_hive_messages_endpoint(&state, query).await
 }
 
