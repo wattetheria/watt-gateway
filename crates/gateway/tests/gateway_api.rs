@@ -960,6 +960,113 @@ async fn mission_lifecycle_event_materializes_task_projection() {
 }
 
 #[tokio::test]
+async fn hive_metadata_event_materializes_topic_projection() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let topic_id = "mainnet:watt-etheria@london-2026-economy@group:london-2026-economy";
+    let mut event = signed_node_event(
+        "node-hive",
+        DataKind::HiveMetadata,
+        "topic.created",
+        json!({
+            "hive": {
+                "hive_id": topic_id,
+                "topic_id": topic_id,
+                "network_id": "mainnet:watt-etheria",
+                "scope_hint": "group:london-2026-economy",
+                "feed_key": "london-2026-economy",
+                "display_name": "讨论伦敦2026年的经济情况",
+                "summary": "讨论伦敦2026年的经济趋势、就业、通胀、房地产、金融服务和政策环境。",
+                "active": true,
+                "created_at": 1_780_114_390,
+                "updated_at": 1_780_114_390,
+                "created_by_public_id": "agent-mCPkNMDtN2X8.aa02a834d64b68b8",
+                "participant_public_ids": []
+            },
+            "public_id": "agent-mCPkNMDtN2X8.aa02a834d64b68b8",
+            "network_id": "mainnet:watt-etheria"
+        }),
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    event.payload.scope.topic_id = Some(topic_id.to_string());
+    event.payload.scope.task_id = None;
+    event.payload.identity_key = Some(topic_id.to_string());
+    resign_node_event(&mut event);
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let topics = request(&app, "GET", "/api/topics?limit=10").await;
+    assert_eq!(topics.0, StatusCode::OK);
+    assert_eq!(topics.1.as_array().unwrap().len(), 1);
+    assert_eq!(topics.1[0]["topic_id"].as_str(), Some(topic_id));
+    assert_eq!(
+        topics.1[0]["display_name"].as_str(),
+        Some("讨论伦敦2026年的经济情况")
+    );
+    assert_eq!(topics.1[0]["source_node_id"].as_str(), Some("node-hive"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn hive_message_event_materializes_topic_message_projection() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let topic_id = "mainnet:watt-etheria@london-2026-economy@group:london-2026-economy";
+    let mut event = signed_node_event(
+        "node-hive",
+        DataKind::HiveActivity,
+        "topic.message.posted",
+        json!({
+            "message_id": "msg-london-1",
+            "topic_id": topic_id,
+            "hive_id": topic_id,
+            "network_id": "mainnet:watt-etheria",
+            "feed_key": "london-2026-economy",
+            "scope_hint": "group:london-2026-economy",
+            "author_public_id": "agent-mCPkNMDtN2X8.aa02a834d64b68b8",
+            "content": "伦敦2026测试消息",
+            "created_at": 1_780_114_500
+        }),
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    event.payload.scope.topic_id = Some(topic_id.to_string());
+    event.payload.scope.task_id = None;
+    event.payload.identity_key = Some("msg-london-1".to_string());
+    resign_node_event(&mut event);
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let messages = request(
+        &app,
+        "GET",
+        &format!("/api/topic-messages?topic_id={topic_id}&limit=10"),
+    )
+    .await;
+    assert_eq!(messages.0, StatusCode::OK);
+    assert_eq!(messages.1.as_array().unwrap().len(), 1);
+    assert_eq!(messages.1[0]["message_id"].as_str(), Some("msg-london-1"));
+    assert_eq!(messages.1[0]["topic_id"].as_str(), Some(topic_id));
+    assert_eq!(messages.1[0]["content"].as_str(), Some("伦敦2026测试消息"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn sync_nodes_reports_partial_when_wattswarm_collection_fails() {
     let db = TestDatabase::new().await;
     let snapshot = signed_snapshot(
@@ -2003,6 +2110,15 @@ fn signed_node_event(
             .to_bytes(),
     );
     SignedNodeEvent { payload, signature }
+}
+
+fn resign_node_event(event: &mut SignedNodeEvent) {
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    event.signature = base64::engine::general_purpose::STANDARD.encode(
+        signing_key
+            .sign(&canonical_bytes(&event.payload).unwrap())
+            .to_bytes(),
+    );
 }
 
 fn did_key_from_public_key_b64(public_key_b64: &str) -> String {

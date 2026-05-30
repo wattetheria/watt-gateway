@@ -13,7 +13,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 pub async fn ingest_node_event(
@@ -162,10 +162,10 @@ pub async fn persist_signed_node_event(
     )
     .await?;
     let Some(row) = inserted else {
-        materialize_mission_lifecycle_projection(state, event, source_id, provisional).await?;
+        materialize_event_projection(state, event, source_id, provisional).await?;
         return Ok(None);
     };
-    materialize_mission_lifecycle_projection(state, event, source_id, provisional).await?;
+    materialize_event_projection(state, event, source_id, provisional).await?;
     let ui_event = GatewayUiEvent::try_from(row.clone())?;
     state.publish_ui_event(ui_event);
     let bus_event = json!({
@@ -182,20 +182,63 @@ pub async fn persist_signed_node_event(
     Ok(Some(row.cursor))
 }
 
-async fn materialize_mission_lifecycle_projection(
+async fn materialize_event_projection(
     state: &AppState,
     event: &SignedNodeEvent,
     source_id: Option<Uuid>,
     provisional: bool,
 ) -> Result<()> {
-    if event.payload.data_kind != DataKind::MissionLifecycle {
-        return Ok(());
+    match event.payload.data_kind {
+        DataKind::MissionLifecycle => {
+            let Some(payload) = normalized_mission_lifecycle_payload(event) else {
+                return Ok(());
+            };
+            materialize_projection_row(
+                state,
+                event,
+                source_id,
+                provisional,
+                DataKind::TaskSummary,
+                payload,
+            )
+            .await
+        }
+        DataKind::HiveMetadata => {
+            let Some(payload) = normalized_hive_metadata_payload(event) else {
+                return Ok(());
+            };
+            materialize_projection_row(
+                state,
+                event,
+                source_id,
+                provisional,
+                DataKind::HiveMetadata,
+                payload,
+            )
+            .await
+        }
+        DataKind::HiveActivity | DataKind::HiveMessagePosted => {
+            let Some(payload) = normalized_hive_activity_payload(event) else {
+                return Ok(());
+            };
+            materialize_projection_row(
+                state,
+                event,
+                source_id,
+                provisional,
+                DataKind::HiveActivity,
+                payload,
+            )
+            .await
+        }
+        _ => Ok(()),
     }
+}
+
+fn normalized_mission_lifecycle_payload(event: &SignedNodeEvent) -> Option<Value> {
     let mut payload = event.payload.payload.clone();
     let mission_id = mission_identity(&payload);
-    let Some(object) = payload.as_object_mut() else {
-        return Ok(());
-    };
+    let object = payload.as_object_mut()?;
     object
         .entry("task_type".to_string())
         .or_insert_with(|| Value::String("wattetheria.mission".to_string()));
@@ -228,15 +271,135 @@ async fn materialize_mission_lifecycle_projection(
             .entry("id".to_string())
             .or_insert_with(|| Value::String(mission_id));
     }
+    Some(payload)
+}
 
-    let data_kind = serde_json::to_string(&DataKind::TaskSummary)?
+fn normalized_hive_metadata_payload(event: &SignedNodeEvent) -> Option<Value> {
+    let mut object = merged_payload_object(&event.payload.payload, &["hive", "topic"])?;
+    let topic_id = object_string(&object, "topic_id")
+        .or_else(|| object_string(&object, "hive_id"))
+        .or_else(|| event.payload.scope.topic_id.clone())
+        .or_else(|| event.payload.identity_key.clone());
+    if let Some(topic_id) = topic_id {
+        object
+            .entry("topic_id".to_string())
+            .or_insert_with(|| Value::String(topic_id.clone()));
+        object
+            .entry("hive_id".to_string())
+            .or_insert_with(|| Value::String(topic_id));
+    }
+    insert_string_if_missing(
+        &mut object,
+        "organization_id",
+        event.payload.scope.organization_id.clone(),
+    );
+    insert_string_if_missing(
+        &mut object,
+        "mission_id",
+        event.payload.scope.task_id.clone(),
+    );
+    object
+        .entry("source_node_id".to_string())
+        .or_insert_with(|| Value::String(event.payload.node_id.clone()));
+    object
+        .entry("snapshot_generated_at".to_string())
+        .or_insert_with(|| Value::Number(event.payload.timestamp.into()));
+    Some(Value::Object(object))
+}
+
+fn normalized_hive_activity_payload(event: &SignedNodeEvent) -> Option<Value> {
+    let mut object = merged_payload_object(&event.payload.payload, &["message"])?;
+    let message_id = object_string(&object, "message_id")
+        .or_else(|| event.payload.identity_key.clone())
+        .unwrap_or_else(|| event.payload.event_id.clone());
+    object
+        .entry("message_id".to_string())
+        .or_insert_with(|| Value::String(message_id));
+    let topic_id =
+        object_string(&object, "hive_id").or_else(|| event.payload.scope.topic_id.clone());
+    insert_string_if_missing(&mut object, "topic_id", topic_id);
+    let hive_id =
+        object_string(&object, "topic_id").or_else(|| event.payload.scope.topic_id.clone());
+    insert_string_if_missing(&mut object, "hive_id", hive_id);
+    insert_string_if_missing(
+        &mut object,
+        "organization_id",
+        event.payload.scope.organization_id.clone(),
+    );
+    let author_id = object_string(&object, "author_public_id")
+        .or_else(|| object_string(&object, "public_id"))
+        .or_else(|| object_string(&object, "controller_id"))
+        .or_else(|| object_string(&object, "author_node_id"));
+    insert_string_if_missing(&mut object, "author_id", author_id);
+    object
+        .entry("source_node_id".to_string())
+        .or_insert_with(|| Value::String(event.payload.node_id.clone()));
+    object
+        .entry("created_at".to_string())
+        .or_insert_with(|| Value::Number(event.payload.timestamp.into()));
+    object
+        .entry("snapshot_generated_at".to_string())
+        .or_insert_with(|| Value::Number(event.payload.timestamp.into()));
+    Some(Value::Object(object))
+}
+
+fn merged_payload_object(payload: &Value, nested_keys: &[&str]) -> Option<Map<String, Value>> {
+    let mut object = Map::new();
+    if let Some(nested) = nested_keys
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_object))
+    {
+        object.extend(
+            nested
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    if let Some(top_level) = payload.as_object() {
+        for (key, value) in top_level {
+            if !nested_keys.contains(&key.as_str()) && !object.contains_key(key) {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if object.is_empty() {
+        None
+    } else {
+        Some(object)
+    }
+}
+
+fn object_string(object: &Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn insert_string_if_missing(object: &mut Map<String, Value>, key: &str, value: Option<String>) {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        object
+            .entry(key.to_string())
+            .or_insert_with(|| Value::String(value));
+    }
+}
+
+async fn materialize_projection_row(
+    state: &AppState,
+    event: &SignedNodeEvent,
+    source_id: Option<Uuid>,
+    provisional: bool,
+    data_kind: DataKind,
+    payload: Value,
+) -> Result<()> {
+    let data_kind_string = serde_json::to_string(&data_kind)?
         .trim_matches('"')
         .to_string();
-    let visibility = serde_json::to_string(&visibility_for_kind(DataKind::TaskSummary))?
+    let visibility = serde_json::to_string(&visibility_for_kind(data_kind))?
         .trim_matches('"')
         .to_string();
-    let identity_key =
-        projection_identity_key(DataKind::TaskSummary, &payload, &event.payload.node_id);
+    let identity_key = projection_identity_key(data_kind, &payload, &event.payload.node_id);
     let provenance = json!({
         "source_node_id": event.payload.node_id,
         "source_cursor_or_seq": event.payload.seq,
@@ -247,7 +410,7 @@ async fn materialize_mission_lifecycle_projection(
     db::upsert_projection_row(
         &state.pool,
         db::UpsertProjectionRecord {
-            data_kind: &data_kind,
+            data_kind: &data_kind_string,
             identity_key: &identity_key,
             source_node_id: &event.payload.node_id,
             source_id,
