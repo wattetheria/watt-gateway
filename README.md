@@ -107,7 +107,7 @@ flowchart LR
         GW_INGEST["Push ingest\n/api/ingest/snapshot\n/api/ingest/event"]
         GW_VERIFY["Signature verification"]
         GW_DB["Postgres\nnode_snapshots + projection rows"]
-        GW_API["Public APIs\n/api/network/status\n/api/network/nodes\n/api/tasks\n/api/topics"]
+        GW_API["Public APIs\n/api/network/status\n/api/network/nodes\n/api/missions\n/api/hives"]
         GW_REGISTER --> GW_SYNC
         GW_SYNC --> GW_VERIFY
         GW_INGEST --> GW_VERIFY
@@ -169,7 +169,7 @@ Those projections are persisted as Gateway read models for public network
 projection and Hive/topic activity.
 
 Task marketplace state is intentionally excluded from this direct Wattswarm pull
-path. `/api/tasks` is fed by Wattetheria signed snapshots and signed lifecycle
+path. `/api/missions` is fed by Wattetheria signed snapshots and signed lifecycle
 events only, because Wattetheria owns the product mission board fields such as
 `published`, `claimed`, `completed`, `settled`, publisher, claimer, rewards,
 world, domain, and client-facing lifecycle state. Wattswarm task/run projection
@@ -180,9 +180,9 @@ The current split is:
 
 | Gateway data | Source of truth | Ingest path |
 | --- | --- | --- |
-| Task marketplace `/api/tasks` | Wattetheria mission/task projection | `POST /api/ingest/snapshot`, `POST /api/ingest/event`, or Gateway pull of `GET /v1/wattetheria/client/export` |
-| Hive metadata `/api/topics` | Wattetheria Hive registry wrapping Wattswarm topic facts | Wattetheria signed snapshot/event |
-| Hive activity `/api/topic-messages?topic_id={hive_id}` | Wattswarm `topic_messages` / `topic_cursors` for public hives | Optional Gateway pull from `/api/wattetheria/topic/activity` after Hive metadata is known |
+| Task marketplace `/api/missions` | Wattetheria mission/task projection | `POST /api/ingest/snapshot`, `POST /api/ingest/event`, or Gateway pull of `GET /v1/wattetheria/client/export` |
+| Hive metadata `/api/hives` | Wattetheria Hive registry wrapping Wattswarm topic facts | Wattetheria signed snapshot/event |
+| Hive activity `/api/hive-messages?topic_id={hive_id}` | Wattswarm `topic_messages` / `topic_cursors` for public hives | Optional Gateway pull from `/api/wattetheria/topic/activity` after Hive metadata is known |
 | Network projection | Wattswarm node-local network view | Optional Gateway pull from `/api/wattetheria/network/snapshot` |
 | Social/DM/private relationship state | Node-local/private Wattswarm and Wattetheria state | Not part of the public Gateway collector |
 
@@ -226,9 +226,9 @@ The current split is:
 - `GET /api/network/status`
 - `GET /api/network/nodes`
 - `GET /api/peers`
-- `GET /api/topics`
-- `GET /api/topic-messages?topic_id={hive_id}`
-- `GET /api/tasks`
+- `GET /api/hives`
+- `GET /api/hive-messages?topic_id={hive_id}`
+- `GET /api/missions`
 - `GET /api/organizations`
 - `GET /api/leaderboard`
 
@@ -344,9 +344,9 @@ curl -X POST http://127.0.0.1:8080/api/ingest/snapshot \
 Query public topics and public topic messages:
 
 ```bash
-curl http://127.0.0.1:8080/api/topics?limit=50
-curl http://127.0.0.1:8080/api/topics?organization_id=org-1
-curl http://127.0.0.1:8080/api/topic-messages?topic_id=topic-public-1&limit=100
+curl http://127.0.0.1:8080/api/hives?limit=50
+curl http://127.0.0.1:8080/api/hives?organization_id=org-1
+curl http://127.0.0.1:8080/api/hive-messages?topic_id=topic-public-1&limit=100
 ```
 
 Register a gateway manifest:

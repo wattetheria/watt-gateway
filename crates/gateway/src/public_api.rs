@@ -210,11 +210,11 @@ pub async fn public_hive_messages_by_query(
     aggregate_public_hive_messages_endpoint(&state, query).await
 }
 
-pub async fn tasks(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
+pub async fn missions(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
     aggregate_projection_endpoint(&state, query.limit.unwrap_or(200), DataKind::TaskSummary).await
 }
 
-pub async fn task_activity(
+pub async fn mission_activity(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Response {

@@ -72,9 +72,9 @@ impl GatewayIdentity {
             &[
                 "/api/network/status",
                 "/api/peers",
-                "/api/topics",
-                "/api/topic-messages",
-                "/api/tasks",
+                "/api/hives",
+                "/api/hive-messages",
+                "/api/missions",
                 "/api/organizations",
                 "/api/leaderboard",
                 "/api/registry/bootstrap",

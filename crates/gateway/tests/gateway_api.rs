@@ -136,7 +136,7 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     assert_eq!(peers.1.as_array().unwrap().len(), 2);
     assert_eq!(peers.1[0]["source_node_id"].as_str(), Some("node-alpha"));
 
-    let topics = request(&app, "GET", "/api/topics?limit=10").await;
+    let topics = request(&app, "GET", "/api/hives?limit=10").await;
     assert_eq!(topics.0, StatusCode::OK);
     assert_eq!(topics.1.as_array().unwrap().len(), 1);
     assert_eq!(topics.1[0]["source_node_id"].as_str(), Some("node-alpha"));
@@ -144,7 +144,7 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     let topic_messages = request(
         &app,
         "GET",
-        "/api/topic-messages?topic_id=topic-public-1&limit=10",
+        "/api/hive-messages?topic_id=topic-public-1&limit=10",
     )
     .await;
     assert_eq!(topic_messages.0, StatusCode::OK);
@@ -174,7 +174,7 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
     let dm_messages = request_status(&app, "GET", "/api/dm/messages?limit=10").await;
     assert_eq!(dm_messages, StatusCode::NOT_FOUND);
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/api/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["source_node_id"].as_str(), Some("node-alpha"));
@@ -197,7 +197,7 @@ async fn register_and_sync_ingests_snapshot_and_aggregates() {
         StatusCode::NOT_FOUND
     );
 
-    let task_activity = request(&app, "GET", "/api/task-activity?limit=10").await;
+    let task_activity = request(&app, "GET", "/api/mission-activity?limit=10").await;
     assert_eq!(task_activity.0, StatusCode::OK);
     assert_eq!(task_activity.1["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(task_activity.1["runs"].as_array().unwrap().len(), 1);
@@ -601,23 +601,23 @@ async fn public_hives_and_messages_are_deduped_sorted_and_filterable() {
     .await;
     assert_eq!(ingest_second.0, StatusCode::OK);
 
-    let topics = request(&app, "GET", "/api/topics?limit=10").await;
+    let topics = request(&app, "GET", "/api/hives?limit=10").await;
     assert_eq!(topics.0, StatusCode::OK);
     assert_eq!(topics.1.as_array().unwrap().len(), 2);
     assert_eq!(topics.1[0]["topic_id"].as_str(), Some("topic-b"));
     assert_eq!(topics.1[1]["topic_id"].as_str(), Some("topic-a"));
 
-    let filtered_topics = request(&app, "GET", "/api/topics?organization_id=org-1").await;
+    let filtered_topics = request(&app, "GET", "/api/hives?organization_id=org-1").await;
     assert_eq!(filtered_topics.0, StatusCode::OK);
     assert_eq!(filtered_topics.1.as_array().unwrap().len(), 1);
     assert_eq!(filtered_topics.1[0]["topic_id"].as_str(), Some("topic-a"));
 
-    let messages = request(&app, "GET", "/api/topic-messages?topic_id=topic-b&limit=10").await;
+    let messages = request(&app, "GET", "/api/hive-messages?topic_id=topic-b&limit=10").await;
     assert_eq!(messages.0, StatusCode::OK);
     assert_eq!(messages.1.as_array().unwrap().len(), 1);
     assert_eq!(messages.1[0]["message_id"].as_str(), Some("msg-b"));
 
-    let filtered_messages = request(&app, "GET", "/api/topic-messages?topic_id=topic-a").await;
+    let filtered_messages = request(&app, "GET", "/api/hive-messages?topic_id=topic-a").await;
     assert_eq!(filtered_messages.0, StatusCode::OK);
     assert_eq!(filtered_messages.1.as_array().unwrap().len(), 1);
     assert_eq!(filtered_messages.1[0]["message_id"].as_str(), Some("msg-a"));
@@ -680,7 +680,7 @@ async fn older_snapshot_does_not_replace_newer_snapshot() {
     .await;
     assert_eq!(stale.0, StatusCode::OK);
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/api/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1[0]["id"].as_str(), Some("task-new"));
 
@@ -736,7 +736,7 @@ async fn suspended_registered_source_is_hidden_from_public_reads_and_rejects_pus
     assert_eq!(network_status.0, StatusCode::OK);
     assert_eq!(network_status.1["nodes"].as_u64(), Some(0));
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/api/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 0);
 
@@ -927,7 +927,7 @@ async fn mission_lifecycle_event_materializes_task_projection() {
         .unwrap();
     assert_eq!(persisted_events, 1);
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/api/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["mission_id"].as_str(), Some("mission-event-1"));
@@ -952,7 +952,7 @@ async fn mission_lifecycle_event_materializes_task_projection() {
     .await;
     assert_eq!(duplicate.0, StatusCode::OK);
     assert_eq!(duplicate.1["status"].as_str(), Some("duplicate"));
-    let restored_tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let restored_tasks = request(&app, "GET", "/api/missions?limit=10").await;
     assert_eq!(restored_tasks.0, StatusCode::OK);
     assert_eq!(restored_tasks.1.as_array().unwrap().len(), 1);
 
@@ -1002,7 +1002,7 @@ async fn hive_metadata_event_materializes_topic_projection() {
     .await;
     assert_eq!(ingest.0, StatusCode::OK);
 
-    let topics = request(&app, "GET", "/api/topics?limit=10").await;
+    let topics = request(&app, "GET", "/api/hives?limit=10").await;
     assert_eq!(topics.0, StatusCode::OK);
     assert_eq!(topics.1.as_array().unwrap().len(), 1);
     assert_eq!(topics.1[0]["topic_id"].as_str(), Some(topic_id));
@@ -1054,7 +1054,7 @@ async fn hive_message_event_materializes_topic_message_projection() {
     let messages = request(
         &app,
         "GET",
-        &format!("/api/topic-messages?topic_id={topic_id}&limit=10"),
+        &format!("/api/hive-messages?topic_id={topic_id}&limit=10"),
     )
     .await;
     assert_eq!(messages.0, StatusCode::OK);
@@ -1163,7 +1163,7 @@ async fn sync_nodes_does_not_require_or_import_wattswarm_task_run_snapshot() {
     assert_eq!(sync.1[0]["sync_status"].as_str(), Some("ok"));
     assert!(sync.1[0]["wattswarm_collect_error"].is_null());
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/api/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["id"].as_str(), Some("mission-product-1"));
@@ -1586,7 +1586,7 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
     assert_eq!(sync.1.as_array().unwrap().len(), 1);
     assert_eq!(sync.1[0]["node_id"].as_str(), Some("node-iroh"));
 
-    let tasks = request(&app, "GET", "/api/tasks?limit=10").await;
+    let tasks = request(&app, "GET", "/api/missions?limit=10").await;
     assert_eq!(tasks.0, StatusCode::OK);
     assert_eq!(tasks.1.as_array().unwrap().len(), 1);
     assert_eq!(tasks.1[0]["id"].as_str(), Some("task-iroh"));

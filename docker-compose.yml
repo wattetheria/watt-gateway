@@ -18,7 +18,7 @@ services:
       WATTETHERIA_GATEWAY_IDENTITY_REGION: local-dev
       WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_ID: operator-docker
       WATTETHERIA_GATEWAY_IDENTITY_ROLES: ingest,query,federation
-      WATTETHERIA_GATEWAY_IDENTITY_SUPPORTED_ENDPOINTS: /api/network/status,/api/peers,/api/topics,/api/topic-messages,/api/tasks,/api/organizations,/api/leaderboard,/api/registry/gateways,/api/registry/bootstrap,/api/registry/discovery,/api/registry/self-manifest,/api/registry/self-register
+      WATTETHERIA_GATEWAY_IDENTITY_SUPPORTED_ENDPOINTS: /api/network/status,/api/peers,/api/hives,/api/hive-messages,/api/missions,/api/organizations,/api/leaderboard,/api/registry/gateways,/api/registry/bootstrap,/api/registry/discovery,/api/registry/self-manifest,/api/registry/self-register
       WATTETHERIA_GATEWAY_IDENTITY_ALLOWS_PUBLIC_INGEST: "true"
       WATTETHERIA_GATEWAY_IDENTITY_SIGNING_KEY: CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws=
     depends_on:
