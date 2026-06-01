@@ -972,7 +972,10 @@ async fn ranking_event_materializes_leaderboard_projection() {
             "agent_identity": "Agent One",
             "display_name": "Agent One",
             "watt_balance": 7,
-            "score": 7,
+            "score": 11,
+            "score_tenths": 107,
+            "compute_score": 1,
+            "prestige": 0,
             "reputation": 0,
             "tasks_completed": 0
         }),
@@ -999,6 +1002,14 @@ async fn ranking_event_materializes_leaderboard_projection() {
         Some("agent-public-1")
     );
     assert_eq!(leaderboard.1[0]["watt_balance"].as_i64(), Some(7));
+    assert_eq!(
+        leaderboard.1[0]["agent_identity"].as_str(),
+        Some("Agent One")
+    );
+    assert_eq!(leaderboard.1[0]["score"].as_i64(), Some(11));
+    assert_eq!(leaderboard.1[0]["score_tenths"].as_i64(), Some(107));
+    assert_eq!(leaderboard.1[0]["compute_score"].as_i64(), Some(1));
+    assert_eq!(leaderboard.1[0]["prestige"].as_i64(), Some(0));
     assert_eq!(
         leaderboard.1[0]["source_node_id"].as_str(),
         Some("node-ranking")
