@@ -960,6 +960,54 @@ async fn mission_lifecycle_event_materializes_task_projection() {
 }
 
 #[tokio::test]
+async fn ranking_event_materializes_leaderboard_projection() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let mut event = signed_node_event(
+        "node-ranking",
+        DataKind::RankingProjection,
+        "ranking.updated",
+        json!({
+            "public_id": "agent-public-1",
+            "agent_identity": "Agent One",
+            "display_name": "Agent One",
+            "watt_balance": 7,
+            "score": 7,
+            "reputation": 0,
+            "tasks_completed": 0
+        }),
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    event.payload.scope.task_id = None;
+    event.payload.identity_key = Some("agent-public-1".to_string());
+    resign_node_event(&mut event);
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let leaderboard = request(&app, "GET", "/api/leaderboard?limit=10").await;
+    assert_eq!(leaderboard.0, StatusCode::OK);
+    assert_eq!(leaderboard.1.as_array().unwrap().len(), 1);
+    assert_eq!(
+        leaderboard.1[0]["public_id"].as_str(),
+        Some("agent-public-1")
+    );
+    assert_eq!(leaderboard.1[0]["watt_balance"].as_i64(), Some(7));
+    assert_eq!(
+        leaderboard.1[0]["source_node_id"].as_str(),
+        Some("node-ranking")
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn hive_metadata_event_materializes_topic_projection() {
     let db = TestDatabase::new().await;
     let app = test_app(&db.database_url).await;

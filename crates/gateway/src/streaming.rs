@@ -231,8 +231,46 @@ async fn materialize_event_projection(
             )
             .await
         }
+        DataKind::RankingProjection => {
+            let Some(payload) = normalized_ranking_projection_payload(event) else {
+                return Ok(());
+            };
+            materialize_projection_row(
+                state,
+                event,
+                source_id,
+                provisional,
+                DataKind::RankingProjection,
+                payload,
+            )
+            .await
+        }
         _ => Ok(()),
     }
+}
+
+fn normalized_ranking_projection_payload(event: &SignedNodeEvent) -> Option<Value> {
+    let mut object = event.payload.payload.as_object()?.clone();
+    let identity = object_string(&object, "public_id")
+        .or_else(|| object_string(&object, "agent_did"))
+        .or_else(|| object_string(&object, "id"))
+        .or_else(|| event.payload.identity_key.clone())?;
+    object
+        .entry("public_id".to_string())
+        .or_insert_with(|| Value::String(identity.clone()));
+    object
+        .entry("agent_did".to_string())
+        .or_insert_with(|| Value::String(identity.clone()));
+    object
+        .entry("id".to_string())
+        .or_insert_with(|| Value::String(identity));
+    object
+        .entry("source_node_id".to_string())
+        .or_insert_with(|| Value::String(event.payload.node_id.clone()));
+    object
+        .entry("snapshot_generated_at".to_string())
+        .or_insert_with(|| Value::Number(event.payload.timestamp.into()));
+    Some(Value::Object(object))
 }
 
 fn normalized_mission_lifecycle_payload(event: &SignedNodeEvent) -> Option<Value> {
