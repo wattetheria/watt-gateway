@@ -33,6 +33,15 @@ impl Config {
             .unwrap_or(10);
         let registry_admin_token = env::var("WATTETHERIA_GATEWAY_REGISTRY_ADMIN_TOKEN").ok();
         let bootstrap_registry_urls = parse_csv_env("WATTETHERIA_GATEWAY_BOOTSTRAP_REGISTRY_URLS");
+        let federation_peers = {
+            let mut peers = parse_csv_env("WATTETHERIA_GATEWAY_FEDERATION_TRUSTED_PEERS");
+            peers.extend(parse_csv_env(
+                "WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS",
+            ));
+            peers.sort();
+            peers.dedup();
+            peers
+        };
         let gateway_identity = GatewayIdentityConfig {
             gateway_id: env::var("WATTETHERIA_GATEWAY_IDENTITY_ID").ok(),
             display_name: env::var("WATTETHERIA_GATEWAY_IDENTITY_DISPLAY_NAME").ok(),
@@ -43,7 +52,8 @@ impl Config {
                 .or_else(|| env::var("WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_ID").ok()),
             roles: parse_csv_env("WATTETHERIA_GATEWAY_IDENTITY_ROLES"),
             supported_endpoints: parse_csv_env("WATTETHERIA_GATEWAY_IDENTITY_SUPPORTED_ENDPOINTS"),
-            federation_peers: parse_csv_env("WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS"),
+            federation_mode: env::var("WATTETHERIA_GATEWAY_FEDERATION_MODE").ok(),
+            federation_peers,
             allows_public_ingest: env::var("WATTETHERIA_GATEWAY_IDENTITY_ALLOWS_PUBLIC_INGEST")
                 .ok()
                 .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))

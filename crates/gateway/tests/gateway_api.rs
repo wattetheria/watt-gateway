@@ -1,4 +1,5 @@
 use axum::body::{Body, to_bytes};
+use axum::extract::OriginalUri;
 use axum::http::{Request, StatusCode};
 use axum::{Json, Router, routing::get};
 use base64::Engine as _;
@@ -10,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tower::util::ServiceExt;
 use wattetheria_gateway::contracts::{
     DataKind, EventScope, NodeEventPayload, ProvisionalExportPolicy, SignedNodeEvent, Visibility,
@@ -1508,6 +1509,280 @@ async fn bootstrap_registry_list_and_discovery_aggregate_upstreams() {
 }
 
 #[tokio::test]
+async fn public_queries_federate_configured_peer_gateways() {
+    let db = TestDatabase::new().await;
+    let remote_requests = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let remote_app = Router::new()
+        .route(
+            "/api/network/status",
+            get({
+                let remote_requests = Arc::clone(&remote_requests);
+                move |uri: OriginalUri| {
+                    record_federated_request(
+                        uri,
+                        Arc::clone(&remote_requests),
+                        json!({
+                            "status": "ok",
+                            "nodes": 3,
+                            "peers": 4,
+                            "tasks": 1,
+                            "organizations": 0,
+                            "topics": 1,
+                            "topic_messages": 0,
+                            "public_blocks": 0,
+                            "network_name": "Watt Etheria",
+                            "network_org_name": "Aether Prime"
+                        }),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/api/network/nodes",
+            get({
+                let remote_requests = Arc::clone(&remote_requests);
+                move |uri: OriginalUri| {
+                    record_federated_request(
+                        uri,
+                        Arc::clone(&remote_requests),
+                        json!([{
+                            "node_id": "remote-node",
+                            "lat": 1.0,
+                            "lng": 2.0,
+                            "snapshot_generated_at": 1_710_000_100
+                        }]),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/api/peers",
+            get({
+                let remote_requests = Arc::clone(&remote_requests);
+                move |uri: OriginalUri| {
+                    record_federated_request(
+                        uri,
+                        Arc::clone(&remote_requests),
+                        json!([{"id": "remote-peer"}]),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/api/hives",
+            get({
+                let remote_requests = Arc::clone(&remote_requests);
+                move |uri: OriginalUri| {
+                    record_federated_request(
+                        uri,
+                        Arc::clone(&remote_requests),
+                        json!([{
+                            "topic_id": "remote-hive",
+                            "title": "Remote Hive",
+                            "last_message_at": "2026-03-18T02:00:00Z"
+                        }]),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/api/missions",
+            get({
+                let remote_requests = Arc::clone(&remote_requests);
+                move |uri: OriginalUri| {
+                    record_federated_request(
+                        uri,
+                        Arc::clone(&remote_requests),
+                        json!([{
+                            "id": "remote-mission",
+                            "title": "Remote Mission",
+                            "updated_at": "2026-03-18T02:00:00Z"
+                        }]),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/api/leaderboard",
+            get({
+                let remote_requests = Arc::clone(&remote_requests);
+                move |uri: OriginalUri| {
+                    record_federated_request(
+                        uri,
+                        Arc::clone(&remote_requests),
+                        json!([{
+                            "agent_did": "remote-agent",
+                            "score": 7
+                        }]),
+                    )
+                }
+            }),
+        );
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_server = tokio::spawn(async move {
+        axum::serve(remote_listener, remote_app).await.unwrap();
+    });
+
+    let app = test_app_with_identity_and_federation_peers(
+        &db.database_url,
+        vec![format!("http://{remote_addr}")],
+    )
+    .await;
+
+    let snapshot = signed_snapshot(
+        "node-local-fed",
+        SnapshotContents {
+            network_name: Some("Watt Etheria"),
+            network_org_name: Some("Aether Prime"),
+            peers: &[json!({"id":"local-peer","lat":-30.0,"lng":151.0})],
+            public_blocks: &[],
+            public_topics: &[json!({
+                "topic_id":"local-hive",
+                "title":"Local Hive",
+                "last_message_at":"2026-03-18T01:00:00Z"
+            })],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[json!({
+                "id":"local-mission",
+                "title":"Local Mission",
+                "updated_at":"2026-03-18T01:00:00Z"
+            })],
+            organizations: &[],
+            leaderboard: &[json!({"agent_did":"local-agent","score":9})],
+        },
+    );
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&snapshot).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let status = request(&app, "GET", "/api/network/status").await;
+    assert_eq!(status.0, StatusCode::OK);
+    assert_eq!(status.1["nodes"].as_u64(), Some(4));
+    assert_eq!(status.1["peers"].as_u64(), Some(5));
+    assert_eq!(status.1["tasks"].as_u64(), Some(2));
+    assert_eq!(status.1["topics"].as_u64(), Some(2));
+    assert_eq!(status.1["federated_gateways"].as_u64(), Some(1));
+
+    let peers = request(&app, "GET", "/api/peers?limit=10").await;
+    assert_eq!(peers.0, StatusCode::OK);
+    assert_contains_id(&peers.1, "id", "local-peer");
+    assert_contains_id(&peers.1, "id", "remote-peer");
+
+    let nodes = request(&app, "GET", "/api/network/nodes?limit=10").await;
+    assert_eq!(nodes.0, StatusCode::OK);
+    assert_contains_id(&nodes.1, "node_id", "local-peer");
+    assert_contains_id(&nodes.1, "node_id", "remote-node");
+
+    let missions = request(&app, "GET", "/api/missions?limit=10").await;
+    assert_eq!(missions.0, StatusCode::OK);
+    assert_contains_id(&missions.1, "id", "local-mission");
+    assert_contains_id(&missions.1, "id", "remote-mission");
+
+    let hives = request(&app, "GET", "/api/hives?limit=10").await;
+    assert_eq!(hives.0, StatusCode::OK);
+    assert_contains_id(&hives.1, "topic_id", "local-hive");
+    assert_contains_id(&hives.1, "topic_id", "remote-hive");
+
+    let leaderboard = request(&app, "GET", "/api/leaderboard?limit=10").await;
+    assert_eq!(leaderboard.0, StatusCode::OK);
+    assert_contains_id(&leaderboard.1, "agent_did", "local-agent");
+    assert_contains_id(&leaderboard.1, "agent_did", "remote-agent");
+
+    let seen_requests = remote_requests.lock().await.clone();
+    for endpoint in [
+        "/api/network/status",
+        "/api/network/nodes",
+        "/api/peers",
+        "/api/hives",
+        "/api/missions",
+        "/api/leaderboard",
+    ] {
+        assert!(
+            seen_requests
+                .iter()
+                .any(|uri| uri.starts_with(endpoint) && uri.contains("federation=local")),
+            "remote request for {endpoint} should include federation=local; seen {seen_requests:?}"
+        );
+    }
+
+    remote_requests.lock().await.clear();
+    let local_only = request(&app, "GET", "/api/missions?limit=10&federation=local").await;
+    assert_eq!(local_only.0, StatusCode::OK);
+    assert_eq!(local_only.1.as_array().unwrap().len(), 1);
+    assert_contains_id(&local_only.1, "id", "local-mission");
+    assert!(remote_requests.lock().await.is_empty());
+
+    remote_server.abort();
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn trusted_federation_ignores_registry_only_gateways() {
+    let db = TestDatabase::new().await;
+    let remote_requests = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let remote_app = Router::new().route(
+        "/api/missions",
+        get({
+            let remote_requests = Arc::clone(&remote_requests);
+            move |uri: OriginalUri| {
+                record_federated_request(
+                    uri,
+                    Arc::clone(&remote_requests),
+                    json!([{"id": "remote-mission"}]),
+                )
+            }
+        }),
+    );
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let remote_server = tokio::spawn(async move {
+        axum::serve(remote_listener, remote_app).await.unwrap();
+    });
+
+    let app = test_app_with_identity_and_federation_peers(&db.database_url, Vec::new()).await;
+    let manifest = signed_gateway_manifest(
+        "gw-registry-only",
+        &format!("http://{remote_addr}"),
+        "global",
+    );
+    let register = request_json(
+        &app,
+        "POST",
+        "/api/registry/gateways/register",
+        json!({ "manifest": manifest }),
+    )
+    .await;
+    assert_eq!(register.0, StatusCode::CREATED);
+    let review = request_json_with_auth(
+        &app,
+        "POST",
+        "/api/admin/registry/gateways/gw-registry-only/review",
+        json!({
+            "status": "approved",
+            "discovery_tier": "verified"
+        }),
+        Some("registry-secret"),
+    )
+    .await;
+    assert_eq!(review.0, StatusCode::OK);
+
+    let missions = request(&app, "GET", "/api/missions?limit=10").await;
+    assert_eq!(missions.0, StatusCode::OK);
+    assert!(missions.1.as_array().unwrap().is_empty());
+    assert!(remote_requests.lock().await.is_empty());
+
+    remote_server.abort();
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn register_node_persists_transport_material_and_routes() {
     let db = TestDatabase::new().await;
     let app = test_app(&db.database_url).await;
@@ -1682,23 +1957,31 @@ async fn test_app(database_url: &str) -> Router {
     })
 }
 
+async fn record_federated_request(
+    uri: OriginalUri,
+    requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+    payload: Value,
+) -> Json<Value> {
+    requests.lock().await.push(uri.0.to_string());
+    Json(payload)
+}
+
+fn assert_contains_id(values: &Value, key: &str, expected: &str) {
+    assert!(
+        values
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value[key].as_str() == Some(expected)),
+        "expected {key}={expected} in {values}"
+    );
+}
+
 async fn test_app_with_identity(database_url: &str) -> Router {
     let pool = db::connect(database_url).await.unwrap();
     db::init_schema(&pool).await.unwrap();
     let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
-    let gateway_identity = GatewayIdentity::from_config(GatewayIdentityConfig {
-        gateway_id: Some("gw-self-1".to_string()),
-        display_name: Some("Self Gateway".to_string()),
-        base_url: Some("https://gateway.self.example".to_string()),
-        region: Some("ap-southeast".to_string()),
-        operator_did: Some("did:key:operator-self".to_string()),
-        roles: vec!["ingest".to_string(), "query".to_string()],
-        supported_endpoints: vec!["/api/network/status".to_string()],
-        federation_peers: vec!["https://gw-us.example".to_string()],
-        allows_public_ingest: true,
-        signing_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([21_u8; 32])),
-    })
-    .unwrap();
+    let gateway_identity = test_gateway_identity(vec!["https://gw-us.example".to_string()]);
     http::router(AppState {
         pool,
         node_client: NodeClient::new(5).unwrap(),
@@ -1710,6 +1993,44 @@ async fn test_app_with_identity(database_url: &str) -> Router {
         gateway_network: None,
         ui_stream_tx,
     })
+}
+
+async fn test_app_with_identity_and_federation_peers(
+    database_url: &str,
+    federation_peers: Vec<String>,
+) -> Router {
+    let pool = db::connect(database_url).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
+    let gateway_identity = test_gateway_identity(federation_peers);
+    http::router(AppState {
+        pool,
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity,
+        gateway_network: None,
+        ui_stream_tx,
+    })
+}
+
+fn test_gateway_identity(federation_peers: Vec<String>) -> Option<GatewayIdentity> {
+    GatewayIdentity::from_config(GatewayIdentityConfig {
+        gateway_id: Some("gw-self-1".to_string()),
+        display_name: Some("Self Gateway".to_string()),
+        base_url: Some("https://gateway.self.example".to_string()),
+        region: Some("ap-southeast".to_string()),
+        operator_did: Some("did:key:operator-self".to_string()),
+        roles: vec!["ingest".to_string(), "query".to_string()],
+        supported_endpoints: vec!["/api/network/status".to_string()],
+        federation_mode: Some("trusted".to_string()),
+        federation_peers,
+        allows_public_ingest: true,
+        signing_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([21_u8; 32])),
+    })
+    .unwrap()
 }
 
 async fn test_app_with_identity_and_bootstrap(
@@ -1727,6 +2048,7 @@ async fn test_app_with_identity_and_bootstrap(
         operator_did: Some("did:key:operator-self".to_string()),
         roles: vec!["ingest".to_string(), "query".to_string()],
         supported_endpoints: vec!["/api/network/status".to_string()],
+        federation_mode: None,
         federation_peers: vec!["https://gw-us.example".to_string()],
         allows_public_ingest: true,
         signing_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([21_u8; 32])),
@@ -2121,6 +2443,11 @@ fn signed_gateway_manifest(
         ],
         supported_endpoints: vec![
             "/api/network/status".to_string(),
+            "/api/network/nodes".to_string(),
+            "/api/peers".to_string(),
+            "/api/hives".to_string(),
+            "/api/missions".to_string(),
+            "/api/leaderboard".to_string(),
             "/api/registry/gateways".to_string(),
         ],
         federation_peers: vec![],

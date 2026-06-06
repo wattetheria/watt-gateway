@@ -13,9 +13,16 @@ pub struct GatewayIdentity {
     operator_did: Option<String>,
     roles: Vec<String>,
     supported_endpoints: Vec<String>,
+    federation_mode: FederationMode,
     federation_peers: Vec<String>,
     allows_public_ingest: bool,
     signing_key: SigningKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FederationMode {
+    Open,
+    Trusted,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +34,7 @@ pub struct GatewayIdentityConfig {
     pub operator_did: Option<String>,
     pub roles: Vec<String>,
     pub supported_endpoints: Vec<String>,
+    pub federation_mode: Option<String>,
     pub federation_peers: Vec<String>,
     pub allows_public_ingest: bool,
     pub signing_key_b64: Option<String>,
@@ -93,6 +101,7 @@ impl GatewayIdentity {
             operator_did: config.operator_did,
             roles,
             supported_endpoints,
+            federation_mode: FederationMode::from_raw(config.federation_mode.as_deref()),
             federation_peers: config.federation_peers,
             allows_public_ingest: config.allows_public_ingest,
             signing_key,
@@ -119,6 +128,27 @@ impl GatewayIdentity {
                 .to_bytes(),
         );
         Ok(SignedGatewayManifest { payload, signature })
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn federation_peers(&self) -> &[String] {
+        &self.federation_peers
+    }
+
+    pub fn allows_registry_federation(&self) -> bool {
+        self.federation_mode == FederationMode::Open
+    }
+}
+
+impl FederationMode {
+    fn from_raw(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("trusted" | "allowlist" | "allow-list") => Self::Trusted,
+            _ => Self::Open,
+        }
     }
 }
 
@@ -162,6 +192,7 @@ mod tests {
             operator_did: Some("did:key:operator-ap".to_string()),
             roles: Vec::new(),
             supported_endpoints: Vec::new(),
+            federation_mode: None,
             federation_peers: vec!["https://gw-us.example".to_string()],
             allows_public_ingest: true,
             signing_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([7_u8; 32])),
@@ -189,6 +220,7 @@ mod tests {
             operator_did: None,
             roles: Vec::new(),
             supported_endpoints: Vec::new(),
+            federation_mode: None,
             federation_peers: Vec::new(),
             allows_public_ingest: true,
             signing_key_b64: None,
@@ -207,6 +239,7 @@ mod tests {
             operator_did: None,
             roles: Vec::new(),
             supported_endpoints: Vec::new(),
+            federation_mode: None,
             federation_peers: Vec::new(),
             allows_public_ingest: true,
             signing_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([7_u8; 32])),

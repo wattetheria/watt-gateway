@@ -1,15 +1,46 @@
 use crate::contracts::DataKind;
 use crate::db;
 use crate::gateway_network::GatewayNetworkHandle;
-use crate::models::{ListQuery, TopicMessageQuery, TopicQuery};
+use crate::models::{GatewayRegistryEntry, ListQuery, TopicMessageQuery, TopicQuery};
 use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use std::time::Duration;
 use wattswarm_network_transport_core::{PeerTransportCapabilities, TransferIntent, TransferKind};
 
-pub async fn network_status(State(state): State<AppState>) -> Response {
+const FEDERATION_LOCAL: &str = "local";
+
+#[derive(Debug, Default, Deserialize)]
+pub struct FederationQuery {
+    pub federation: Option<String>,
+}
+
+pub async fn network_status(
+    State(state): State<AppState>,
+    Query(query): Query<FederationQuery>,
+) -> Response {
+    let mut status = match local_network_status_value(&state).await {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if federation_enabled(query.federation.as_deref()) {
+        let remote_statuses =
+            fetch_federated_objects(&state, "/api/network/status", Vec::new()).await;
+        status = merge_network_status_values(status, remote_statuses);
+    }
+    axum::Json(status).into_response()
+}
+
+async fn local_network_status_value(state: &AppState) -> anyhow::Result<Value> {
     match db::list_visible_snapshots(&state.pool).await {
         Ok(rows) => {
             let snapshots = rows.iter().map(|row| &row.payload.0).collect::<Vec<_>>();
@@ -44,7 +75,7 @@ pub async fn network_status(State(state): State<AppState>) -> Response {
                 .iter()
                 .map(|payload| payload["public_blocks"].as_array().map_or(0, Vec::len))
                 .sum::<usize>();
-            axum::Json(json!({
+            Ok(json!({
                 "status": "ok",
                 "nodes": total_nodes,
                 "peers": total_peers,
@@ -58,7 +89,91 @@ pub async fn network_status(State(state): State<AppState>) -> Response {
                 "gateway_runtime": state.gateway_network.as_ref().map(gateway_runtime_status),
                 "updated_at": db::now_rfc3339(),
             }))
-            .into_response()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn merge_network_status_values(mut local: Value, remotes: Vec<Value>) -> Value {
+    let mut statuses = Vec::with_capacity(remotes.len() + 1);
+    statuses.push(local.clone());
+    statuses.extend(remotes);
+    let count_keys = [
+        "nodes",
+        "peers",
+        "tasks",
+        "organizations",
+        "topics",
+        "topic_messages",
+        "public_blocks",
+    ];
+    if let Some(object) = local.as_object_mut() {
+        for key in count_keys {
+            object.insert(
+                key.to_string(),
+                Value::Number(
+                    statuses
+                        .iter()
+                        .map(|status| status.get(key).and_then(Value::as_u64).unwrap_or(0))
+                        .sum::<u64>()
+                        .into(),
+                ),
+            );
+        }
+        object.insert(
+            "network_name".to_string(),
+            single_shared_status_string(&statuses, "network_name"),
+        );
+        object.insert(
+            "network_org_name".to_string(),
+            single_shared_status_string(&statuses, "network_org_name"),
+        );
+        object.insert(
+            "federated_gateways".to_string(),
+            Value::Number((statuses.len().saturating_sub(1) as u64).into()),
+        );
+        object.insert("updated_at".to_string(), Value::String(db::now_rfc3339()));
+    }
+    local
+}
+
+fn single_shared_status_string(statuses: &[Value], key: &str) -> Value {
+    let mut values = statuses
+        .iter()
+        .filter_map(|status| status.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    match values.as_slice() {
+        [value] => Value::String(value.clone()),
+        _ => Value::Null,
+    }
+}
+
+pub async fn peers(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
+    let limit = query.limit.unwrap_or(200);
+    match local_snapshot_array_values(&state, limit, "peers", |source_id, value| {
+        attach_source(value, source_id)
+    })
+    .await
+    {
+        Ok(mut values) => {
+            if federation_enabled(query.federation.as_deref()) {
+                values.extend(
+                    fetch_federated_arrays(
+                        &state,
+                        "/api/peers",
+                        vec![("limit", limit.to_string())],
+                    )
+                    .await,
+                );
+                dedupe_values_by_key(&mut values, peer_identity_key);
+            }
+            values.truncate(limit);
+            axum::Json(values).into_response()
         }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -68,21 +183,12 @@ pub async fn network_status(State(state): State<AppState>) -> Response {
     }
 }
 
-pub async fn peers(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_snapshot_array_endpoint(
-        &state,
-        query.limit.unwrap_or(200),
-        "peers",
-        |source_id, value| attach_source(value, source_id),
-    )
-    .await
-}
-
 pub async fn network_nodes(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    let mut values = match projection_values(&state, DataKind::NetworkProjection).await {
+    let limit = query.limit.unwrap_or(200);
+    let mut values = match local_network_node_values(&state).await {
         Ok(values) => values,
         Err(error) => {
             return (
@@ -92,16 +198,26 @@ pub async fn network_nodes(
                 .into_response();
         }
     };
-    let rows = match db::list_visible_snapshots(&state.pool).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"error": error.to_string()})),
+    if federation_enabled(query.federation.as_deref()) {
+        values.extend(
+            fetch_federated_arrays(
+                &state,
+                "/api/network/nodes",
+                vec![("limit", limit.to_string())],
             )
-                .into_response();
-        }
-    };
+            .await,
+        );
+    }
+    sort_values_desc_by_timestamp_with_fallback(&mut values, &["snapshot_generated_at"]);
+    values.retain(has_valid_geo);
+    dedupe_nodes_by_id(&mut values);
+    values.truncate(limit);
+    axum::Json(values).into_response()
+}
+
+async fn local_network_node_values(state: &AppState) -> anyhow::Result<Vec<Value>> {
+    let mut values = projection_values(state, DataKind::NetworkProjection).await?;
+    let rows = db::list_visible_snapshots(&state.pool).await?;
     for row in rows {
         values.extend(snapshot_geo_nodes(
             &row.payload.0,
@@ -109,13 +225,7 @@ pub async fn network_nodes(
             row.generated_at.timestamp(),
         ));
     }
-    sort_values_desc_by_timestamp_with_fallback(&mut values, &["snapshot_generated_at"]);
-    values.retain(has_valid_geo);
-    dedupe_nodes_by_id(&mut values);
-    if let Some(limit) = query.limit {
-        values.truncate(limit);
-    }
-    axum::Json(values).into_response()
+    Ok(values)
 }
 
 fn has_valid_geo(value: &Value) -> bool {
@@ -211,7 +321,16 @@ pub async fn public_hive_messages_by_query(
 }
 
 pub async fn missions(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
-    aggregate_projection_endpoint(&state, query.limit.unwrap_or(200), DataKind::TaskSummary).await
+    aggregate_federated_projection_endpoint(
+        &state,
+        query.limit.unwrap_or(200),
+        query.federation.as_deref(),
+        DataKind::TaskSummary,
+        "/api/missions",
+        mission_identity_key,
+        &["updated_at", "created_at", "snapshot_generated_at"],
+    )
+    .await
 }
 
 pub async fn mission_activity(
@@ -294,10 +413,20 @@ pub async fn leaderboard(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    aggregate_projection_endpoint(
+    aggregate_federated_projection_endpoint(
         &state,
         query.limit.unwrap_or(200),
+        query.federation.as_deref(),
         DataKind::RankingProjection,
+        "/api/leaderboard",
+        ranking_identity_key,
+        &[
+            "score",
+            "watt",
+            "updated_at",
+            "created_at",
+            "snapshot_generated_at",
+        ],
     )
     .await
 }
@@ -328,6 +457,22 @@ fn gateway_runtime_status(runtime: &GatewayNetworkHandle) -> Value {
 async fn aggregate_public_hives_endpoint(state: &AppState, query: TopicQuery) -> Response {
     match projection_values(state, DataKind::HiveMetadata).await {
         Ok(mut values) => {
+            if federation_enabled(query.federation.as_deref()) {
+                let mut params = vec![("limit", query.limit.unwrap_or(200).to_string())];
+                if let Some(value) = query.network_id.as_deref() {
+                    params.push(("network_id", value.to_string()));
+                }
+                if let Some(value) = query.hive_id.as_deref() {
+                    params.push(("hive_id", value.to_string()));
+                }
+                if let Some(value) = query.topic_id.as_deref() {
+                    params.push(("topic_id", value.to_string()));
+                }
+                if let Some(value) = query.organization_id.as_deref() {
+                    params.push(("organization_id", value.to_string()));
+                }
+                values.extend(fetch_federated_arrays(state, "/api/hives", params).await);
+            }
             values.retain(|value| matches_hive_filters(value, &query));
             sort_values_desc_by_timestamp(&mut values);
             dedupe_values_by_key(&mut values, topic_identity_key);
@@ -382,28 +527,27 @@ async fn aggregate_projection_endpoint(
     }
 }
 
-async fn aggregate_snapshot_array_endpoint<F>(
+async fn aggregate_federated_projection_endpoint<F>(
     state: &AppState,
     limit: usize,
-    key: &str,
-    transform: F,
+    federation: Option<&str>,
+    data_kind: DataKind,
+    endpoint: &'static str,
+    identity_key: F,
+    sort_keys: &[&str],
 ) -> Response
 where
-    F: Fn(String, Value) -> Value,
+    F: Fn(&Value) -> Option<String> + Copy,
 {
-    match db::list_visible_snapshots(&state.pool).await {
-        Ok(rows) => {
-            let mut values = Vec::new();
-            for row in rows {
-                if let Some(entries) = row.payload.0[key].as_array() {
-                    values.extend(
-                        entries
-                            .iter()
-                            .take(limit)
-                            .cloned()
-                            .map(|value| transform(row.node_id.clone(), value)),
-                    );
-                }
+    match projection_values(state, data_kind).await {
+        Ok(mut values) => {
+            if federation_enabled(federation) {
+                values.extend(
+                    fetch_federated_arrays(state, endpoint, vec![("limit", limit.to_string())])
+                        .await,
+                );
+                sort_values_desc_by_timestamp_with_fallback(&mut values, sort_keys);
+                dedupe_values_by_key(&mut values, identity_key);
             }
             values.truncate(limit);
             axum::Json(values).into_response()
@@ -414,6 +558,193 @@ where
         )
             .into_response(),
     }
+}
+
+async fn local_snapshot_array_values<F>(
+    state: &AppState,
+    limit: usize,
+    key: &str,
+    transform: F,
+) -> anyhow::Result<Vec<Value>>
+where
+    F: Fn(String, Value) -> Value,
+{
+    let rows = db::list_visible_snapshots(&state.pool).await?;
+    let mut values = Vec::new();
+    for row in rows {
+        if let Some(entries) = row.payload.0[key].as_array() {
+            values.extend(
+                entries
+                    .iter()
+                    .take(limit)
+                    .cloned()
+                    .map(|value| transform(row.node_id.clone(), value)),
+            );
+        }
+    }
+    values.truncate(limit);
+    Ok(values)
+}
+
+fn federation_enabled(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some(FEDERATION_LOCAL | "none" | "false" | "0")
+    )
+}
+
+async fn fetch_federated_arrays(
+    state: &AppState,
+    endpoint: &'static str,
+    params: Vec<(&'static str, String)>,
+) -> Vec<Value> {
+    let mut values = Vec::new();
+    let client = federated_gateway_client();
+    for base_url in federated_gateway_base_urls(state, endpoint).await {
+        let Some(url) = federated_gateway_url(&base_url, endpoint, &params) else {
+            continue;
+        };
+        let Ok(response) = client.get(url).send().await else {
+            continue;
+        };
+        let Ok(response) = response.error_for_status() else {
+            continue;
+        };
+        let Ok(Value::Array(items)) = response.json::<Value>().await else {
+            continue;
+        };
+        values.extend(items);
+    }
+    values
+}
+
+async fn fetch_federated_objects(
+    state: &AppState,
+    endpoint: &'static str,
+    params: Vec<(&'static str, String)>,
+) -> Vec<Value> {
+    let mut values = Vec::new();
+    let client = federated_gateway_client();
+    for base_url in federated_gateway_base_urls(state, endpoint).await {
+        let Some(url) = federated_gateway_url(&base_url, endpoint, &params) else {
+            continue;
+        };
+        let Ok(response) = client.get(url).send().await else {
+            continue;
+        };
+        let Ok(response) = response.error_for_status() else {
+            continue;
+        };
+        let Ok(Value::Object(object)) = response.json::<Value>().await else {
+            continue;
+        };
+        values.push(Value::Object(object));
+    }
+    values
+}
+
+async fn federated_gateway_base_urls(state: &AppState, endpoint: &'static str) -> Vec<String> {
+    let mut base_urls = state
+        .gateway_identity
+        .as_ref()
+        .map(|identity| identity.federation_peers().to_vec())
+        .unwrap_or_default();
+
+    if state
+        .gateway_identity
+        .as_ref()
+        .is_some_and(|identity| !identity.allows_registry_federation())
+    {
+        return dedupe_and_filter_gateway_base_urls(base_urls, state.gateway_identity.as_ref());
+    }
+
+    let mut gateways = Vec::new();
+    if let Ok(entries) =
+        db::list_gateway_registry_entries(&state.pool, Some("approved"), None, None, Some("query"))
+            .await
+    {
+        gateways.extend(entries);
+    }
+    for registry_url in &state.bootstrap_registry_urls {
+        if let Ok(entries) = state
+            .registry_client
+            .fetch_public_gateways(registry_url)
+            .await
+        {
+            gateways.extend(entries);
+        }
+    }
+    base_urls.extend(
+        gateways
+            .into_iter()
+            .filter(|gateway| gateway_supports_endpoint(gateway, endpoint))
+            .map(|gateway| gateway.base_url),
+    );
+    dedupe_and_filter_gateway_base_urls(base_urls, state.gateway_identity.as_ref())
+}
+
+fn dedupe_and_filter_gateway_base_urls(
+    base_urls: Vec<String>,
+    identity: Option<&crate::gateway_identity::GatewayIdentity>,
+) -> Vec<String> {
+    let self_base_url = identity.map(|identity| normalize_gateway_base_url(identity.base_url()));
+    let mut seen = std::collections::BTreeSet::new();
+    base_urls
+        .into_iter()
+        .filter_map(|base_url| {
+            let base_url = normalize_gateway_base_url(&base_url);
+            if !base_url.is_empty()
+                && self_base_url.as_deref() != Some(base_url.as_str())
+                && seen.insert(base_url.clone())
+            {
+                Some(base_url)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn gateway_supports_endpoint(gateway: &GatewayRegistryEntry, endpoint: &'static str) -> bool {
+    gateway.status == "approved"
+        && gateway.roles.iter().any(|role| role == "query")
+        && gateway
+            .supported_endpoints
+            .iter()
+            .any(|candidate| candidate == endpoint || candidate == "*")
+}
+
+fn federated_gateway_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build federated gateway client")
+}
+
+fn federated_gateway_url(
+    base_url: &str,
+    endpoint: &'static str,
+    params: &[(&'static str, String)],
+) -> Option<String> {
+    let base_url = normalize_gateway_base_url(base_url);
+    if base_url.is_empty() {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(&format!("{base_url}{endpoint}")).ok()?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in params {
+            if !value.trim().is_empty() {
+                pairs.append_pair(key, value);
+            }
+        }
+        pairs.append_pair("federation", FEDERATION_LOCAL);
+    }
+    Some(url.to_string())
+}
+
+fn normalize_gateway_base_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
 }
 
 async fn projection_values(state: &AppState, data_kind: DataKind) -> anyhow::Result<Vec<Value>> {
@@ -601,6 +932,28 @@ fn topic_message_identity_key(value: &Value) -> Option<String> {
             .unwrap_or_default();
         Some(format!("{topic_id}:{author_id}:{timestamp}:{body}"))
     })
+}
+
+fn peer_identity_key(value: &Value) -> Option<String> {
+    topic_key_from_value(
+        value,
+        &[
+            "node_id",
+            "peer_id",
+            "id",
+            "public_id",
+            "agent_did",
+            "source_node_id",
+        ],
+    )
+}
+
+fn mission_identity_key(value: &Value) -> Option<String> {
+    topic_key_from_value(value, &["mission_id", "task_id", "id"])
+}
+
+fn ranking_identity_key(value: &Value) -> Option<String> {
+    topic_key_from_value(value, &["agent_did", "public_id", "agent_id", "id"])
 }
 
 fn task_activity_task_identity_key(value: &Value) -> Option<String> {

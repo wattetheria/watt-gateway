@@ -242,6 +242,8 @@ Environment variables:
 - `WATTETHERIA_GATEWAY_REQUEST_TIMEOUT_SECS`
 - `WATTETHERIA_GATEWAY_REGISTRY_ADMIN_TOKEN`
 - `WATTETHERIA_GATEWAY_BOOTSTRAP_REGISTRY_URLS`
+- `WATTETHERIA_GATEWAY_FEDERATION_MODE`
+- `WATTETHERIA_GATEWAY_FEDERATION_TRUSTED_PEERS`
 - `WATTETHERIA_GATEWAY_IDENTITY_ID`
 - `WATTETHERIA_GATEWAY_IDENTITY_DISPLAY_NAME`
 - `WATTETHERIA_GATEWAY_IDENTITY_BASE_URL`
@@ -250,7 +252,7 @@ Environment variables:
 - `WATTETHERIA_GATEWAY_IDENTITY_OPERATOR_DID`
 - `WATTETHERIA_GATEWAY_IDENTITY_ROLES`
 - `WATTETHERIA_GATEWAY_IDENTITY_SUPPORTED_ENDPOINTS`
-- `WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS`
+- `WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS` legacy alias for trusted peers
 - `WATTETHERIA_GATEWAY_IDENTITY_ALLOWS_PUBLIC_INGEST`
 
 `WATTETHERIA_GATEWAY_BOOTSTRAP_REGISTRY_URLS` is a comma-separated list. Each entry may be:
@@ -260,6 +262,32 @@ Environment variables:
 - a registry register URL like `https://gw-ap.example.com/api/registry/gateways/register`
 
 The gateway normalizes these forms automatically for list and register operations.
+
+Gateway federation trust policy:
+
+- `WATTETHERIA_GATEWAY_FEDERATION_MODE=open` keeps the current discovery behavior:
+  configured trusted peers are used and approved registry gateways may also be
+  aggregated.
+- `WATTETHERIA_GATEWAY_FEDERATION_MODE=trusted` restricts public UI query
+  aggregation to gateway base URLs listed in
+  `WATTETHERIA_GATEWAY_FEDERATION_TRUSTED_PEERS`.
+
+Official or curated gateway entry nodes should run in trusted mode. The trusted
+peerlist is a comma-separated list of gateway base URLs, for example:
+
+```bash
+WATTETHERIA_GATEWAY_FEDERATION_MODE=trusted
+WATTETHERIA_GATEWAY_FEDERATION_TRUSTED_PEERS=https://gw-ap.example.com,https://gw-eu.example.com
+```
+
+Public UI query endpoints aggregate trusted peers directly and add
+`federation=local` to remote requests to prevent recursive gateway fan-out.
+Community gateways do not need registry admin approval to be used this way:
+operators verify the gateway out of band, add its base URL to the peerlist, and
+restart or redeploy the gateway. The registry review APIs remain available for
+manifest discovery workflows, but the peerlist is the recommended first-version
+curation path. `WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS` remains supported
+as a legacy alias for the trusted peerlist.
 
 Public chat support is intentionally limited in this phase:
 
@@ -347,6 +375,12 @@ Query public topics and public topic messages:
 curl http://127.0.0.1:8080/api/hives?limit=50
 curl http://127.0.0.1:8080/api/hives?organization_id=org-1
 curl http://127.0.0.1:8080/api/hive-messages?topic_id=topic-public-1&limit=100
+```
+
+Query only this gateway without federation fan-out:
+
+```bash
+curl http://127.0.0.1:8080/api/missions?federation=local
 ```
 
 Register a gateway manifest:

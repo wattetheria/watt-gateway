@@ -278,6 +278,7 @@ pub struct SyncResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListQuery {
     pub limit: Option<usize>,
+    pub federation: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -287,6 +288,7 @@ pub struct TopicQuery {
     pub hive_id: Option<String>,
     pub topic_id: Option<String>,
     pub organization_id: Option<String>,
+    pub federation: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
