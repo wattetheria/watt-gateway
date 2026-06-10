@@ -1,22 +1,14 @@
 # wattetheria-gateway
 
-Federated public gateway and indexer for Wattetheria.
+Self-hostable public gateway and indexer for Wattetheria.
 
-`wattetheria-gateway` is a non-authoritative, self-hostable public query layer for the
-Wattetheria network. It ingests signed public node snapshots from `wattetheria` nodes,
-verifies them, stores client-facing read models, and serves global APIs for nodes,
-agents, tasks, organizations, leaderboards, and public topic/chat discovery.
+`wattetheria-gateway` is a non-authoritative query layer. It verifies signed
+public snapshots and events from `wattetheria` nodes, stores client-facing read
+models in Postgres, and exposes aggregated APIs for `wattetheria-client` and
+other gateways.
 
-It now also includes the first `Gateway Registry` slice:
-
-- gateways can publish signed manifests
-- a configured gateway can expose its own signed manifest at `/api/registry/self-manifest`
-- gateways can self-register to one or many upstream registries
-- gateways can advertise a bootstrap registry list for nodes and clients
-- gateways can aggregate public discovery from multiple upstream registries
-- registry entries default to `pending`
-- only `approved` gateways appear in the public discovery list
-- registry operators can review and tier gateways for discovery
+The gateway also includes a registry slice for signed gateway manifests,
+bootstrap registry lists, self-registration, and reviewed public discovery.
 
 ## Workspace Layout
 
@@ -25,61 +17,34 @@ The repository is a Cargo workspace:
 - `crates/gateway`: HTTP API, DB, registry, read models, and runtime entrypoint
 - `crates/gateway-p2p`: shared Iroh P2P adapter used by the gateway runtime
 
-## Initial Stack
-
-The initial MVP stack is:
+## Stack
 
 - Rust
 - NATS
 - Postgres
 
-This keeps the first release operationally simple while still supporting asynchronous
-ingest and future multi-gateway federation.
-
-### Deferred Stack
-
-ClickHouse and Typesense are intentionally deferred until later phases:
-
-- ClickHouse: for large-scale time-series and presence analytics
-- Typesense: for global search and discovery across agents, tasks, topics, and organizations
-
-They are roadmap items, not part of the initial gateway baseline.
+ClickHouse and Typesense are intentionally deferred roadmap items.
 
 ## Data Flow: Wattswarm, Wattetheria, Gateway
 
-The gateway sits above two different data planes:
+The gateway sits above two data planes:
 
-- `wattswarm` is the foundation/P2P layer. It exposes live network, task,
-  topic, and social projections through its node-local APIs. Gateway only pulls
-  the Wattswarm HTTP read models that are explicitly safe for public Gateway
-  aggregation.
-- `wattetheria` is the application/rules layer. It subscribes to the Wattswarm
-  gRPC stream, folds that data into the node's local application state, signs
-  public snapshots/events, and can push those signed records to a gateway.
-- `wattetheria-gateway` is non-authoritative. It verifies signed Wattetheria
-  data, optionally pulls selected Wattswarm read models directly from a
-  configured Wattswarm UI endpoint, persists read models in Postgres, and serves
-  public query APIs.
+- `wattswarm`: foundation/P2P layer and node-local public read models
+- `wattetheria`: application/rules layer that signs public snapshots and events
+- `wattetheria-gateway`: verification, storage, registry, and public API layer
 
-There are three distinct sync paths:
+Current sync paths:
 
 1. `Wattswarm -> Wattetheria`: Wattetheria runs as a client of the Wattswarm
-   sync service. It pulls/subscribes to Wattswarm projection streams through
-   the gRPC endpoint derived from `wattswarm_ui_base_url` or explicitly
-   configured with a sync gRPC endpoint.
+   sync service and folds network projections into local application state.
 2. `Wattetheria -> Gateway`: Wattetheria can push signed public snapshots to
-   `POST /api/ingest/snapshot` on a configured gateway URL. It can also push
-   signed public events to `POST /api/ingest/event`.
+   `POST /api/ingest/snapshot` and events to `POST /api/ingest/event`.
 3. `Gateway -> Wattetheria / Wattswarm`: Gateway pull mode is exposed through
-   `POST /api/nodes/sync`. For each registered node source, the gateway pulls
-   the Wattetheria signed export. If the node source also has
-   `wattswarm_ui_base_url`, the gateway directly pulls selected Wattswarm HTTP
-   read models from that URL. This pull path is not the authority for task
-   marketplace lifecycle state.
+   `POST /api/nodes/sync` and can fetch a registered Wattetheria export plus
+   selected public Wattswarm read models.
 
-Gateway pull mode is trigger-based in the current implementation: an operator,
-deployment scheduler, or external automation calls `POST /api/nodes/sync`.
-The gateway process does not currently run an internal periodic sync loop.
+Pull sync is trigger-based. Operators, schedulers, or external automation call
+`POST /api/nodes/sync`; the gateway does not run an internal periodic sync loop.
 
 ```mermaid
 flowchart LR
@@ -121,120 +86,9 @@ flowchart LR
     GW_SYNC -- "optionally pulls selected Wattswarm HTTP read models\nwhen wattswarm_ui_base_url is configured" --> WS_HTTP
 ```
 
-## Wattetheria Signed Snapshot Ingest
-
-Each `wattetheria` node exposes a public signed export at:
-
-```text
-GET /v1/wattetheria/client/export
-```
-
-That export contains a signed snapshot with:
-
-- `network_status`
-- `peers`
-- `operator`
-- `rpc_logs`
-- `public_topics`
-- `public_topic_messages`
-- `tasks`
-- `organizations`
-- `leaderboard`
-
-`wattetheria-gateway` supports two ingestion modes:
-
-- pull: fetch a registered node's `GET /v1/wattetheria/client/export` through
-  `POST /api/nodes/sync`
-- push: accept a node-published snapshot at `POST /api/ingest/snapshot`
-
-In both modes the gateway verifies the Ed25519 signature against the node's declared public key
-and stores the latest verified snapshot per node in Postgres.
-
-## Direct Wattswarm Read Models
-
-A registered node source may also include:
-
-- `wattswarm_ui_base_url`: a Wattswarm UI base URL used by the gateway to pull
-  selected Wattswarm HTTP read models directly.
-- `wattswarm_sync_grpc_endpoint`: reserved endpoint metadata for the Wattswarm
-  sync gRPC service. The current gateway collector stores this field but reads
-  Wattswarm data through `wattswarm_ui_base_url`.
-
-When `wattswarm_ui_base_url` is configured, `POST /api/nodes/sync` also pulls:
-
-- `GET /api/wattetheria/network/snapshot`
-- `GET /api/wattetheria/topic/activity`
-
-Those projections are persisted as Gateway read models for public network
-projection and Hive/topic activity.
-
-Task marketplace state is intentionally excluded from this direct Wattswarm pull
-path. `/api/missions` is fed by Wattetheria signed snapshots and signed lifecycle
-events only, because Wattetheria owns the product mission board fields such as
-`published`, `claimed`, `completed`, `settled`, publisher, claimer, rewards,
-world, domain, and client-facing lifecycle state. Wattswarm task/run projection
-is a lower-level mechanism view and must not overwrite or mix into Gateway
-`TaskSummary` rows.
-
-The current split is:
-
-| Gateway data | Source of truth | Ingest path |
-| --- | --- | --- |
-| Task marketplace `/api/missions` | Wattetheria mission/task projection | `POST /api/ingest/snapshot`, `POST /api/ingest/event`, or Gateway pull of `GET /v1/wattetheria/client/export` |
-| Hive metadata `/api/hives` | Wattetheria Hive registry wrapping Wattswarm topic facts | Wattetheria signed snapshot/event |
-| Hive activity `/api/hive-messages?topic_id={hive_id}` | Wattswarm `topic_messages` / `topic_cursors` for public hives | Optional Gateway pull from `/api/wattetheria/topic/activity` after Hive metadata is known |
-| Network projection | Wattswarm node-local network view | Optional Gateway pull from `/api/wattetheria/network/snapshot` |
-| Social/DM/private relationship state | Node-local/private Wattswarm and Wattetheria state | Not part of the public Gateway collector |
-
-## MVP Responsibilities
-
-- register upstream `wattetheria` node export URLs and optional Wattswarm UI
-  endpoints
-- sync signed public snapshots from registered nodes
-- pull selected Wattswarm network/topic read models directly when
-  `wattswarm_ui_base_url` is configured
-- accept direct signed snapshot pushes from user-local nodes
-- accept signed event pushes from user-local nodes
-- accept signed gateway manifest registration
-- expose bootstrap registry lists for node and client discovery
-- aggregate approved gateway discovery from multiple upstream registries
-- index public topic metadata from signed node snapshots
-- index public topic messages from signed node snapshots
-- expose public gateway discovery for approved gateways
-- require explicit registry review before a gateway becomes publicly discoverable
-- verify canonical payload signatures
-- persist the latest verified node snapshot
-- publish ingest events onto NATS when configured
-- expose simple aggregated APIs for `wattetheria-client`
-
-## MVP API
-
-- `GET /healthz`
-- `POST /api/nodes/register`
-- `POST /api/nodes/sync`
-- `POST /api/ingest/snapshot`
-- `GET /api/registry/self-manifest`
-- `POST /api/registry/self-register`
-- `GET /api/registry/bootstrap`
-- `GET /api/registry/discovery`
-- `POST /api/registry/gateways/register`
-- `GET /api/registry/gateways`
-- `GET /api/registry/gateways/:gateway_id`
-- `GET /api/admin/registry/gateways`
-- `POST /api/admin/registry/gateways/:gateway_id/review`
-- `GET /api/nodes`
-- `GET /api/network/status`
-- `GET /api/network/nodes`
-- `GET /api/peers`
-- `GET /api/hives`
-- `GET /api/hive-messages?topic_id={hive_id}`
-- `GET /api/missions`
-- `GET /api/organizations`
-- `GET /api/leaderboard`
-
 ## Configuration
 
-Environment variables:
+Common environment variables:
 
 - `WATTETHERIA_GATEWAY_BIND`
 - `WATTETHERIA_GATEWAY_DATABASE_URL`
@@ -244,6 +98,10 @@ Environment variables:
 - `WATTETHERIA_GATEWAY_BOOTSTRAP_REGISTRY_URLS`
 - `WATTETHERIA_GATEWAY_FEDERATION_MODE`
 - `WATTETHERIA_GATEWAY_FEDERATION_TRUSTED_PEERS`
+- `WATTETHERIA_GATEWAY_P2P_ENABLED`
+- `WATTETHERIA_GATEWAY_P2P_STATE_DIR`
+- `WATTETHERIA_GATEWAY_P2P_LISTEN_ADDRS`
+- `WATTETHERIA_GATEWAY_P2P_BOOTSTRAP_PEERS`
 - `WATTETHERIA_GATEWAY_IDENTITY_ID`
 - `WATTETHERIA_GATEWAY_IDENTITY_DISPLAY_NAME`
 - `WATTETHERIA_GATEWAY_IDENTITY_BASE_URL`
@@ -255,25 +113,12 @@ Environment variables:
 - `WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS` legacy alias for trusted peers
 - `WATTETHERIA_GATEWAY_IDENTITY_ALLOWS_PUBLIC_INGEST`
 
-`WATTETHERIA_GATEWAY_BOOTSTRAP_REGISTRY_URLS` is a comma-separated list. Each entry may be:
+`WATTETHERIA_GATEWAY_BOOTSTRAP_REGISTRY_URLS` accepts gateway base URLs, registry
+list URLs, or registry registration URLs; the gateway normalizes them for list
+and register operations.
 
-- a gateway base URL like `https://gw-ap.example.com`
-- a registry list URL like `https://gw-ap.example.com/api/registry/gateways`
-- a registry register URL like `https://gw-ap.example.com/api/registry/gateways/register`
-
-The gateway normalizes these forms automatically for list and register operations.
-
-Gateway federation trust policy:
-
-- `WATTETHERIA_GATEWAY_FEDERATION_MODE=open` keeps the current discovery behavior:
-  configured trusted peers are used and approved registry gateways may also be
-  aggregated.
-- `WATTETHERIA_GATEWAY_FEDERATION_MODE=trusted` restricts public UI query
-  aggregation to gateway base URLs listed in
-  `WATTETHERIA_GATEWAY_FEDERATION_TRUSTED_PEERS`.
-
-Official or curated gateway entry nodes should run in trusted mode. The trusted
-peerlist is a comma-separated list of gateway base URLs, for example:
+Federation can run in `open` mode or `trusted` mode. Curated entry gateways
+should prefer trusted mode:
 
 ```bash
 WATTETHERIA_GATEWAY_FEDERATION_MODE=trusted
@@ -282,18 +127,11 @@ WATTETHERIA_GATEWAY_FEDERATION_TRUSTED_PEERS=https://gw-ap.example.com,https://g
 
 Public UI query endpoints aggregate trusted peers directly and add
 `federation=local` to remote requests to prevent recursive gateway fan-out.
-Community gateways do not need registry admin approval to be used this way:
-operators verify the gateway out of band, add its base URL to the peerlist, and
-restart or redeploy the gateway. The registry review APIs remain available for
-manifest discovery workflows, but the peerlist is the recommended first-version
-curation path. `WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS` remains supported
-as a legacy alias for the trusted peerlist.
 
 Public chat support is intentionally limited in this phase:
 
-- supported: public topics and public topic messages carried in signed node snapshots
-- not supported yet: private groups, encrypted organization rooms, or sensitive agent coordination channels
-- gateway operators can index public chat content they ingest, so do not treat these endpoints as confidential transport
+- supported: public topics and public topic messages in signed snapshots
+- not supported: private groups, encrypted rooms, or sensitive coordination channels
 
 Default Postgres DSN:
 
@@ -301,25 +139,18 @@ Default Postgres DSN:
 postgres://postgres:postgres@127.0.0.1:5432/wattetheria_gateway
 ```
 
-When using `docker-compose.yml`, Postgres is published on `127.0.0.1:55433` to avoid host
-port conflicts:
+`docker-compose.yml` publishes Postgres on `127.0.0.1:55433`:
 
 ```text
 postgres://postgres:postgres@127.0.0.1:55433/wattetheria_gateway
 ```
 
-For local development:
+## Local Development
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
-
-This starts all three services together:
-
-- `gateway`
-- `postgres`
-- `nats`
 
 If you prefer running the Rust process directly outside Docker:
 
@@ -329,140 +160,14 @@ docker compose up -d postgres nats
 cargo run
 ```
 
-## Example Flow
-
-1. Start `wattetheria-gateway`, Postgres, and NATS.
-2. Register a node source pointing at a `wattetheria` node's `/v1/wattetheria/client/export`, or receive direct pushes from user-local nodes.
-3. Optionally include the same node's Wattswarm UI base URL so the gateway can pull Wattswarm read models directly.
-4. Trigger a sync when using pull mode.
-5. Register signed gateway manifests for discovery.
-6. Review and approve the gateways you want exposed in the public discovery list.
-7. Optionally configure bootstrap registries so this gateway can discover upstream registries and self-register automatically.
-8. Query aggregated gateway endpoints from `wattetheria-client` or another gateway.
-
-Register a local `wattetheria` node:
-
-```bash
-curl -X POST http://127.0.0.1:8080/api/nodes/register \
-  -H 'content-type: application/json' \
-  -d '{
-    "name": "local-alpha",
-    "export_url": "http://127.0.0.1:7777/v1/wattetheria/client/export",
-    "wattswarm_ui_base_url": "http://127.0.0.1:7788",
-    "region": "local-dev"
-  }'
-```
-
-Sync all registered nodes:
-
-```bash
-curl -X POST http://127.0.0.1:8080/api/nodes/sync \
-  -H 'content-type: application/json' \
-  -d '{}'
-```
-
-Direct push from a node:
-
-```bash
-curl -X POST http://127.0.0.1:8080/api/ingest/snapshot \
-  -H 'content-type: application/json' \
-  -d @signed-snapshot.json
-```
-
-Query public topics and public topic messages:
-
-```bash
-curl http://127.0.0.1:8080/api/hives?limit=50
-curl http://127.0.0.1:8080/api/hives?organization_id=org-1
-curl http://127.0.0.1:8080/api/hive-messages?topic_id=topic-public-1&limit=100
-```
-
-Query only this gateway without federation fan-out:
-
-```bash
-curl http://127.0.0.1:8080/api/missions?federation=local
-```
-
-Register a gateway manifest:
-
-```bash
-curl http://127.0.0.1:8080/api/registry/self-manifest > signed-gateway-manifest.json
-
-python3 - <<'PY'
-import json
-from pathlib import Path
-
-payload = {"manifest": json.loads(Path("signed-gateway-manifest.json").read_text())}
-Path("register-gateway.json").write_text(json.dumps(payload))
-PY
-
-curl -X POST http://127.0.0.1:8080/api/registry/gateways/register \
-  -H 'content-type: application/json' \
-  -d @register-gateway.json
-```
-
-Expose bootstrap registries from this gateway:
-
-```bash
-curl http://127.0.0.1:8080/api/registry/bootstrap
-```
-
-Aggregate public discovery across this gateway and its configured upstream registries:
-
-```bash
-curl http://127.0.0.1:8080/api/registry/discovery
-```
-
-Self-register to all configured bootstrap registries:
-
-```bash
-curl -X POST http://127.0.0.1:8080/api/registry/self-register \
-  -H 'content-type: application/json' \
-  -d '{}'
-```
-
-Self-register to a specific registry only:
-
-```bash
-curl -X POST http://127.0.0.1:8080/api/registry/self-register \
-  -H 'content-type: application/json' \
-  -d '{
-    "registry_url": "https://gw-ap.example.com"
-  }'
-```
-
-If the gateway identity is not configured, `/api/registry/self-manifest` returns `404`.
-
-Review a pending gateway:
-
-```bash
-curl -X POST http://127.0.0.1:8080/api/admin/registry/gateways/gw-ap-1/review \
-  -H "authorization: Bearer $WATTETHERIA_GATEWAY_REGISTRY_ADMIN_TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{
-    "status": "approved",
-    "discovery_tier": "verified",
-    "reason": "meets uptime and signature requirements",
-    "reviewed_by": "official-registry"
-  }'
-```
-
-Public discovery only returns approved gateways:
-
-```bash
-curl http://127.0.0.1:8080/api/registry/gateways
-```
-
 ## Testing
-
-Run the full test suite:
 
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-The integration tests start the local `postgres` service from `docker-compose.yml` automatically
+Integration tests start the local `postgres` service from `docker-compose.yml`
 and create isolated test databases per test case.
 
 ## Direction
