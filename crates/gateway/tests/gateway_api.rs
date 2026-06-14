@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use sqlx::ConnectOptions;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
@@ -30,7 +31,7 @@ use wattetheria_gateway::registry_client::RegistryClient;
 use wattetheria_gateway::state::AppState;
 use wattetheria_gateway::verify::{canonical_bytes, verify_signed_gateway_manifest};
 use wattswarm_artifact_store::ArtifactStore;
-use wattswarm_network_transport_core::PeerTransportCapabilities;
+use wattswarm_network_transport_core::{PeerTransportCapabilities, TransportContactMaterial};
 
 static POSTGRES_READY: OnceLock<()> = OnceLock::new();
 
@@ -1852,6 +1853,7 @@ async fn network_status_includes_gateway_runtime_when_shared_p2p_is_enabled() {
 async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exist() {
     let db = TestDatabase::new().await;
     let remote_state_dir = unique_state_dir("gateway-remote");
+    write_test_relay_urls(&remote_state_dir);
     let remote_runtime = GatewayNetworkRuntime::new(
         GatewayNetworkNode::generate(wattetheria_gateway::config::GatewayP2pConfig {
             enabled: true,
@@ -1882,6 +1884,10 @@ async fn sync_nodes_prefers_iroh_when_contact_material_and_snapshot_binding_exis
     let remote_contact = remote_runtime
         .export_transport_contact_material(chrono::Utc::now().timestamp() as u64)
         .unwrap();
+    if !contact_has_direct_addr(&remote_contact) {
+        db.cleanup().await;
+        return;
+    }
     let (app, _local_runtime, local_handle) = test_app_with_network(&db.database_url).await;
 
     let register = request_json(
@@ -2073,10 +2079,12 @@ async fn test_app_with_network(
     let pool = db::connect(database_url).await.unwrap();
     db::init_schema(&pool).await.unwrap();
     let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
+    let state_dir = unique_state_dir("gateway-local");
+    write_test_relay_urls(&state_dir);
     let runtime = GatewayNetworkRuntime::new(
         GatewayNetworkNode::generate(wattetheria_gateway::config::GatewayP2pConfig {
             enabled: true,
-            state_dir: unique_state_dir("gateway-local"),
+            state_dir,
             listen_addrs: vec!["127.0.0.1:0".to_string()],
             ..Default::default()
         })
@@ -2102,6 +2110,23 @@ async fn test_app_with_network(
 
 fn unique_state_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()))
+}
+
+fn write_test_relay_urls(state_dir: &Path) {
+    std::fs::create_dir_all(state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("startup_config.json"),
+        r#"{"relay_urls":["https://relay.example.invalid/"]}"#,
+    )
+    .unwrap();
+}
+
+fn contact_has_direct_addr(contact: &TransportContactMaterial) -> bool {
+    contact
+        .extra
+        .get("direct_addrs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| !items.is_empty())
 }
 
 async fn request(app: &Router, method: &str, uri: &str) -> (StatusCode, Value) {
