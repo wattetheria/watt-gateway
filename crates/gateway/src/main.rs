@@ -2,8 +2,8 @@ use anyhow::Context;
 use async_nats::ConnectOptions;
 use tracing::{info, warn};
 use wattetheria_gateway::{
-    config::Config, db, gateway_identity::GatewayIdentity, gateway_network, http, node_client,
-    registry_client, state::AppState,
+    config::Config, db, gateway_identity::GatewayIdentity, gateway_network, gateway_sync, http,
+    node_client, registry_client, state::AppState,
 };
 
 #[tokio::main]
@@ -35,6 +35,12 @@ async fn main() -> anyhow::Result<()> {
         .map(|runtime| runtime.export_handle(chrono::Utc::now().timestamp() as u64))
         .transpose()
         .context("export gateway p2p info")?;
+    let (gateway_sync_tx, gateway_sync_rx) = if gateway_network_runtime.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel(512);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let pool = db::connect(&config.database_url)
         .await
         .context("connect postgres")?;
@@ -66,8 +72,16 @@ async fn main() -> anyhow::Result<()> {
         bootstrap_registry_urls: config.bootstrap_registry_urls,
         gateway_identity,
         gateway_network,
+        gateway_sync_tx,
         ui_stream_tx,
     };
+    if let (Some(runtime), Some(rx)) = (gateway_network_runtime, gateway_sync_rx) {
+        tokio::spawn(gateway_sync::run_gateway_p2p_sync(
+            runtime,
+            app_state.clone(),
+            rx,
+        ));
+    }
     let app = http::router(app_state);
 
     info!("wattetheria-gateway listening on {}", config.bind_addr);

@@ -4,8 +4,9 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_substrate::{
-    NetworkNodeId, NetworkRuntimeObservabilitySnapshot, SubstrateConfig, SubstrateNode,
-    SubstrateRuntime, SwarmScope, TopicNamespace, TrafficGuardPeerHealth,
+    GossipKind, NetworkNodeId, NetworkRuntimeObservabilitySnapshot, RawGossipMessage,
+    SubstrateConfig, SubstrateNode, SubstrateRuntime, SubstrateRuntimeEvent, SwarmScope,
+    TopicNamespace, TrafficGuardPeerHealth,
 };
 use wattswarm_network_transport_core::{
     DirectDataFetchRequest, DirectDataObjectKind, PeerTransportCapabilities, TransferIntent,
@@ -121,6 +122,12 @@ pub struct GatewayNetworkRuntime {
     state_dir: PathBuf,
     lock_path: PathBuf,
     lock_file: File,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayNetworkGossip {
+    pub propagation_source: NetworkNodeId,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +253,31 @@ impl GatewayNetworkRuntime {
             state_dir: self.state_dir.clone(),
             local_peer_id: self.local_peer_id(),
         })
+    }
+
+    pub fn publish_sync_summary(&mut self, payload: &[u8]) -> Result<()> {
+        self.inner
+            .publish(&SwarmScope::Global, GossipKind::Summaries, payload)
+    }
+
+    pub async fn next_sync_summary(&mut self) -> Result<GatewayNetworkGossip> {
+        loop {
+            if let SubstrateRuntimeEvent::Gossip {
+                propagation_source,
+                message:
+                    RawGossipMessage {
+                        scope: SwarmScope::Global,
+                        kind: GossipKind::Summaries,
+                        payload,
+                    },
+            } = self.inner.next_event().await?
+            {
+                return Ok(GatewayNetworkGossip {
+                    propagation_source,
+                    payload,
+                });
+            }
+        }
     }
 }
 

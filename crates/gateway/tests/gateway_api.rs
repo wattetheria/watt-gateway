@@ -22,6 +22,7 @@ use wattetheria_gateway::gateway_identity::{GatewayIdentity, GatewayIdentityConf
 use wattetheria_gateway::gateway_network::{
     self, GatewayNetworkHandle, GatewayNetworkNode, GatewayNetworkRuntime,
 };
+use wattetheria_gateway::gateway_sync::GatewayP2pSyncCommand;
 use wattetheria_gateway::http;
 use wattetheria_gateway::models::{
     GatewayManifest, PublicClientSnapshot, SignedGatewayManifest, SignedPublicClientSnapshot,
@@ -509,6 +510,125 @@ async fn ingest_snapshot_accepts_push_without_registered_source() {
 }
 
 #[tokio::test]
+async fn ingest_snapshot_announces_applied_snapshot_to_p2p_sync() {
+    let db = TestDatabase::new().await;
+    let pool = db::connect(&db.database_url).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
+    let (gateway_sync_tx, mut gateway_sync_rx) = tokio::sync::mpsc::channel(8);
+    let app = http::router(AppState {
+        pool,
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: Some(gateway_sync_tx),
+        ui_stream_tx,
+    });
+    let snapshot = signed_snapshot(
+        "node-p2p-announce",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[json!({"id":"task-p2p-announce"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&snapshot).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let command = tokio::time::timeout(std::time::Duration::from_secs(1), gateway_sync_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match command {
+        GatewayP2pSyncCommand::SnapshotApplied {
+            node_id,
+            signer_agent_did,
+            generated_at,
+        } => {
+            assert_eq!(node_id, "node-p2p-announce");
+            assert_eq!(signer_agent_did, snapshot.signer_agent_did);
+            assert_eq!(generated_at, snapshot.payload.generated_at);
+        }
+        GatewayP2pSyncCommand::EventApplied { .. } => {
+            panic!("expected snapshot p2p sync command")
+        }
+    }
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn ingest_node_event_announces_applied_event_to_p2p_sync() {
+    let db = TestDatabase::new().await;
+    let pool = db::connect(&db.database_url).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    let (ui_stream_tx, _) = tokio::sync::broadcast::channel(64);
+    let (gateway_sync_tx, mut gateway_sync_rx) = tokio::sync::mpsc::channel(8);
+    let app = http::router(AppState {
+        pool,
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: Some(gateway_sync_tx),
+        ui_stream_tx,
+    });
+    let event = signed_node_event(
+        "node-p2p-event",
+        DataKind::MissionLifecycle,
+        "mission.published",
+        json!({"id":"task-p2p-event","status":"published"}),
+    );
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let command = tokio::time::timeout(std::time::Duration::from_secs(1), gateway_sync_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match command {
+        GatewayP2pSyncCommand::EventApplied { event: announced } => {
+            assert_eq!(announced.payload.event_id, event.payload.event_id);
+            assert_eq!(announced.payload.node_id, "node-p2p-event");
+            assert_eq!(announced.signature, event.signature);
+        }
+        GatewayP2pSyncCommand::SnapshotApplied { .. } => {
+            panic!("expected event p2p sync command")
+        }
+    }
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn public_hives_and_messages_are_deduped_sorted_and_filterable() {
     let db = TestDatabase::new().await;
     let app = test_app(&db.database_url).await;
@@ -843,6 +963,7 @@ async fn ephemeral_only_events_are_streamed_without_persisting_ui_rows() {
         bootstrap_registry_urls: Vec::new(),
         gateway_identity: None,
         gateway_network: None,
+        gateway_sync_tx: None,
         ui_stream_tx,
     };
 
@@ -1959,6 +2080,7 @@ async fn test_app(database_url: &str) -> Router {
         bootstrap_registry_urls: Vec::new(),
         gateway_identity: None,
         gateway_network: None,
+        gateway_sync_tx: None,
         ui_stream_tx,
     })
 }
@@ -1997,6 +2119,7 @@ async fn test_app_with_identity(database_url: &str) -> Router {
         bootstrap_registry_urls: Vec::new(),
         gateway_identity,
         gateway_network: None,
+        gateway_sync_tx: None,
         ui_stream_tx,
     })
 }
@@ -2018,6 +2141,7 @@ async fn test_app_with_identity_and_federation_peers(
         bootstrap_registry_urls: Vec::new(),
         gateway_identity,
         gateway_network: None,
+        gateway_sync_tx: None,
         ui_stream_tx,
     })
 }
@@ -2069,6 +2193,7 @@ async fn test_app_with_identity_and_bootstrap(
         bootstrap_registry_urls,
         gateway_identity,
         gateway_network: None,
+        gateway_sync_tx: None,
         ui_stream_tx,
     })
 }
@@ -2103,6 +2228,7 @@ async fn test_app_with_network(
         bootstrap_registry_urls: Vec::new(),
         gateway_identity: None,
         gateway_network: Some(gateway_network.clone()),
+        gateway_sync_tx: None,
         ui_stream_tx,
     });
     (app, runtime, gateway_network)

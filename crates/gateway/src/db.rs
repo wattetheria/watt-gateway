@@ -742,6 +742,27 @@ pub async fn list_snapshots(pool: &PgPool) -> Result<Vec<SnapshotRow>> {
     .await?)
 }
 
+pub async fn get_snapshot_by_node_id(pool: &PgPool, node_id: &str) -> Result<Option<SnapshotRow>> {
+    Ok(sqlx::query_as::<_, SnapshotRow>(
+        r#"
+        select
+            source_id,
+            node_id,
+            signer_agent_did,
+            public_key,
+            generated_at,
+            ingested_at,
+            payload,
+            signature
+        from node_snapshots
+        where node_id = $1
+        "#,
+    )
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 pub async fn list_visible_snapshots(pool: &PgPool) -> Result<Vec<SnapshotRow>> {
     Ok(sqlx::query_as::<_, SnapshotRow>(
         r#"

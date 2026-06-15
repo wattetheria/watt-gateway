@@ -72,6 +72,33 @@ pub async fn persist_signed_node_event(
     source_id: Option<Uuid>,
     expected_signer_agent_did: Option<&str>,
 ) -> Result<Option<i64>> {
+    persist_signed_node_event_with_options(state, event, source_id, expected_signer_agent_did, true)
+        .await
+}
+
+pub(crate) async fn persist_signed_node_event_without_p2p_announce(
+    state: &AppState,
+    event: &SignedNodeEvent,
+    source_id: Option<Uuid>,
+    expected_signer_agent_did: Option<&str>,
+) -> Result<Option<i64>> {
+    persist_signed_node_event_with_options(
+        state,
+        event,
+        source_id,
+        expected_signer_agent_did,
+        false,
+    )
+    .await
+}
+
+async fn persist_signed_node_event_with_options(
+    state: &AppState,
+    event: &SignedNodeEvent,
+    source_id: Option<Uuid>,
+    expected_signer_agent_did: Option<&str>,
+    announce_p2p: bool,
+) -> Result<Option<i64>> {
     let resolved_source = if source_id.is_none() && expected_signer_agent_did.is_none() {
         db::find_node_source_for_identity(
             &state.pool,
@@ -179,6 +206,13 @@ pub async fn persist_signed_node_event(
     let _ = state
         .publish_event("gateway.event.ingested", &bus_event)
         .await;
+    if announce_p2p && let Some(tx) = &state.gateway_sync_tx {
+        let _ = tx
+            .send(crate::gateway_sync::GatewayP2pSyncCommand::EventApplied {
+                event: Box::new(event.clone()),
+            })
+            .await;
+    }
     Ok(Some(row.cursor))
 }
 

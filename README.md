@@ -113,6 +113,23 @@ Common environment variables:
 - `WATTETHERIA_GATEWAY_IDENTITY_FEDERATION_PEERS` legacy alias for trusted peers
 - `WATTETHERIA_GATEWAY_IDENTITY_ALLOWS_PUBLIC_INGEST`
 
+## Gateway P2P Synchronization
+
+When `WATTETHERIA_GATEWAY_P2P_ENABLED` is enabled, the gateway starts a shared
+P2P runtime and joins the global summary gossip scope. Successful signed
+snapshot ingests are announced over gossip with the gateway's Iroh contact
+material. Peer gateways that receive an announcement compare the advertised
+snapshot version with their local store, fetch missing or newer signed snapshots
+over Iroh direct transport, then run the normal signature verification and
+read-model ingest path. Successful signed node events are propagated as signed
+gossip payloads and are also re-ingested through the normal event verification
+and projection path.
+
+Gossip carries only small synchronization announcements and signed event
+payloads. Snapshot payloads and artifacts are fetched over direct transport so
+large public data is not broadcast through the gossip mesh. HTTP federation
+remains available for query-time aggregation and registry discovery.
+
 `WATTETHERIA_GATEWAY_BOOTSTRAP_REGISTRY_URLS` accepts gateway base URLs, registry
 list URLs, or registry registration URLs; the gateway normalizes them for list
 and register operations.

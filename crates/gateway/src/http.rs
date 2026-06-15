@@ -904,6 +904,33 @@ pub(crate) async fn ingest_signed_snapshot(
     source_id: Option<Uuid>,
     expected_signer_agent_did: Option<&str>,
 ) -> anyhow::Result<bool> {
+    ingest_signed_snapshot_with_options(state, snapshot, source_id, expected_signer_agent_did, true)
+        .await
+}
+
+pub(crate) async fn ingest_signed_snapshot_without_p2p_announce(
+    state: &AppState,
+    snapshot: &SignedPublicClientSnapshot,
+    source_id: Option<Uuid>,
+    expected_signer_agent_did: Option<&str>,
+) -> anyhow::Result<bool> {
+    ingest_signed_snapshot_with_options(
+        state,
+        snapshot,
+        source_id,
+        expected_signer_agent_did,
+        false,
+    )
+    .await
+}
+
+async fn ingest_signed_snapshot_with_options(
+    state: &AppState,
+    snapshot: &SignedPublicClientSnapshot,
+    source_id: Option<Uuid>,
+    expected_signer_agent_did: Option<&str>,
+    announce_p2p: bool,
+) -> anyhow::Result<bool> {
     verify_signed_snapshot(snapshot, expected_signer_agent_did)?;
     let payload_json = serde_json::to_value(&snapshot.payload)?;
     if let Some(handle) = &state.gateway_network {
@@ -935,6 +962,17 @@ pub(crate) async fn ingest_signed_snapshot(
         let _ = state
             .publish_event("gateway.snapshot.ingested", &event)
             .await;
+        if announce_p2p && let Some(tx) = &state.gateway_sync_tx {
+            let _ = tx
+                .send(
+                    crate::gateway_sync::GatewayP2pSyncCommand::SnapshotApplied {
+                        node_id: snapshot.payload.node_id.clone(),
+                        signer_agent_did: snapshot.signer_agent_did.clone(),
+                        generated_at: snapshot.payload.generated_at,
+                    },
+                )
+                .await;
+        }
     }
     Ok(applied)
 }
