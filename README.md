@@ -50,7 +50,7 @@ Pull sync is trigger-based. Operators, schedulers, or external automation call
 flowchart LR
     subgraph WS["Wattswarm node"]
         WS_P2P["P2P transport, gossip, tasks"]
-        WS_HTTP["HTTP read models\n/api/wattetheria/network/snapshot\n/api/wattetheria/topic/activity"]
+        WS_HTTP["HTTP read models\n/api/wattetheria/network/snapshot\n/api/wattetheria/topic/activity\n/api/wattetheria/topic/subscriptions"]
         WS_GRPC["gRPC projection streams\nnetwork/task/topic/social"]
         WS_P2P --> WS_HTTP
         WS_P2P --> WS_GRPC
@@ -148,6 +148,8 @@ Public UI query endpoints aggregate trusted peers directly and add
 Public chat support is intentionally limited in this phase:
 
 - supported: public topics and public topic messages in signed snapshots
+- supported: Hive `member_count` from active Wattswarm topic subscription
+  projections when a source exposes `wattswarm_ui_base_url`
 - not supported: private groups, encrypted rooms, or sensitive coordination channels
 
 Default Postgres DSN:

@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use wattswarm_network_transport_core::{PeerTransportCapabilities, TransferIntent, TransferKind};
 
@@ -457,6 +458,16 @@ fn gateway_runtime_status(runtime: &GatewayNetworkHandle) -> Value {
 async fn aggregate_public_hives_endpoint(state: &AppState, query: TopicQuery) -> Response {
     match projection_values(state, DataKind::HiveMetadata).await {
         Ok(mut values) => {
+            let member_counts = match projection_values(state, DataKind::HiveSubscription).await {
+                Ok(subscriptions) => hive_member_counts(subscriptions),
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": error.to_string()})),
+                    )
+                        .into_response();
+                }
+            };
             if federation_enabled(query.federation.as_deref()) {
                 let mut params = vec![("limit", query.limit.unwrap_or(200).to_string())];
                 if let Some(value) = query.network_id.as_deref() {
@@ -477,7 +488,11 @@ async fn aggregate_public_hives_endpoint(state: &AppState, query: TopicQuery) ->
             sort_values_desc_by_timestamp(&mut values);
             dedupe_values_by_key(&mut values, topic_identity_key);
             values.truncate(query.limit.unwrap_or(200));
-            values = values.into_iter().map(normalize_hive_value).collect();
+            values = values
+                .into_iter()
+                .map(normalize_hive_value)
+                .map(|value| attach_hive_member_count(value, &member_counts))
+                .collect();
             axum::Json(values).into_response()
         }
         Err(error) => (
@@ -756,6 +771,83 @@ async fn projection_values(state: &AppState, data_kind: DataKind) -> anyhow::Res
         .into_iter()
         .map(|row| attach_source(row.payload.0, row.source_node_id))
         .collect())
+}
+
+fn hive_member_counts(subscription_values: Vec<Value>) -> BTreeMap<String, usize> {
+    let mut latest_by_subscriber = BTreeMap::<String, (String, bool, u64)>::new();
+    for value in subscription_values {
+        let Some(route_key) = hive_route_key(&value) else {
+            continue;
+        };
+        let Some(subscriber_node_id) = string_field(&value, "subscriber_node_id") else {
+            continue;
+        };
+        let subscription_key = format!("{route_key}\u{1f}{subscriber_node_id}");
+        let active = value
+            .get("active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let updated_at = numeric_timestamp(&value, &["updated_at", "snapshot_generated_at"]);
+        let should_replace = latest_by_subscriber
+            .get(&subscription_key)
+            .is_none_or(|(_, _, existing_updated_at)| updated_at >= *existing_updated_at);
+        if should_replace {
+            latest_by_subscriber.insert(subscription_key, (route_key, active, updated_at));
+        }
+    }
+
+    let mut counts = BTreeMap::<String, usize>::new();
+    for (_, (route_key, active, _)) in latest_by_subscriber {
+        if active {
+            *counts.entry(route_key).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn attach_hive_member_count(mut value: Value, member_counts: &BTreeMap<String, usize>) -> Value {
+    let count = hive_route_key(&value).and_then(|route_key| member_counts.get(&route_key).copied());
+    if let Some(object) = value.as_object_mut() {
+        if let Some(count) = count {
+            object.insert(
+                "member_count".to_string(),
+                Value::Number((count as u64).into()),
+            );
+        } else {
+            object
+                .entry("member_count".to_string())
+                .or_insert_with(|| Value::Number(0_u64.into()));
+        }
+    }
+    value
+}
+
+fn hive_route_key(value: &Value) -> Option<String> {
+    let feed_key = string_field(value, "feed_key")?;
+    let scope_hint = string_field(value, "scope_hint")?;
+    let network_id = string_field(value, "network_id").unwrap_or_default();
+    Some(format!("{network_id}\u{1f}{feed_key}\u{1f}{scope_hint}"))
+}
+
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn numeric_timestamp(value: &Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| {
+            value.get(*key).and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_i64().map(|raw| raw.max(0) as u64))
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn attach_source(mut value: Value, source_node_id: String) -> Value {

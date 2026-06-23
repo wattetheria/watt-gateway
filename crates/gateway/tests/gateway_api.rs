@@ -748,6 +748,101 @@ async fn public_hives_and_messages_are_deduped_sorted_and_filterable() {
 }
 
 #[tokio::test]
+async fn public_hives_member_count_uses_latest_subscription_projection_state() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let app = test_app(&db.database_url).await;
+    let provenance = json!({"ingest_path": "test"});
+    let hive = json!({
+        "topic_id": "topic-members",
+        "hive_id": "topic-members",
+        "network_id": "mainnet:test",
+        "feed_key": "crew.chat",
+        "scope_hint": "group:crew-7",
+        "display_name": "Crew Hive",
+        "last_message_at": "2026-03-18T02:00:00Z"
+    });
+    db::upsert_projection_row(
+        &pool,
+        UpsertProjectionRecord {
+            data_kind: "hive_metadata",
+            identity_key: "topic-members",
+            source_node_id: "node-owner",
+            source_id: None,
+            generated_at: 100,
+            visibility: "public",
+            payload: &hive,
+            provenance: &provenance,
+        },
+    )
+    .await
+    .unwrap();
+
+    for subscriber in ["node-alpha", "node-beta"] {
+        let subscription = json!({
+            "subscription_id": format!("mainnet:test\u{1f}crew.chat\u{1f}group:crew-7\u{1f}{subscriber}"),
+            "network_id": "mainnet:test",
+            "feed_key": "crew.chat",
+            "scope_hint": "group:crew-7",
+            "subscriber_node_id": subscriber,
+            "active": true,
+            "updated_at": 110
+        });
+        db::upsert_projection_row(
+            &pool,
+            UpsertProjectionRecord {
+                data_kind: "hive_subscription",
+                identity_key: subscription["subscription_id"].as_str().unwrap(),
+                source_node_id: subscriber,
+                source_id: None,
+                generated_at: 110,
+                visibility: "public",
+                payload: &subscription,
+                provenance: &provenance,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let hives = request(&app, "GET", "/api/hives?limit=10").await;
+    assert_eq!(hives.0, StatusCode::OK);
+    assert_eq!(hives.1[0]["member_count"].as_u64(), Some(2));
+
+    let inactive = json!({
+        "subscription_id": "mainnet:test\u{1f}crew.chat\u{1f}group:crew-7\u{1f}node-beta",
+        "network_id": "mainnet:test",
+        "feed_key": "crew.chat",
+        "scope_hint": "group:crew-7",
+        "subscriber_node_id": "node-beta",
+        "active": false,
+        "updated_at": 120
+    });
+    db::upsert_projection_row(
+        &pool,
+        UpsertProjectionRecord {
+            data_kind: "hive_subscription",
+            identity_key: inactive["subscription_id"].as_str().unwrap(),
+            source_node_id: "node-beta",
+            source_id: None,
+            generated_at: 120,
+            visibility: "public",
+            payload: &inactive,
+            provenance: &provenance,
+        },
+    )
+    .await
+    .unwrap();
+
+    let hives = request(&app, "GET", "/api/hives?limit=10").await;
+    assert_eq!(hives.0, StatusCode::OK);
+    assert_eq!(hives.1[0]["member_count"].as_u64(), Some(1));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn older_snapshot_does_not_replace_newer_snapshot() {
     let db = TestDatabase::new().await;
     let app = test_app(&db.database_url).await;

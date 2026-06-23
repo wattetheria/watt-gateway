@@ -45,6 +45,23 @@ pub struct WattswarmTopicActivitySnapshot {
     pub cursor: Option<Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WattswarmTopicSubscriptionRow {
+    pub network_id: String,
+    pub subscriber_node_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub active: bool,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WattswarmTopicSubscriptionSnapshot {
+    pub generated_at: u64,
+    pub network_id: String,
+    pub subscriptions: Vec<WattswarmTopicSubscriptionRow>,
+}
+
 pub async fn collect_wattswarm_read_models(state: &AppState, source: &NodeSourceRow) -> Result<()> {
     let Some(base_url) = source
         .wattswarm_ui_base_url
@@ -64,6 +81,11 @@ pub async fn collect_wattswarm_read_models(state: &AppState, source: &NodeSource
         .await?;
     persist_network_projection(state, source, &network).await?;
 
+    if let Err(error) =
+        collect_topic_subscription_read_models(state, source, base_url, &network.network_id).await
+    {
+        eprintln!("wattswarm topic subscription projection collection skipped: {error:#}");
+    }
     collect_topic_activity_read_models(state, source, base_url).await?;
     Ok(())
 }
@@ -163,6 +185,61 @@ async fn collect_topic_activity_read_models(
         }
     }
     Ok(())
+}
+
+async fn collect_topic_subscription_read_models(
+    state: &AppState,
+    source: &NodeSourceRow,
+    base_url: &str,
+    network_id: &str,
+) -> Result<()> {
+    let query = [("network_id", network_id.to_string())];
+    let snapshot: WattswarmTopicSubscriptionSnapshot = state
+        .node_client
+        .fetch_json(
+            &format!("{base_url}/api/wattetheria/topic/subscriptions"),
+            Some(&query),
+        )
+        .await?;
+    for subscription in snapshot.subscriptions {
+        let subscription_id = topic_subscription_identity(&subscription);
+        let payload = json!({
+            "subscription_id": subscription_id,
+            "network_id": subscription.network_id,
+            "subscriber_node_id": subscription.subscriber_node_id,
+            "feed_key": subscription.feed_key,
+            "scope_hint": subscription.scope_hint,
+            "active": subscription.active,
+            "updated_at": subscription.updated_at,
+            "snapshot_generated_at": snapshot.generated_at,
+        });
+        let source_node_id = payload["subscriber_node_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&source.name)
+            .to_owned();
+        persist_projection(
+            state,
+            DataKind::HiveSubscription,
+            projection_identity_key(DataKind::HiveSubscription, &payload, &source_node_id),
+            &source_node_id,
+            source.id,
+            i64::try_from(subscription.updated_at).unwrap_or(i64::MAX),
+            payload,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn topic_subscription_identity(subscription: &WattswarmTopicSubscriptionRow) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        subscription.network_id,
+        subscription.feed_key,
+        subscription.scope_hint,
+        subscription.subscriber_node_id
+    )
 }
 
 async fn persist_projection(
