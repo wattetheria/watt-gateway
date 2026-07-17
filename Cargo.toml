@@ -31,7 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }
-watt-did = { git = "https://github.com/wattetheria/watt-did.git", branch = "main" }
+watt-did = { path = "../watt-did" }
 wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }
 wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }
 wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }
