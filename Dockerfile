@@ -13,6 +13,7 @@ COPY crates/gateway-p2p/Cargo.toml crates/gateway-p2p/Cargo.toml
 # Replace local path dependencies with repository sources so Docker builds do
 # not depend on sibling directories from the host machine.
 RUN sed -i \
+    -e '/"crates\/message-gateway",/d' \
     -e 's|wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }|wattetheria-gateway-contract = { git = "https://github.com/wattetheria/wattetheria.git", package = "wattetheria-gateway-contract" }|' \
     -e 's|watt-did = { path = "../watt-did" }|watt-did = { git = "https://github.com/wattetheria/watt-did.git" }|' \
     -e 's|wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }|wattswarm-artifact-store = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-artifact-store" }|' \
@@ -47,6 +48,7 @@ COPY --from=cacher /app/target /app/target
 # COPY . . restores local path dependencies, so apply the Docker-only git
 # dependency rewrite again before the final build.
 RUN sed -i \
+    -e '/"crates\/message-gateway",/d' \
     -e 's|wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }|wattetheria-gateway-contract = { git = "https://github.com/wattetheria/wattetheria.git", package = "wattetheria-gateway-contract" }|' \
     -e 's|watt-did = { path = "../watt-did" }|watt-did = { git = "https://github.com/wattetheria/watt-did.git" }|' \
     -e 's|wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }|wattswarm-artifact-store = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-artifact-store" }|' \

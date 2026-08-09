@@ -1,0 +1,120 @@
+services:
+  postgres:
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?set POSTGRES_USER} -d ${POSTGRES_DB:?set POSTGRES_DB}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  message-gateway-db-init:
+    image: postgres:16
+    restart: "no"
+    environment:
+      PGPASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
+      PGUSER: "${POSTGRES_USER:?set POSTGRES_USER}"
+      WATTSWARM_CS_POSTGRES_DB: "${WATTSWARM_CS_POSTGRES_DB:?set WATTSWARM_CS_POSTGRES_DB}"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        database_exists="$$(psql -h postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$$WATTSWARM_CS_POSTGRES_DB'")"
+        if [ "$$database_exists" != "1" ]; then
+          psql -h postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE \"$$WATTSWARM_CS_POSTGRES_DB\""
+        fi
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  rabbitmq-tls-init:
+    image: alpine:3.22
+    restart: "no"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        apk add --no-cache openssl
+        if [ ! -s /certs/ca.crt ] || [ ! -s /certs/server.crt ] || [ ! -s /certs/server.key ]; then
+          rm -f /certs/*
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -subj "/CN=Wattswarm Local RabbitMQ CA" \
+            -keyout /certs/ca.key -out /certs/ca.crt
+          openssl req -newkey rsa:2048 -nodes -subj "/CN=rabbitmq" \
+            -keyout /certs/server.key -out /certs/server.csr
+          printf 'subjectAltName=DNS:rabbitmq,DNS:localhost,IP:127.0.0.1\n' > /certs/server.ext
+          openssl x509 -req -days 365 -in /certs/server.csr \
+            -CA /certs/ca.crt -CAkey /certs/ca.key -CAcreateserial \
+            -extfile /certs/server.ext -out /certs/server.crt
+        fi
+        chmod 600 /certs/ca.key
+        chmod 644 /certs/ca.crt /certs/server.crt /certs/server.key
+    volumes:
+      - rabbitmq-tls:/certs
+
+  rabbitmq:
+    image: rabbitmq:4.1-management
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: "${WATTSWARM_RABBITMQ_USERNAME:?set WATTSWARM_RABBITMQ_USERNAME}"
+      RABBITMQ_DEFAULT_PASS: ${WATTSWARM_RABBITMQ_PASSWORD:?set WATTSWARM_RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: "${WATTSWARM_RABBITMQ_VHOST:?set WATTSWARM_RABBITMQ_VHOST}"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - rabbitmq-tls:/certs:ro
+      - ./deploy/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    depends_on:
+      rabbitmq-tls-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    ports:
+      - "${WATTSWARM_RABBITMQ_MANAGEMENT_PORT:?set WATTSWARM_RABBITMQ_MANAGEMENT_PORT}:15672"
+
+  message-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.message-gateway
+      additional_contexts:
+        wattswarm: ../wattswarm
+    restart: unless-stopped
+    environment:
+      WATTSWARM_CS_BIND_ADDR: "${WATTSWARM_CS_BIND_ADDR:?set WATTSWARM_CS_BIND_ADDR}"
+      WATTSWARM_CS_DATABASE_URL: "${WATTSWARM_CS_DATABASE_URL:?set WATTSWARM_CS_DATABASE_URL}"
+      WATTSWARM_CS_MESSAGE_BUS: "${WATTSWARM_CS_MESSAGE_BUS:?set WATTSWARM_CS_MESSAGE_BUS}"
+      WATTSWARM_CS_COMMIT_HMAC_SECRET_FILE: /run/secrets/cs_commit_hmac_secret
+      WATTSWARM_RABBITMQ_ENDPOINT: "${WATTSWARM_RABBITMQ_ENDPOINT:?set WATTSWARM_RABBITMQ_ENDPOINT}"
+      WATTSWARM_RABBITMQ_USERNAME: "${WATTSWARM_RABBITMQ_USERNAME:?set WATTSWARM_RABBITMQ_USERNAME}"
+      WATTSWARM_RABBITMQ_PASSWORD_FILE: /run/secrets/rabbitmq_password
+      WATTSWARM_RABBITMQ_CLUSTER_QUEUE_LIMIT: "${WATTSWARM_RABBITMQ_CLUSTER_QUEUE_LIMIT:?set WATTSWARM_RABBITMQ_CLUSTER_QUEUE_LIMIT}"
+      RUST_LOG: "${WATTSWARM_CS_RUST_LOG:?set WATTSWARM_CS_RUST_LOG}"
+    secrets:
+      - rabbitmq_password
+      - cs_commit_hmac_secret
+    volumes:
+      - rabbitmq-tls:/run/rabbitmq-tls:ro
+    depends_on:
+      message-gateway-db-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8090/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "${WATTSWARM_CS_HTTP_PORT:?set WATTSWARM_CS_HTTP_PORT}:8090"
+
+volumes:
+  rabbitmq-data:
+  rabbitmq-tls:
+
+secrets:
+  rabbitmq_password:
+    environment: WATTSWARM_RABBITMQ_PASSWORD
+  cs_commit_hmac_secret:
+    environment: WATTSWARM_CS_COMMIT_HMAC_SECRET

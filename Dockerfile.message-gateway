@@ -1,0 +1,28 @@
+FROM rust:1.93-bookworm AS builder
+WORKDIR /workspace
+
+COPY --from=wattswarm . /workspace/wattswarm
+COPY . /workspace/watt-gateway
+
+WORKDIR /workspace/watt-gateway
+RUN sed -i \
+    -e '/"crates\/gateway",/d' \
+    -e '/"crates\/gateway-p2p",/d' \
+    -e '/^default-members = /d' \
+    Cargo.toml
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/workspace/watt-gateway/target \
+    cargo build --release -p wattetheria-message-gateway \
+    && cp target/release/wattetheria-message-gateway /tmp/wattetheria-message-gateway
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /tmp/wattetheria-message-gateway /usr/local/bin/wattetheria-message-gateway
+
+EXPOSE 8090
+CMD ["wattetheria-message-gateway"]

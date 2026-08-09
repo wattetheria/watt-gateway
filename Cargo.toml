@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/gateway",
   "crates/gateway-p2p",
+  "crates/message-gateway",
 ]
 default-members = ["crates/gateway"]
 
@@ -14,25 +15,36 @@ license = "AGPL-3.0-only"
 anyhow = "1"
 async-nats = "0.39"
 axum = { version = "0.8", features = ["json", "ws"] }
+axum-server = { version = "0.7.2", features = ["tls-rustls-no-provider"] }
 base64 = "0.22"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = "2"
 hex = "0.4"
+hmac = "0.12"
+futures-util = "0.3"
+lapin = "2.5"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_jcs = "0.2"
+sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "uuid"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"
 wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }
 watt-did = { path = "../watt-did" }
 wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }
+wattswarm-crypto = { path = "../wattswarm/crates/crypto" }
+wattswarm-network-client-server = { path = "../wattswarm/crates/network-client-server" }
 wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }
 wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }
 wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }
+wattswarm-protocol = { path = "../wattswarm/crates/protocol" }

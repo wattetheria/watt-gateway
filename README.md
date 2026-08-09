@@ -1,14 +1,23 @@
 # wattetheria-gateway
 
-Self-hostable public gateway and indexer for Wattetheria.
+Self-hostable gateway services for Wattetheria and Wattswarm.
 
-`wattetheria-gateway` is a non-authoritative query layer. It verifies signed
-public snapshots and events from `wattetheria` nodes, stores client-facing read
-models in Postgres, and exposes aggregated APIs for `wattetheria-client` and
-other gateways.
+This workspace contains two independently deployable services:
 
-The gateway also includes a registry slice for signed gateway manifests,
-bootstrap registry lists, self-registration, and reviewed public discovery.
+- `wattetheria-gateway` is a non-authoritative public query and indexing layer.
+  It verifies signed public snapshots and events from `wattetheria` nodes,
+  stores client-facing read models in PostgreSQL, and exposes aggregated APIs
+  for `wattetheria-client` and other gateways. It also includes a registry
+  slice for signed gateway manifests, bootstrap registry lists,
+  self-registration, and reviewed public discovery.
+- `wattetheria-message-gateway` is the private ClientServer transport boundary
+  for Wattswarm nodes. It authenticates node identities, validates signed
+  records and scope routes, publishes messages to bounded RabbitMQ mailboxes,
+  and manages delivery and commit state.
+
+The services have separate binaries, runtime configuration, and deployment
+boundaries. Neither service creates, re-signs, or becomes authoritative over
+Wattetheria or Wattswarm business facts.
 
 ## Workspace Layout
 
@@ -16,14 +25,99 @@ The repository is a Cargo workspace:
 
 - `crates/gateway`: HTTP API, DB, registry, read models, and runtime entrypoint
 - `crates/gateway-p2p`: shared Iroh P2P adapter used by the gateway runtime
+- `crates/message-gateway`: independent private Wattswarm ClientServer mailbox
+  service with its own binary, PostgreSQL control schema, and RabbitMQ access
 
 ## Stack
 
 - Rust
 - NATS
 - Postgres
+- RabbitMQ (ClientServer mode only)
 
 ClickHouse and Typesense are intentionally deferred roadmap items.
+
+## Wattswarm Message Gateway
+
+`wattetheria-message-gateway` is operationally separate from the public
+Wattetheria indexer. It authenticates one logical Wattswarm principal per V1
+session, validates existing signed records and scope routes, and expands direct
+or versioned scope delivery into two quorum mailboxes per Tenant: Interactive
+and Bulk. It does not create Authority facts, re-sign records, store permanent
+message history, or expose RabbitMQ to nodes.
+
+The service requires PostgreSQL and AMQPS. Its configuration uses
+`WATTSWARM_CS_*` and `WATTSWARM_RABBITMQ_*` variables; startup validates queue
+cardinality, active-Tenant/fanout capacity, Global delivery-rate admission,
+TLS, commit HMAC, membership mutation, object size, and horizontal
+owner-forwarding settings. The optional Object Store is read-only and
+content-addressed. Objects are isolated below a SHA-256 network directory, so
+the same content digest in two networks never resolves through a shared path.
+
+Operators can read a network-scoped snapshot from
+`GET /internal/v1/observability?network_id=<network-id>` on the internal mTLS
+listener. It reports active sessions, admission and backpressure, mailbox and
+dead-letter depth, delivery and confirm latency, membership binding drift,
+commit ownership, gaps, and receipt state. The endpoint is not mounted on the
+public listener and never returns session proofs, tokens, passwords, commit
+tokens, or message payloads.
+
+Trusted network authorities are supplied as a JSON object mapping `network_id`
+to genesis node id through `WATTSWARM_CS_TRUSTED_NETWORK_GENESIS_FILE`. Startup
+seeds that mapping into the membership projection and rejects any active Tenant
+whose current membership cannot be validated. Membership changes must be signed
+by the current Finalizer quorum; the trusted genesis identity is only the
+bootstrap authority for the first membership event.
+
+Public APIs listen on `WATTSWARM_CS_BIND_ADDR`. Cross-instance delivery commits
+use the separate `WATTSWARM_CS_INTERNAL_BIND_ADDR` listener and require all of
+`WATTSWARM_CS_INTERNAL_ROUTE`, `WATTSWARM_CS_INTERNAL_MTLS_IDENTITY_FILE`, and
+`WATTSWARM_CS_INTERNAL_MTLS_CA_FILE`; partial internal-listener configuration is
+rejected. The internal commit endpoint is not mounted on the public router.
+
+Dead letters have their own byte bound,
+`WATTSWARM_RABBITMQ_DEAD_LETTER_MAX_LENGTH_BYTES`, and use quorum-queue
+at-least-once dead-lettering. Expired challenges, sessions, receipts, owner
+leases, and retained acknowledged gaps are cleaned at
+`WATTSWARM_CS_METADATA_CLEANUP_INTERVAL`; acknowledged gap retention is set by
+`WATTSWARM_CS_ACKNOWLEDGED_GAP_RETENTION`.
+
+Mailbox pages use manual ACK and stable delivery identities. The owning Gateway
+instance retains the original AMQP channel; a commit received by another
+instance is forwarded over the configured HTTPS/mTLS internal route. If the
+owner lease disappears, the channel closes and RabbitMQ requeues the page. TTL,
+capacity, and delivery-limit dead letters are compressed into payload-free,
+network- and class-bound `MailboxGap` records. Direct and versioned-scope
+routing keys also include the network identity, preventing cross-network queue
+delivery even when principals or scope addresses match.
+
+Session proofs bind an optional signed Tenant state-instance id. A changed id
+durably returns `history_unavailable`, because the Gateway cannot restore
+already ACKed local history. Group and Region authors must be active members of
+that exact scope; a globally admitted principal receives a narrow exception
+only for its signed self-join event. PostgreSQL also holds the shared Global and
+non-Global cell token buckets, coalesces identical membership retries, and
+records payload-free accepted-session and confirmed-publish audit metadata.
+
+Run the real TLS RabbitMQ/PostgreSQL contracts with:
+
+```bash
+./scripts/run-message-gateway-contract.sh
+```
+
+The script uses host-published ports when available and automatically runs the
+Rust contract runner inside the Compose network when Docker Desktop port
+forwarding is unavailable.
+
+Run the independent three-node quorum leader-failure contract with:
+
+```bash
+./scripts/run-message-gateway-quorum-failure-contract.sh
+```
+
+It forms a three-node RabbitMQ cluster, publishes a persistent quorum message,
+stops the queue leader, verifies delivery from a surviving node, and removes
+the isolated contract cluster on exit.
 
 ## Data Flow: Wattswarm, Wattetheria, Gateway
 
@@ -158,18 +252,38 @@ Default Postgres DSN:
 postgres://postgres:postgres@127.0.0.1:5432/wattetheria_gateway
 ```
 
-`docker-compose.yml` publishes Postgres on `127.0.0.1:55433`:
+`docker-compose.yml` publishes Postgres on `127.0.0.1:55434`:
 
 ```text
-postgres://postgres:postgres@127.0.0.1:55433/wattetheria_gateway
+postgres://postgres:postgres@127.0.0.1:55434/wattetheria_gateway
 ```
 
 ## Local Development
+
+The default Compose file runs the P2P gateway stack only:
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
+
+ClientServer mode uses a separate overlay that adds the Message Gateway and
+RabbitMQ while retaining the public Gateway, PostgreSQL, and NATS services:
+
+```bash
+cp .env.example .env
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.client-server.yml \
+  up --build
+```
+
+Set non-default values for `WATTSWARM_RABBITMQ_PASSWORD` and
+`WATTSWARM_CS_COMMIT_HMAC_SECRET` before exposing this deployment. The overlay
+creates the separate `wattswarm_message_gateway` PostgreSQL database, generates
+a local RabbitMQ TLS certificate, and exposes the Message Gateway on port
+`8090`. RabbitMQ's management UI is exposed on port `15672`; Wattswarm nodes
+never connect to RabbitMQ directly.
 
 If you prefer running the Rust process directly outside Docker:
 

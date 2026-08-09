@@ -1,0 +1,33 @@
+services:
+  postgres-contract:
+    image: postgres:17-alpine
+    ports:
+      - "55439:5432"
+    environment:
+      POSTGRES_USER: wattswarm
+      POSTGRES_PASSWORD: contract-password
+      POSTGRES_DB: message_gateway_contract
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wattswarm -d message_gateway_contract"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.1-management
+    hostname: rabbitmq-contract
+    ports:
+      - "35671:5671"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: wattswarm
+      RABBITMQ_DEFAULT_PASS: contract-password
+      RABBITMQ_DEFAULT_VHOST: /wattswarm
+    volumes:
+      - ./.tmp/rabbitmq-tls:/certs:ro
+      - ./.tmp/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
