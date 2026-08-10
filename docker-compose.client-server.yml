@@ -78,8 +78,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.message-gateway
-      additional_contexts:
-        wattswarm: ../wattswarm
+      secrets:
+        - github_token
     restart: unless-stopped
     environment:
       WATTSWARM_CS_BIND_ADDR: "${WATTSWARM_CS_BIND_ADDR:?set WATTSWARM_CS_BIND_ADDR}"

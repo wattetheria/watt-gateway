@@ -1,20 +1,76 @@
-FROM rust:1.93-bookworm AS builder
-WORKDIR /workspace
+FROM rust:1.93-bookworm AS chef
+WORKDIR /app
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
-COPY --from=wattswarm . /workspace/wattswarm
-COPY . /workspace/watt-gateway
+RUN cargo install cargo-chef --locked
 
-WORKDIR /workspace/watt-gateway
+FROM chef AS planner
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/message-gateway/Cargo.toml crates/message-gateway/Cargo.toml
+
+# Build against the remote Wattswarm repository instead of a host sibling
+# directory. Pin the client-server transport revision for reproducible images.
 RUN sed -i \
     -e '/"crates\/gateway",/d' \
     -e '/"crates\/gateway-p2p",/d' \
     -e '/^default-members = /d' \
+    -e 's|wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }|wattetheria-gateway-contract = { git = "https://github.com/wattetheria/wattetheria.git", package = "wattetheria-gateway-contract" }|' \
+    -e 's|watt-did = { path = "../watt-did" }|watt-did = { git = "https://github.com/wattetheria/watt-did.git" }|' \
+    -e 's|wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }|wattswarm-artifact-store = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-artifact-store" }|' \
+    -e 's|wattswarm-crypto = { path = "../wattswarm/crates/crypto" }|wattswarm-crypto = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-crypto" }|' \
+    -e 's|wattswarm-network-client-server = { path = "../wattswarm/crates/network-client-server" }|wattswarm-network-client-server = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-network-client-server" }|' \
+    -e 's|wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }|wattswarm-network-substrate = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-network-substrate" }|' \
+    -e 's|wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }|wattswarm-network-transport-core = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-network-transport-core" }|' \
+    -e 's|wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }|wattswarm-network-transport-iroh = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-network-transport-iroh" }|' \
+    -e 's|wattswarm-protocol = { path = "../wattswarm/crates/protocol" }|wattswarm-protocol = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-protocol" }|' \
     Cargo.toml
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+
+RUN mkdir -p crates/message-gateway/src \
+    && printf "fn main() {}\n" > crates/message-gateway/src/main.rs
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS cacher
+
+COPY --from=planner /app/recipe.json /app/recipe.json
+RUN --mount=type=secret,id=github_token \
+    --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/workspace/watt-gateway/target \
-    cargo build --release -p wattetheria-message-gateway \
-    && cp target/release/wattetheria-message-gateway /tmp/wattetheria-message-gateway
+    if [ -f /run/secrets/github_token ]; then \
+      git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/"; \
+    fi \
+    && cargo chef cook --release --recipe-path recipe.json
+
+FROM chef AS builder
+
+COPY . .
+COPY --from=cacher /app/target /app/target
+
+# COPY . . restores local path dependencies, so apply the Docker-only git
+# dependency rewrite again before the final build.
+RUN sed -i \
+    -e '/"crates\/gateway",/d' \
+    -e '/"crates\/gateway-p2p",/d' \
+    -e '/^default-members = /d' \
+    -e 's|wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }|wattetheria-gateway-contract = { git = "https://github.com/wattetheria/wattetheria.git", package = "wattetheria-gateway-contract" }|' \
+    -e 's|watt-did = { path = "../watt-did" }|watt-did = { git = "https://github.com/wattetheria/watt-did.git" }|' \
+    -e 's|wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }|wattswarm-artifact-store = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-artifact-store" }|' \
+    -e 's|wattswarm-crypto = { path = "../wattswarm/crates/crypto" }|wattswarm-crypto = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-crypto" }|' \
+    -e 's|wattswarm-network-client-server = { path = "../wattswarm/crates/network-client-server" }|wattswarm-network-client-server = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-network-client-server" }|' \
+    -e 's|wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }|wattswarm-network-substrate = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-network-substrate" }|' \
+    -e 's|wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }|wattswarm-network-transport-core = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-network-transport-core" }|' \
+    -e 's|wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }|wattswarm-network-transport-iroh = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-network-transport-iroh" }|' \
+    -e 's|wattswarm-protocol = { path = "../wattswarm/crates/protocol" }|wattswarm-protocol = { git = "https://github.com/wattetheria/wattswarm.git", rev = "5717b0bb22cfec0d1726a9c35660ed5fc4144926", package = "wattswarm-protocol" }|' \
+    Cargo.toml
+
+RUN --mount=type=secret,id=github_token \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    if [ -f /run/secrets/github_token ]; then \
+      git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/"; \
+    fi \
+    && cargo build --release -p wattetheria-message-gateway
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -22,7 +78,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /tmp/wattetheria-message-gateway /usr/local/bin/wattetheria-message-gateway
+COPY --from=builder /app/target/release/wattetheria-message-gateway /usr/local/bin/wattetheria-message-gateway
 
 EXPOSE 8090
 CMD ["wattetheria-message-gateway"]
