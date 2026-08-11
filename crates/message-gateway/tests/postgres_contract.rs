@@ -45,6 +45,7 @@ fn config(database_url: String) -> Config {
         fanout_admission_utilization_percent: 80,
         commit_hmac_secret: vec![7; 32],
         session_ttl: Duration::from_secs(900),
+        skip_grant_validation: false,
         object_store_root: Option::<PathBuf>::None,
         max_object_bytes: 64 * 1024 * 1024,
         membership_binding_timeout: Duration::from_secs(5),

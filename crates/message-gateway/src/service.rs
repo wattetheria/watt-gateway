@@ -83,13 +83,19 @@ pub async fn admit_grant(
     config: &Config,
     request: &GrantAdmissionRequest,
 ) -> Result<GrantAdmissionResponse> {
-    validate_network_membership_grant(config, &request.grant)?;
     let grant = &request.grant;
-    let genesis_principal = config
+    let expected_genesis = config
         .trusted_network_genesis
         .get(&grant.network_id)
         .context("network is not configured with a trusted Genesis authority")?;
-    if !db::principal_is_global_authority(pool, &grant.network_id, genesis_principal).await? {
+    validate_network_membership_grant_for_admission(
+        grant,
+        expected_genesis,
+        config.skip_grant_validation,
+    )?;
+    if !config.skip_grant_validation
+        && !db::principal_is_global_authority(pool, &grant.network_id, expected_genesis).await?
+    {
         bail!("configured network Genesis authority is not active");
     }
 
@@ -150,14 +156,26 @@ pub async fn admit_grant(
 }
 
 fn validate_network_membership_grant(
-    config: &Config,
     grant: &NetworkMembershipGrant,
+    expected_issuer: &str,
 ) -> Result<()> {
-    let expected_issuer = config
-        .trusted_network_genesis
-        .get(&grant.network_id)
-        .context("network has no trusted Genesis public key")?;
     wattswarm_crypto::verify_network_membership_grant(grant, expected_issuer, now_ms())
+}
+
+fn validate_network_membership_grant_for_admission(
+    grant: &NetworkMembershipGrant,
+    expected_issuer: &str,
+    skip_trusted_issuer_validation: bool,
+) -> Result<()> {
+    if skip_trusted_issuer_validation {
+        return wattswarm_crypto::verify_network_membership_grant(
+            grant,
+            &grant.issuer_genesis_id,
+            now_ms(),
+        )
+        .context("local CS test Grant signature or structure is invalid");
+    }
+    validate_network_membership_grant(grant, expected_issuer)
 }
 
 pub async fn send_control(
@@ -1261,6 +1279,36 @@ mod tests {
                 payload: OpaqueSignedRecord::new(serde_json::to_vec(&event).unwrap()).unwrap(),
             },
         )
+    }
+
+    #[test]
+    fn local_grant_validation_bypass_accepts_only_a_self_signed_test_grant() {
+        let signer = NodeIdentity::random();
+        let issued_at = now_ms();
+        let principal_id = signer.node_id();
+        let grant = wattswarm_crypto::sign_network_membership_grant(
+            &wattswarm_protocol::types::UnsignedNetworkMembershipGrant {
+                version: wattswarm_protocol::types::NETWORK_MEMBERSHIP_GRANT_VERSION,
+                network_id: "network".to_owned(),
+                principal_id: principal_id.clone(),
+                public_key_hex: principal_id,
+                issuer_genesis_id: signer.node_id(),
+                issued_at,
+                expires_at: Some(issued_at.saturating_add(60 * 60 * 1_000)),
+            },
+            &signer,
+        )
+        .unwrap();
+        let trusted_genesis = NodeIdentity::random().node_id();
+
+        assert!(
+            validate_network_membership_grant_for_admission(&grant, &trusted_genesis, true,)
+                .is_ok()
+        );
+        assert!(
+            validate_network_membership_grant_for_admission(&grant, &trusted_genesis, false,)
+                .is_err()
+        );
     }
 
     #[test]

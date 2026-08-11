@@ -12,6 +12,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let config = Arc::new(Config::from_env()?);
+    if config.skip_grant_validation {
+        warn!(
+            "WATTSWARM_CS_SKIP_GRANT_VALIDATION is enabled; only use this Message Gateway for local CS transport testing"
+        );
+    }
     let pool = db::connect(&config.database_url).await?;
     db::init_schema(&pool).await?;
     db::seed_trusted_network_genesis(&pool, &config).await?;
