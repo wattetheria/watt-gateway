@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use wattswarm_network_transport_core::{DeliveryClass, SwarmScope};
-use wattswarm_protocol::types::NetworkMembershipGrant;
+// Temporarily disabled with the Grant admission endpoint. The production
+// Docker build pins a Wattswarm revision without NetworkMembershipGrant.
 
 use crate::config::Config;
 
@@ -234,6 +235,9 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/*
+ * Temporarily disabled until the pinned Wattswarm revision exposes Grant
+ * types. Keep this implementation for re-enabling with the matching pin.
 pub async fn upsert_network_membership_grant(
     tx: &mut Transaction<'_, Postgres>,
     grant: &NetworkMembershipGrant,
@@ -270,6 +274,7 @@ pub async fn upsert_network_membership_grant(
     .await?;
     Ok(())
 }
+*/
 
 pub async fn seed_trusted_network_genesis(pool: &PgPool, config: &Config) -> Result<()> {
     for (network_id, genesis_node_id) in &config.trusted_network_genesis {

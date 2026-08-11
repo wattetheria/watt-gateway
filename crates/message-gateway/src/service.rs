@@ -9,22 +9,23 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use wattswarm_network_client_server::{
-    ControlAcceptance, ControlFrame, DeliveryClassInput, EventDeliveryUrgency,
-    GrantAdmissionRequest, GrantAdmissionResponse, PublishAcceptance, PublishFrame,
-    PublishPayloadType, control_frame_signing_message, delivery_class_for_record,
+    ControlAcceptance, ControlFrame, DeliveryClassInput, EventDeliveryUrgency, PublishAcceptance,
+    PublishFrame, PublishPayloadType, control_frame_signing_message, delivery_class_for_record,
 };
 use wattswarm_network_transport_core::{
     CheckpointAnnouncement, DeliveryClass, EventTransportRoute, PropagationLane, RuleAnnouncement,
     SummaryAnnouncement, SwarmScope,
 };
 use wattswarm_protocol::types::{
-    Event, EventKind, EventPayload, Membership, NetworkMembershipGrant, Role, ScopeHint,
-    SignatureEnvelope,
+    Event, EventKind, EventPayload, Membership, Role, ScopeHint, SignatureEnvelope,
 };
 
+/* Grant-only helper retained for re-enabling the temporarily disabled Grant
+ * admission flow after the Wattswarm changes are published.
 fn now_ms() -> u64 {
     Utc::now().timestamp_millis().max(0) as u64
 }
+*/
 
 struct ValidatedFrame {
     route: EventTransportRoute,
@@ -77,6 +78,11 @@ pub async fn ensure_tenant_transport_admission(
     Ok(())
 }
 
+/*
+ * Temporarily disabled: Grant admission depends on types and crypto helpers
+ * that are newer than the Wattswarm revision pinned by the production Docker
+ * build. Keep this code for re-enabling after the Wattswarm changes are
+ * published and the Docker pin is advanced.
 pub async fn admit_grant(
     pool: &PgPool,
     rabbit: &RabbitAdapter,
@@ -177,6 +183,7 @@ fn validate_network_membership_grant_for_admission(
     }
     validate_network_membership_grant(grant, expected_issuer)
 }
+*/
 
 pub async fn send_control(
     pool: &PgPool,
@@ -1281,6 +1288,10 @@ mod tests {
         )
     }
 
+    /*
+     * Temporarily disabled with the Grant admission flow. Keep this test for
+     * re-enabling after the Wattswarm Grant API is available at the pinned
+     * dependency revision.
     #[test]
     fn local_grant_validation_bypass_accepts_only_a_self_signed_test_grant() {
         let signer = NodeIdentity::random();
@@ -1310,6 +1321,7 @@ mod tests {
                 .is_err()
         );
     }
+    */
 
     #[test]
     fn rejects_route_author_signature_and_frame_forgery() {
