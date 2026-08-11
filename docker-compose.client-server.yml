@@ -86,6 +86,7 @@ services:
       WATTSWARM_CS_DATABASE_URL: "${WATTSWARM_CS_DATABASE_URL:?set WATTSWARM_CS_DATABASE_URL}"
       WATTSWARM_CS_MESSAGE_BUS: "${WATTSWARM_CS_MESSAGE_BUS:?set WATTSWARM_CS_MESSAGE_BUS}"
       WATTSWARM_CS_COMMIT_HMAC_SECRET_FILE: /run/secrets/cs_commit_hmac_secret
+      WATTSWARM_CS_TRUSTED_NETWORK_GENESIS_FILE: /run/wattswarm/trusted-network-genesis.json
       WATTSWARM_RABBITMQ_ENDPOINT: "${WATTSWARM_RABBITMQ_ENDPOINT:?set WATTSWARM_RABBITMQ_ENDPOINT}"
       WATTSWARM_RABBITMQ_USERNAME: "${WATTSWARM_RABBITMQ_USERNAME:?set WATTSWARM_RABBITMQ_USERNAME}"
       WATTSWARM_RABBITMQ_PASSWORD_FILE: /run/secrets/rabbitmq_password
@@ -96,6 +97,7 @@ services:
       - cs_commit_hmac_secret
     volumes:
       - rabbitmq-tls:/run/rabbitmq-tls:ro
+      - "${WATTSWARM_CS_TRUSTED_NETWORK_GENESIS_HOST_FILE:-./trusted-network-genesis.json}:/run/wattswarm/trusted-network-genesis.json:ro"
     depends_on:
       message-gateway-db-init:
         condition: service_completed_successfully

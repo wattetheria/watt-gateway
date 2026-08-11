@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use wattswarm_network_transport_core::{DeliveryClass, SwarmScope};
+use wattswarm_protocol::types::NetworkMembershipGrant;
 
 use crate::config::Config;
 
@@ -72,6 +73,16 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             roles_json JSONB NOT NULL DEFAULT '[]'::jsonb,
             binding_updated_at TIMESTAMPTZ,
             PRIMARY KEY(network_id, scope_label, principal_id)
+        );
+        CREATE TABLE IF NOT EXISTS gateway_network_membership_grants (
+            network_id TEXT NOT NULL,
+            principal_id TEXT NOT NULL,
+            grant_id TEXT NOT NULL,
+            grant_json JSONB NOT NULL,
+            issued_at_ms BIGINT NOT NULL,
+            expires_at_ms BIGINT,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY(network_id, principal_id)
         );
         CREATE TABLE IF NOT EXISTS gateway_scope_versions (
             network_id TEXT NOT NULL,
@@ -209,6 +220,8 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
             ADD COLUMN IF NOT EXISTS record_hash TEXT NOT NULL DEFAULT '';
         CREATE INDEX IF NOT EXISTS idx_gateway_scope_memberships_active
             ON gateway_scope_memberships(network_id, scope_label, state, membership_version);
+        CREATE INDEX IF NOT EXISTS idx_gateway_network_membership_grants_expiry
+            ON gateway_network_membership_grants(network_id, principal_id, expires_at_ms);
         CREATE INDEX IF NOT EXISTS idx_gateway_delivery_owner_lease
             ON gateway_delivery_owners(lease_expires_at);
         CREATE INDEX IF NOT EXISTS idx_gateway_mailbox_gaps_pending
@@ -218,6 +231,43 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+pub async fn upsert_network_membership_grant(
+    tx: &mut Transaction<'_, Postgres>,
+    grant: &NetworkMembershipGrant,
+    grant_id: &str,
+) -> Result<()> {
+    let issued_at_ms = i64::try_from(grant.issued_at)
+        .context("network membership grant issued_at exceeds PostgreSQL BIGINT")?;
+    let expires_at_ms = grant
+        .expires_at
+        .map(|value| {
+            i64::try_from(value)
+                .context("network membership grant expires_at exceeds PostgreSQL BIGINT")
+        })
+        .transpose()?;
+    sqlx::query(
+        "INSERT INTO gateway_network_membership_grants(
+             network_id, principal_id, grant_id, grant_json,
+             issued_at_ms, expires_at_ms, updated_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,clock_timestamp())
+         ON CONFLICT(network_id, principal_id) DO UPDATE SET
+             grant_id = EXCLUDED.grant_id,
+             grant_json = EXCLUDED.grant_json,
+             issued_at_ms = EXCLUDED.issued_at_ms,
+             expires_at_ms = EXCLUDED.expires_at_ms,
+             updated_at = clock_timestamp()",
+    )
+    .bind(&grant.network_id)
+    .bind(&grant.principal_id)
+    .bind(grant_id)
+    .bind(serde_json::to_value(grant)?)
+    .bind(issued_at_ms)
+    .bind(expires_at_ms)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -359,9 +409,20 @@ pub async fn principal_is_admitted(
 ) -> Result<bool> {
     Ok(sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
-             SELECT 1 FROM gateway_scope_memberships
-             WHERE network_id = $1 AND scope_label = 'global'
-               AND principal_id = $2 AND state = 'active'
+             SELECT 1
+             FROM gateway_scope_memberships membership
+             LEFT JOIN gateway_network_membership_grants grant_projection
+               ON grant_projection.network_id = membership.network_id
+              AND grant_projection.principal_id = membership.principal_id
+             WHERE membership.network_id = $1
+               AND membership.scope_label = 'global'
+               AND membership.principal_id = $2
+               AND membership.state = 'active'
+               AND (
+                   grant_projection.expires_at_ms IS NULL
+                   OR grant_projection.expires_at_ms >
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+               )
          )",
     )
     .bind(network_id)
@@ -440,8 +501,18 @@ pub async fn principal_is_global_authority(
 pub async fn active_tenant_count(pool: &PgPool, network_id: &str) -> Result<u64> {
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT principal_id)
-         FROM gateway_scope_memberships
-         WHERE network_id = $1 AND scope_label = 'global' AND state = 'active'",
+         FROM gateway_scope_memberships membership
+         LEFT JOIN gateway_network_membership_grants grant_projection
+           ON grant_projection.network_id = membership.network_id
+          AND grant_projection.principal_id = membership.principal_id
+         WHERE membership.network_id = $1
+           AND membership.scope_label = 'global'
+           AND membership.state = 'active'
+           AND (
+               grant_projection.expires_at_ms IS NULL
+               OR grant_projection.expires_at_ms >
+                  (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+           )",
     )
     .bind(network_id)
     .fetch_one(pool)
@@ -655,10 +726,20 @@ pub async fn authorized_scope_version_and_count(
     let scope_label = scope.label()?;
     let author_allowed: bool = sqlx::query_scalar(
         "SELECT EXISTS(
-             SELECT 1 FROM gateway_scope_memberships
-             WHERE network_id = $1
-               AND (scope_label = $2 OR ($4 AND scope_label = 'global'))
-               AND principal_id = $3 AND state = 'active'
+             SELECT 1
+             FROM gateway_scope_memberships membership
+             LEFT JOIN gateway_network_membership_grants grant_projection
+               ON grant_projection.network_id = membership.network_id
+              AND grant_projection.principal_id = membership.principal_id
+             WHERE membership.network_id = $1
+               AND (membership.scope_label = $2 OR ($4 AND membership.scope_label = 'global'))
+               AND membership.principal_id = $3
+               AND membership.state = 'active'
+               AND (
+                   grant_projection.expires_at_ms IS NULL
+                   OR grant_projection.expires_at_ms >
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+               )
          )",
     )
     .bind(network_id)
@@ -680,8 +761,18 @@ pub async fn authorized_scope_version_and_count(
     .await?;
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM gateway_scope_memberships
-         WHERE network_id = $1 AND scope_label = $2 AND state = 'active'
-           AND ($3::TEXT IS NULL OR membership_version = $3)",
+         LEFT JOIN gateway_network_membership_grants grant_projection
+           ON grant_projection.network_id = gateway_scope_memberships.network_id
+          AND grant_projection.principal_id = gateway_scope_memberships.principal_id
+         WHERE gateway_scope_memberships.network_id = $1
+           AND gateway_scope_memberships.scope_label = $2
+           AND gateway_scope_memberships.state = 'active'
+           AND (
+               grant_projection.expires_at_ms IS NULL
+               OR grant_projection.expires_at_ms >
+                  (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+           )
+           AND ($3::TEXT IS NULL OR gateway_scope_memberships.membership_version = $3)",
     )
     .bind(network_id)
     .bind(&scope_label)
@@ -703,10 +794,21 @@ pub async fn scope_contains_principal(
     }
     Ok(sqlx::query_scalar(
         "SELECT EXISTS(
-             SELECT 1 FROM gateway_scope_memberships
-             WHERE network_id = $1 AND scope_label = $2 AND principal_id = $3
-               AND state = 'active'
-               AND ($4::TEXT IS NULL OR membership_version = $4)
+             SELECT 1
+             FROM gateway_scope_memberships membership
+             LEFT JOIN gateway_network_membership_grants grant_projection
+               ON grant_projection.network_id = membership.network_id
+              AND grant_projection.principal_id = membership.principal_id
+             WHERE membership.network_id = $1
+               AND membership.scope_label = $2
+               AND membership.principal_id = $3
+               AND membership.state = 'active'
+               AND (
+                   grant_projection.expires_at_ms IS NULL
+                   OR grant_projection.expires_at_ms >
+                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+               )
+               AND ($4::TEXT IS NULL OR membership.membership_version = $4)
          )",
     )
     .bind(network_id)

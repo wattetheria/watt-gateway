@@ -7439,6 +7439,7 @@ dependencies = [
  "hkdf",
  "rand 0.8.5",
  "serde",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.10.9",
  "wattswarm-protocol",
@@ -7453,8 +7454,11 @@ dependencies = [
  "base64",
  "reqwest 0.12.28",
  "serde",
+ "serde_jcs 0.2.0",
  "serde_json",
+ "uuid",
  "wattswarm-network-transport-core",
+ "wattswarm-protocol",
 ]
 
 [[package]]
@@ -7508,6 +7512,7 @@ name = "wattswarm-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_jcs 0.2.0",
  "serde_json",
  "thiserror 2.0.18",
 ]

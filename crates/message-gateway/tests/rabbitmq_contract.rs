@@ -15,16 +15,18 @@ use wattetheria_message_gateway::{
 };
 use wattswarm_crypto::NodeIdentity;
 use wattswarm_network_client_server::{
-    ChallengeRequest, CommitRequest, LogicalNodePrincipalClaim, LogicalNodePrincipalProof,
-    PublishFrame, PublishPayloadType, PublishRoute, SessionProofRequest, session_proof_message,
+    ChallengeRequest, CommitRequest, GrantAdmissionRequest, LogicalNodePrincipalClaim,
+    LogicalNodePrincipalProof, PublishFrame, PublishPayloadType, PublishRoute, SessionProofRequest,
+    session_proof_message,
 };
 use wattswarm_network_transport_core::{
     DeliveryClass, EventTransportRoute, OpaqueSignedRecord, PropagationLane, SummaryAnnouncement,
     SwarmScope,
 };
 use wattswarm_protocol::types::{
-    EventPayload, FeedSubscriptionUpdatedPayload, Membership, MembershipUpdatedPayload, Role,
-    SignatureEnvelope, UnsignedEvent,
+    EventPayload, FeedSubscriptionUpdatedPayload, Membership, MembershipUpdatedPayload,
+    NETWORK_MEMBERSHIP_GRANT_VERSION, Role, SignatureEnvelope, UnsignedEvent,
+    UnsignedNetworkMembershipGrant,
 };
 
 fn config() -> Config {
@@ -358,6 +360,80 @@ async fn trusted_genesis_projects_and_authorizes_membership_quorum_contract() {
         .await
         .is_err(),
         "a projected non-Finalizer must not authorize MembershipUpdated"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires real TLS RabbitMQ and PostgreSQL; run through scripts/run-message-gateway-contract.sh"]
+async fn auto_registration_adds_a_member_once_and_is_idempotent_contract() {
+    let pool = contract_pool().await;
+    let mut gateway_config = config();
+    let network_id = format!("auto-registration-{}", Uuid::new_v4());
+    let genesis = NodeIdentity::random();
+    let member = NodeIdentity::random();
+    gateway_config
+        .trusted_network_genesis
+        .insert(network_id.clone(), genesis.node_id());
+    db::seed_trusted_network_genesis(&pool, &gateway_config)
+        .await
+        .unwrap();
+    let adapter = RabbitAdapter::connect(Arc::new(gateway_config.clone()))
+        .await
+        .unwrap();
+    let issued_at = chrono::Utc::now().timestamp_millis() as u64;
+    let grant = wattswarm_crypto::sign_network_membership_grant(
+        &UnsignedNetworkMembershipGrant {
+            version: NETWORK_MEMBERSHIP_GRANT_VERSION,
+            network_id: network_id.clone(),
+            principal_id: member.node_id(),
+            public_key_hex: member.node_id(),
+            issuer_genesis_id: genesis.node_id(),
+            issued_at,
+            expires_at: None,
+        },
+        &genesis,
+    )
+    .unwrap();
+    let request = GrantAdmissionRequest { grant };
+
+    let first = service::admit_grant(&pool, &adapter, &gateway_config, &request)
+        .await
+        .unwrap();
+    assert_eq!(first.status, "active");
+    assert!(
+        db::principal_is_admitted(&pool, &network_id, &member.node_id())
+            .await
+            .unwrap()
+    );
+
+    let second = service::admit_grant(&pool, &adapter, &gateway_config, &request)
+        .await
+        .unwrap();
+    assert_eq!(second.membership_version, first.membership_version);
+
+    sqlx::query(
+        "UPDATE gateway_network_membership_grants
+         SET expires_at_ms = 0
+         WHERE network_id = $1 AND principal_id = $2",
+    )
+    .bind(&network_id)
+    .bind(member.node_id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !db::principal_is_admitted(&pool, &network_id, &member.node_id())
+            .await
+            .unwrap()
+    );
+
+    service::admit_grant(&pool, &adapter, &gateway_config, &request)
+        .await
+        .unwrap();
+    assert!(
+        db::principal_is_admitted(&pool, &network_id, &member.node_id())
+            .await
+            .unwrap()
     );
 }
 

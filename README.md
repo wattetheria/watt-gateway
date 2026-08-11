@@ -69,6 +69,27 @@ whose current membership cannot be validated. Membership changes must be signed
 by the current Finalizer quorum; the trusted genesis identity is only the
 bootstrap authority for the first membership event.
 
+The trusted Genesis map is a public-key trust root, not a user token or a
+Wattetheria real-world Credential. In the Docker deployment, copy the map to
+the host path configured by `WATTSWARM_CS_TRUSTED_NETWORK_GENESIS_HOST_FILE`;
+the compose file mounts it as
+`/run/wattswarm/trusted-network-genesis.json`.
+
+New ClientServer nodes auto-register with the Genesis Wattswarm node, not with
+this Message Gateway. The node sends a request signed by its own Ed25519
+identity to `POST /api/network/registration/auto`. The Genesis node verifies
+that request and automatically signs a `NetworkMembershipGrant`. The node then
+sends that Grant to this Gateway at `POST /v1/admission/grant`. The Gateway
+verifies the Genesis signature, checks that the configured Genesis authority is
+active, and idempotently projects the node into the active global membership.
+Only after this admission does the normal session challenge run.
+
+The Grant has no expiry by default. Set
+`WATTSWARM_NETWORK_GRANT_TTL_SECONDS` on the Genesis registration server to a
+positive value to issue Grants with an expiry; the Gateway validates that
+expiry. `WATTSWARM_CS_AUTO_REGISTER=false` disables the node's automatic
+request; the manual application workflow will use the same Grant format later.
+
 Public APIs listen on `WATTSWARM_CS_BIND_ADDR`. Cross-instance delivery commits
 use the separate `WATTSWARM_CS_INTERNAL_BIND_ADDR` listener and require all of
 `WATTSWARM_CS_INTERNAL_ROUTE`, `WATTSWARM_CS_INTERNAL_MTLS_IDENTITY_FILE`, and

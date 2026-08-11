@@ -18,7 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use wattswarm_network_client_server::{
     ChallengeRequest, ChallengeResponse, CommitRequest, ControlAcceptance, ControlFrame,
-    PublishAcceptance, PublishFrame, SessionProofRequest, SessionResponse,
+    GrantAdmissionRequest, GrantAdmissionResponse, PublishAcceptance, PublishFrame,
+    SessionProofRequest, SessionResponse,
 };
 use wattswarm_network_transport_core::MailboxBinding;
 use wattswarm_network_transport_core::{DeliveryClass, DeliveryPage};
@@ -33,6 +34,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/v1/admission/grant", post(admit_grant))
         .route("/v1/session/challenge", post(challenge))
         .route("/v1/session/proof", post(proof))
         .route("/v1/publish", post(publish))
@@ -53,6 +55,15 @@ pub fn internal_router(state: AppState) -> Router {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"ok": true, "service": "wattswarm-message-gateway"}))
+}
+
+async fn admit_grant(
+    State(state): State<AppState>,
+    Json(request): Json<GrantAdmissionRequest>,
+) -> ApiResult<Json<GrantAdmissionResponse>> {
+    Ok(Json(
+        service::admit_grant(&state.pool, &state.rabbit, &state.config, &request).await?,
+    ))
 }
 
 async fn challenge(

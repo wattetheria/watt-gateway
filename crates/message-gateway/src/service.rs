@@ -9,16 +9,22 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use wattswarm_network_client_server::{
-    ControlAcceptance, ControlFrame, DeliveryClassInput, EventDeliveryUrgency, PublishAcceptance,
-    PublishFrame, PublishPayloadType, control_frame_signing_message, delivery_class_for_record,
+    ControlAcceptance, ControlFrame, DeliveryClassInput, EventDeliveryUrgency,
+    GrantAdmissionRequest, GrantAdmissionResponse, PublishAcceptance, PublishFrame,
+    PublishPayloadType, control_frame_signing_message, delivery_class_for_record,
 };
 use wattswarm_network_transport_core::{
     CheckpointAnnouncement, DeliveryClass, EventTransportRoute, PropagationLane, RuleAnnouncement,
     SummaryAnnouncement, SwarmScope,
 };
 use wattswarm_protocol::types::{
-    Event, EventKind, EventPayload, Membership, Role, ScopeHint, SignatureEnvelope,
+    Event, EventKind, EventPayload, Membership, NetworkMembershipGrant, Role, ScopeHint,
+    SignatureEnvelope,
 };
+
+fn now_ms() -> u64 {
+    Utc::now().timestamp_millis().max(0) as u64
+}
 
 struct ValidatedFrame {
     route: EventTransportRoute,
@@ -69,6 +75,89 @@ pub async fn ensure_tenant_transport_admission(
             .await?;
     }
     Ok(())
+}
+
+pub async fn admit_grant(
+    pool: &PgPool,
+    rabbit: &RabbitAdapter,
+    config: &Config,
+    request: &GrantAdmissionRequest,
+) -> Result<GrantAdmissionResponse> {
+    validate_network_membership_grant(config, &request.grant)?;
+    let grant = &request.grant;
+    let genesis_principal = config
+        .trusted_network_genesis
+        .get(&grant.network_id)
+        .context("network is not configured with a trusted Genesis authority")?;
+    if !db::principal_is_global_authority(pool, &grant.network_id, genesis_principal).await? {
+        bail!("configured network Genesis authority is not active");
+    }
+
+    let grant_id = wattswarm_crypto::network_membership_grant_id(grant)?;
+    let mut tx = db::begin_scope_fence(pool, &grant.network_id, "global", true).await?;
+    db::upsert_network_membership_grant(&mut tx, grant, &grant_id).await?;
+    let active_version = sqlx::query_scalar::<_, String>(
+        "SELECT membership_version FROM gateway_scope_memberships
+         LEFT JOIN gateway_network_membership_grants grant_projection
+           ON grant_projection.network_id = gateway_scope_memberships.network_id
+          AND grant_projection.principal_id = gateway_scope_memberships.principal_id
+         WHERE gateway_scope_memberships.network_id = $1
+           AND gateway_scope_memberships.scope_label = 'global'
+           AND gateway_scope_memberships.principal_id = $2
+           AND gateway_scope_memberships.state = 'active'
+           AND (
+               grant_projection.expires_at_ms IS NULL
+               OR grant_projection.expires_at_ms >
+                  (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+           )",
+    )
+    .bind(&grant.network_id)
+    .bind(&grant.principal_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(membership_version) = active_version {
+        tx.commit().await?;
+        return Ok(GrantAdmissionResponse {
+            network_id: grant.network_id.clone(),
+            principal_id: grant.principal_id.clone(),
+            membership_version,
+            status: "active".to_owned(),
+        });
+    }
+
+    let membership_version = format!("grant:{grant_id}");
+    apply_membership_mutation(
+        &mut tx,
+        rabbit,
+        config,
+        &grant.network_id,
+        &MembershipMutation::Principal {
+            scope: SwarmScope::Global,
+            principal_id: grant.principal_id.clone(),
+            active: true,
+            version: membership_version.clone(),
+        },
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(GrantAdmissionResponse {
+        network_id: grant.network_id.clone(),
+        principal_id: grant.principal_id.clone(),
+        membership_version,
+        status: "active".to_owned(),
+    })
+}
+
+fn validate_network_membership_grant(
+    config: &Config,
+    grant: &NetworkMembershipGrant,
+) -> Result<()> {
+    let expected_issuer = config
+        .trusted_network_genesis
+        .get(&grant.network_id)
+        .context("network has no trusted Genesis public key")?;
+    wattswarm_crypto::verify_network_membership_grant(grant, expected_issuer, now_ms())
 }
 
 pub async fn send_control(
