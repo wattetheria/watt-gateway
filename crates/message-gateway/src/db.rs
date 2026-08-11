@@ -505,7 +505,7 @@ pub async fn principal_is_global_authority(
 
 pub async fn active_tenant_count(pool: &PgPool, network_id: &str) -> Result<u64> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT principal_id)
+        "SELECT COUNT(DISTINCT membership.principal_id)
          FROM gateway_scope_memberships membership
          LEFT JOIN gateway_network_membership_grants grant_projection
            ON grant_projection.network_id = membership.network_id
