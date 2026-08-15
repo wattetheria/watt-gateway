@@ -57,9 +57,13 @@ pub async fn ensure_tenant_transport_admission(
     principal_id: &str,
 ) -> Result<()> {
     db::validate_active_tenant_admission(pool, config, network_id).await?;
+    // Temporarily disabled while Gateway Grant admission is commented out
+    // for CS transport testing. Mailbox and route binding setup below remains.
+    /*
     if !db::principal_is_admitted(pool, network_id, principal_id).await? {
         bail!("principal is not an active network member");
     }
+    */
     rabbit
         .ensure_tenant_mailboxes(network_id, principal_id)
         .await?;
@@ -200,9 +204,13 @@ pub async fn send_control(
     {
         bail!("control frame binding or size is invalid");
     }
+    // Temporarily disabled with Gateway Grant admission. The target mailbox
+    // is still created by RabbitMQ delivery code below.
+    /*
     if !db::principal_is_admitted(pool, &session.network_id, &frame.target_principal_id).await? {
         bail!("control target is not an active network member");
     }
+    */
     wattswarm_crypto::verify_signature(
         &frame.source_principal_id,
         &control_frame_signing_message(frame)?,

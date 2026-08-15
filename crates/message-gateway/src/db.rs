@@ -720,15 +720,23 @@ pub async fn authorized_scope_version_and_count(
     principal_id: &str,
     allow_network_member_author: bool,
 ) -> Result<(Option<String>, u64)> {
-    if let SwarmScope::Node(recipient) = scope {
+    let _ = (principal_id, allow_network_member_author);
+    if let SwarmScope::Node(_recipient) = scope {
+        // Temporarily disabled with Gateway Grant admission. Direct CS routes
+        // still use the node-specific RabbitMQ mailbox below.
+        /*
         if !principal_is_admitted(pool, network_id, principal_id).await?
             || !principal_is_admitted(pool, network_id, recipient).await?
         {
             bail!("direct route author or recipient is not an active network member");
         }
+        */
         return Ok((None, 1));
     }
     let scope_label = scope.label()?;
+    // Temporarily disabled with Gateway Grant admission. Keep the original
+    // scope membership query for re-enabling when Gateway registration is restored.
+    /*
     let author_allowed: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
@@ -756,6 +764,7 @@ pub async fn authorized_scope_version_and_count(
     if !author_allowed {
         bail!("principal is not authorized for publish scope");
     }
+    */
     let version = sqlx::query_scalar::<_, String>(
         "SELECT active_membership_version FROM gateway_scope_versions
          WHERE network_id = $1 AND scope_label = $2",

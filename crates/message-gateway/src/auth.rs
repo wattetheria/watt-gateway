@@ -37,9 +37,14 @@ pub async fn create_challenge(
     {
         bail!("tenant instance id must be non-empty and at most 128 bytes");
     }
+    // Temporarily disabled while the Gateway Grant admission flow is
+    // commented out for CS transport testing. Keep the membership gate for
+    // re-enabling when Gateway registration is restored.
+    /*
     if !db::principal_is_admitted(pool, &request.network_id, &claim.principal_id).await? {
         bail!("principal is not an active network member");
     }
+    */
     let challenge_id = Uuid::new_v4();
     let mut nonce = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
@@ -98,11 +103,16 @@ pub async fn prove_session(
     }
     let claim = &request.principals[0];
     let proof = &request.proofs[0];
-    if proof.principal_id != claim.principal_id
-        || !db::principal_is_admitted(pool, &network_id, &claim.principal_id).await?
-    {
+    if proof.principal_id != claim.principal_id {
         bail!("principal proof is not admitted");
     }
+    // Temporarily disabled with the Gateway Grant admission flow. Keep the
+    // membership check for re-enabling when Gateway registration is restored.
+    /*
+    if !db::principal_is_admitted(pool, &network_id, &claim.principal_id).await? {
+        bail!("principal proof is not admitted");
+    }
+    */
     let challenge = ChallengeResponse {
         challenge_id: challenge_id.to_string(),
         nonce,
@@ -201,9 +211,13 @@ pub async fn verify_bearer(pool: &PgPool, token: &str) -> Result<VerifiedSession
         network_id: row.try_get("network_id")?,
         principal_id: row.try_get("principal_id")?,
     };
+    // Temporarily disabled with the Gateway Grant admission flow. Token
+    // integrity and expiry checks above remain active.
+    /*
     if !db::principal_is_admitted(pool, &session.network_id, &session.principal_id).await? {
         bail!("session principal is no longer admitted");
     }
+    */
     Ok(session)
 }
 
