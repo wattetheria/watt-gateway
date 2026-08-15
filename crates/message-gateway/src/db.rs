@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
 use wattswarm_network_transport_core::{DeliveryClass, SwarmScope};
-// Temporarily disabled with the Grant admission endpoint. The production
-// Docker build pins a Wattswarm revision without NetworkMembershipGrant.
+use wattswarm_protocol::types::NetworkMembershipGrant;
 
 use crate::config::Config;
 
@@ -235,9 +234,6 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/*
- * Temporarily disabled until the pinned Wattswarm revision exposes Grant
- * types. Keep this implementation for re-enabling with the matching pin.
 pub async fn upsert_network_membership_grant(
     tx: &mut Transaction<'_, Postgres>,
     grant: &NetworkMembershipGrant,
@@ -274,7 +270,6 @@ pub async fn upsert_network_membership_grant(
     .await?;
     Ok(())
 }
-*/
 
 pub async fn seed_trusted_network_genesis(pool: &PgPool, config: &Config) -> Result<()> {
     for (network_id, genesis_node_id) in &config.trusted_network_genesis {
@@ -720,23 +715,15 @@ pub async fn authorized_scope_version_and_count(
     principal_id: &str,
     allow_network_member_author: bool,
 ) -> Result<(Option<String>, u64)> {
-    let _ = (principal_id, allow_network_member_author);
-    if let SwarmScope::Node(_recipient) = scope {
-        // Temporarily disabled with Gateway Grant admission. Direct CS routes
-        // still use the node-specific RabbitMQ mailbox below.
-        /*
+    if let SwarmScope::Node(recipient) = scope {
         if !principal_is_admitted(pool, network_id, principal_id).await?
             || !principal_is_admitted(pool, network_id, recipient).await?
         {
             bail!("direct route author or recipient is not an active network member");
         }
-        */
         return Ok((None, 1));
     }
     let scope_label = scope.label()?;
-    // Temporarily disabled with Gateway Grant admission. Keep the original
-    // scope membership query for re-enabling when Gateway registration is restored.
-    /*
     let author_allowed: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
@@ -764,7 +751,6 @@ pub async fn authorized_scope_version_and_count(
     if !author_allowed {
         bail!("principal is not authorized for publish scope");
     }
-    */
     let version = sqlx::query_scalar::<_, String>(
         "SELECT active_membership_version FROM gateway_scope_versions
          WHERE network_id = $1 AND scope_label = $2",

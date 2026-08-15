@@ -15,16 +15,18 @@ use wattetheria_message_gateway::{
 };
 use wattswarm_crypto::NodeIdentity;
 use wattswarm_network_client_server::{
-    ChallengeRequest, CommitRequest, LogicalNodePrincipalClaim, LogicalNodePrincipalProof,
-    PublishFrame, PublishPayloadType, PublishRoute, SessionProofRequest, session_proof_message,
+    ChallengeRequest, CommitRequest, GrantAdmissionRequest, LogicalNodePrincipalClaim,
+    LogicalNodePrincipalProof, PublishFrame, PublishPayloadType, PublishRoute, SessionProofRequest,
+    session_proof_message,
 };
 use wattswarm_network_transport_core::{
     DeliveryClass, EventTransportRoute, OpaqueSignedRecord, PropagationLane, SummaryAnnouncement,
     SwarmScope,
 };
 use wattswarm_protocol::types::{
-    EventPayload, FeedSubscriptionUpdatedPayload, Membership, MembershipUpdatedPayload, Role,
-    SignatureEnvelope, UnsignedEvent,
+    EventPayload, FeedSubscriptionUpdatedPayload, Membership, MembershipUpdatedPayload,
+    NETWORK_MEMBERSHIP_GRANT_VERSION, Role, SignatureEnvelope, UnsignedEvent,
+    UnsignedNetworkMembershipGrant,
 };
 
 fn config() -> Config {
@@ -57,7 +59,6 @@ fn config() -> Config {
         fanout_admission_utilization_percent: 80,
         commit_hmac_secret: vec![7; 32],
         session_ttl: Duration::from_secs(900),
-        skip_grant_validation: false,
         object_store_root: None,
         max_object_bytes: 64 * 1024 * 1024,
         membership_binding_timeout: Duration::from_secs(5),
@@ -362,10 +363,6 @@ async fn trusted_genesis_projects_and_authorizes_membership_quorum_contract() {
     );
 }
 
-/*
- * Temporarily disabled with the Grant admission endpoint. Keep this contract
- * test for re-enabling after the Wattswarm Grant API is available at the
- * pinned dependency revision.
 #[tokio::test]
 #[ignore = "requires real TLS RabbitMQ and PostgreSQL; run through scripts/run-message-gateway-contract.sh"]
 async fn auto_registration_adds_a_member_once_and_is_idempotent_contract() {
@@ -439,7 +436,6 @@ async fn auto_registration_adds_a_member_once_and_is_idempotent_contract() {
             .unwrap()
     );
 }
-*/
 
 #[tokio::test]
 #[ignore = "requires real TLS RabbitMQ and PostgreSQL; run through scripts/run-message-gateway-contract.sh"]

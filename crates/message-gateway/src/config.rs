@@ -32,7 +32,6 @@ pub struct Config {
     pub fanout_admission_utilization_percent: u64,
     pub commit_hmac_secret: Vec<u8>,
     pub session_ttl: Duration,
-    pub skip_grant_validation: bool,
     pub object_store_root: Option<PathBuf>,
     pub max_object_bytes: u64,
     pub membership_binding_timeout: Duration,
@@ -136,7 +135,6 @@ impl Config {
             )?,
             commit_hmac_secret: std::fs::read(commit_secret_file)?,
             session_ttl: Duration::from_secs(number("WATTSWARM_CS_SESSION_TTL_SECONDS", 900)?),
-            skip_grant_validation: flag("WATTSWARM_CS_SKIP_GRANT_VALIDATION", false)?,
             object_store_root: env::var_os("WATTSWARM_CS_OBJECT_STORE_ROOT").map(PathBuf::from),
             max_object_bytes: number("WATTSWARM_CS_MAX_OBJECT_BYTES", 67_108_864)?,
             membership_binding_timeout: Duration::from_millis(number(
@@ -311,17 +309,6 @@ where
         .with_context(|| format!("parse {key}"))
 }
 
-fn flag(key: &str, default: bool) -> Result<bool> {
-    let Some(value) = env::var(key).ok() else {
-        return Ok(default);
-    };
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => bail!("parse {key}: expected a boolean"),
-    }
-}
-
 fn redact_endpoint(endpoint: &str) -> String {
     endpoint
         .rsplit_once('@')
@@ -360,7 +347,6 @@ mod tests {
             fanout_admission_utilization_percent: 80,
             commit_hmac_secret: vec![1; 32],
             session_ttl: Duration::from_secs(900),
-            skip_grant_validation: false,
             object_store_root: None,
             max_object_bytes: 67_108_864,
             membership_binding_timeout: Duration::from_secs(10),

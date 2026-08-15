@@ -9,23 +9,22 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use wattswarm_network_client_server::{
-    ControlAcceptance, ControlFrame, DeliveryClassInput, EventDeliveryUrgency, PublishAcceptance,
-    PublishFrame, PublishPayloadType, control_frame_signing_message, delivery_class_for_record,
+    ControlAcceptance, ControlFrame, DeliveryClassInput, EventDeliveryUrgency,
+    GrantAdmissionRequest, GrantAdmissionResponse, PublishAcceptance, PublishFrame,
+    PublishPayloadType, control_frame_signing_message, delivery_class_for_record,
 };
 use wattswarm_network_transport_core::{
     CheckpointAnnouncement, DeliveryClass, EventTransportRoute, PropagationLane, RuleAnnouncement,
     SummaryAnnouncement, SwarmScope,
 };
 use wattswarm_protocol::types::{
-    Event, EventKind, EventPayload, Membership, Role, ScopeHint, SignatureEnvelope,
+    Event, EventKind, EventPayload, Membership, NetworkMembershipGrant, Role, ScopeHint,
+    SignatureEnvelope,
 };
 
-/* Grant-only helper retained for re-enabling the temporarily disabled Grant
- * admission flow after the Wattswarm changes are published.
 fn now_ms() -> u64 {
     Utc::now().timestamp_millis().max(0) as u64
 }
-*/
 
 struct ValidatedFrame {
     route: EventTransportRoute,
@@ -57,13 +56,9 @@ pub async fn ensure_tenant_transport_admission(
     principal_id: &str,
 ) -> Result<()> {
     db::validate_active_tenant_admission(pool, config, network_id).await?;
-    // Temporarily disabled while Gateway Grant admission is commented out
-    // for CS transport testing. Mailbox and route binding setup below remains.
-    /*
     if !db::principal_is_admitted(pool, network_id, principal_id).await? {
         bail!("principal is not an active network member");
     }
-    */
     rabbit
         .ensure_tenant_mailboxes(network_id, principal_id)
         .await?;
@@ -82,11 +77,6 @@ pub async fn ensure_tenant_transport_admission(
     Ok(())
 }
 
-/*
- * Temporarily disabled: Grant admission depends on types and crypto helpers
- * that are newer than the Wattswarm revision pinned by the production Docker
- * build. Keep this code for re-enabling after the Wattswarm changes are
- * published and the Docker pin is advanced.
 pub async fn admit_grant(
     pool: &PgPool,
     rabbit: &RabbitAdapter,
@@ -98,14 +88,8 @@ pub async fn admit_grant(
         .trusted_network_genesis
         .get(&grant.network_id)
         .context("network is not configured with a trusted Genesis authority")?;
-    validate_network_membership_grant_for_admission(
-        grant,
-        expected_genesis,
-        config.skip_grant_validation,
-    )?;
-    if !config.skip_grant_validation
-        && !db::principal_is_global_authority(pool, &grant.network_id, expected_genesis).await?
-    {
+    validate_network_membership_grant_for_admission(grant, expected_genesis)?;
+    if !db::principal_is_global_authority(pool, &grant.network_id, expected_genesis).await? {
         bail!("configured network Genesis authority is not active");
     }
 
@@ -175,19 +159,9 @@ fn validate_network_membership_grant(
 fn validate_network_membership_grant_for_admission(
     grant: &NetworkMembershipGrant,
     expected_issuer: &str,
-    skip_trusted_issuer_validation: bool,
 ) -> Result<()> {
-    if skip_trusted_issuer_validation {
-        return wattswarm_crypto::verify_network_membership_grant(
-            grant,
-            &grant.issuer_genesis_id,
-            now_ms(),
-        )
-        .context("local CS test Grant signature or structure is invalid");
-    }
     validate_network_membership_grant(grant, expected_issuer)
 }
-*/
 
 pub async fn send_control(
     pool: &PgPool,
@@ -204,13 +178,9 @@ pub async fn send_control(
     {
         bail!("control frame binding or size is invalid");
     }
-    // Temporarily disabled with Gateway Grant admission. The target mailbox
-    // is still created by RabbitMQ delivery code below.
-    /*
     if !db::principal_is_admitted(pool, &session.network_id, &frame.target_principal_id).await? {
         bail!("control target is not an active network member");
     }
-    */
     wattswarm_crypto::verify_signature(
         &frame.source_principal_id,
         &control_frame_signing_message(frame)?,
@@ -1296,12 +1266,8 @@ mod tests {
         )
     }
 
-    /*
-     * Temporarily disabled with the Grant admission flow. Keep this test for
-     * re-enabling after the Wattswarm Grant API is available at the pinned
-     * dependency revision.
     #[test]
-    fn local_grant_validation_bypass_accepts_only_a_self_signed_test_grant() {
+    fn grant_validation_requires_trusted_genesis_issuer() {
         let signer = NodeIdentity::random();
         let issued_at = now_ms();
         let principal_id = signer.node_id();
@@ -1320,16 +1286,9 @@ mod tests {
         .unwrap();
         let trusted_genesis = NodeIdentity::random().node_id();
 
-        assert!(
-            validate_network_membership_grant_for_admission(&grant, &trusted_genesis, true,)
-                .is_ok()
-        );
-        assert!(
-            validate_network_membership_grant_for_admission(&grant, &trusted_genesis, false,)
-                .is_err()
-        );
+        assert!(validate_network_membership_grant_for_admission(&grant, &signer.node_id()).is_ok());
+        assert!(validate_network_membership_grant_for_admission(&grant, &trusted_genesis).is_err());
     }
-    */
 
     #[test]
     fn rejects_route_author_signature_and_frame_forgery() {

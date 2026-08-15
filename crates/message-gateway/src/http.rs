@@ -18,7 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use wattswarm_network_client_server::{
     ChallengeRequest, ChallengeResponse, CommitRequest, ControlAcceptance, ControlFrame,
-    PublishAcceptance, PublishFrame, SessionProofRequest, SessionResponse,
+    GrantAdmissionRequest, GrantAdmissionResponse, PublishAcceptance, PublishFrame,
+    SessionProofRequest, SessionResponse,
 };
 use wattswarm_network_transport_core::MailboxBinding;
 use wattswarm_network_transport_core::{DeliveryClass, DeliveryPage};
@@ -33,9 +34,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        // Temporarily disabled until the Wattswarm Grant API is published at
-        // the pinned revision used by the production Docker build. Keep the
-        // implementation below for re-enabling with the matching revision.
+        .route("/v1/admission/grant", post(admit_grant))
         .route("/v1/session/challenge", post(challenge))
         .route("/v1/session/proof", post(proof))
         .route("/v1/publish", post(publish))
@@ -58,11 +57,6 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({"ok": true, "service": "wattswarm-message-gateway"}))
 }
 
-/*
- * Temporarily disabled: this endpoint depends on NetworkMembershipGrant types
- * that are not available in the Wattswarm revision pinned by the production
- * Docker build. Do not remove; re-enable after the Wattswarm Grant changes are
- * published and the Docker pin is advanced.
 async fn admit_grant(
     State(state): State<AppState>,
     Json(request): Json<GrantAdmissionRequest>,
@@ -71,7 +65,6 @@ async fn admit_grant(
         service::admit_grant(&state.pool, &state.rabbit, &state.config, &request).await?,
     ))
 }
-*/
 
 async fn challenge(
     State(state): State<AppState>,
