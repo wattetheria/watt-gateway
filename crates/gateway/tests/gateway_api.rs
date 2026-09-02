@@ -29,7 +29,7 @@ use wattetheria_gateway::models::{
 };
 use wattetheria_gateway::node_client::NodeClient;
 use wattetheria_gateway::registry_client::RegistryClient;
-use wattetheria_gateway::state::AppState;
+use wattetheria_gateway::state::{AppState, UiStreamHub};
 use wattetheria_gateway::verify::{canonical_bytes, verify_signed_gateway_manifest};
 use wattswarm_artifact_store::ArtifactStore;
 use wattswarm_network_transport_core::{PeerTransportCapabilities, TransportContactMaterial};
@@ -506,6 +506,13 @@ async fn ingest_snapshot_accepts_push_without_registered_source() {
     let network_status = request(&app, "GET", "/api/network/status").await;
     assert_eq!(network_status.1["nodes"].as_u64(), Some(1));
 
+    let pool = db.pool().await;
+    let outbox_count: i64 = sqlx::query_scalar("select count(*) from gateway_p2p_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(outbox_count, 0);
+
     db.cleanup().await;
 }
 
@@ -526,7 +533,7 @@ async fn ingest_snapshot_announces_applied_snapshot_to_p2p_sync() {
         gateway_identity: None,
         gateway_network: None,
         gateway_sync_tx: Some(gateway_sync_tx),
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     });
     let snapshot = signed_snapshot(
         "node-p2p-announce",
@@ -557,20 +564,21 @@ async fn ingest_snapshot_announces_applied_snapshot_to_p2p_sync() {
         .await
         .unwrap()
         .unwrap();
-    match command {
-        GatewayP2pSyncCommand::SnapshotApplied {
-            node_id,
-            signer_agent_did,
-            generated_at,
-        } => {
-            assert_eq!(node_id, "node-p2p-announce");
-            assert_eq!(signer_agent_did, snapshot.signer_agent_did);
-            assert_eq!(generated_at, snapshot.payload.generated_at);
-        }
-        GatewayP2pSyncCommand::EventApplied { .. } => {
-            panic!("expected snapshot p2p sync command")
-        }
-    }
+    let GatewayP2pSyncCommand = command;
+
+    let pool = db.pool().await;
+    let row: (String, serde_json::Value) = sqlx::query_as(
+        "select command_kind, payload from gateway_p2p_outbox where dedupe_key = $1",
+    )
+    .bind(format!(
+        "snapshot:{}:{}",
+        snapshot.payload.node_id, snapshot.payload.generated_at
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, db::P2P_OUTBOX_COMMAND_SNAPSHOT);
+    assert_eq!(row.1["node_id"].as_str(), Some("node-p2p-announce"));
 
     db.cleanup().await;
 }
@@ -592,7 +600,7 @@ async fn ingest_node_event_announces_applied_event_to_p2p_sync() {
         gateway_identity: None,
         gateway_network: None,
         gateway_sync_tx: Some(gateway_sync_tx),
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     });
     let event = signed_node_event(
         "node-p2p-event",
@@ -614,17 +622,159 @@ async fn ingest_node_event_announces_applied_event_to_p2p_sync() {
         .await
         .unwrap()
         .unwrap();
-    match command {
-        GatewayP2pSyncCommand::EventApplied { event: announced } => {
-            assert_eq!(announced.payload.event_id, event.payload.event_id);
-            assert_eq!(announced.payload.node_id, "node-p2p-event");
-            assert_eq!(announced.signature, event.signature);
-        }
-        GatewayP2pSyncCommand::SnapshotApplied { .. } => {
-            panic!("expected event p2p sync command")
-        }
+    let GatewayP2pSyncCommand = command;
+
+    let pool = db.pool().await;
+    let row: (String, serde_json::Value) = sqlx::query_as(
+        "select command_kind, payload from gateway_p2p_outbox where dedupe_key = $1",
+    )
+    .bind(format!("event:{}", event.payload.event_id))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, db::P2P_OUTBOX_COMMAND_EVENT);
+    assert_eq!(row.1["payload"]["event_id"], event.payload.event_id);
+    assert_eq!(row.1["signature"], event.signature);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn p2p_outbox_claim_ack_release_and_retry_limit_are_consistent() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    for index in 0..2 {
+        sqlx::query(
+            r#"
+            insert into gateway_p2p_outbox (dedupe_key, command_kind, payload)
+            values ($1, $2, $3)
+            "#,
+        )
+        .bind(format!("test-outbox-{index}"))
+        .bind(db::P2P_OUTBOX_COMMAND_EVENT)
+        .bind(sqlx::types::Json(json!({"index": index})))
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
+    let (first_claim, second_claim) = tokio::join!(
+        db::claim_p2p_outbox(&pool, 1),
+        db::claim_p2p_outbox(&pool, 1)
+    );
+    let first = first_claim.unwrap().pop().unwrap();
+    let second = second_claim.unwrap().pop().unwrap();
+    assert_ne!(first.id, second.id);
+    assert_eq!(first.attempts, 1);
+    assert_eq!(second.attempts, 1);
+    assert!(db::claim_p2p_outbox(&pool, 2).await.unwrap().is_empty());
+
+    assert!(!db::release_p2p_outbox(&pool, first.id).await.unwrap());
+    assert!(db::claim_p2p_outbox(&pool, 1).await.unwrap().is_empty());
+    sqlx::query(
+        "update gateway_p2p_outbox set claimed_until = now() - interval '1 second' where id = $1",
+    )
+    .bind(first.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let retried = db::claim_p2p_outbox(&pool, 1).await.unwrap().pop().unwrap();
+    assert_eq!(retried.id, first.id);
+    assert_eq!(retried.attempts, 2);
+    db::ack_p2p_outbox(&pool, retried.id).await.unwrap();
+
+    sqlx::query("update gateway_p2p_outbox set attempts = $2, claimed_until = null where id = $1")
+        .bind(second.id)
+        .bind(db::P2P_OUTBOX_MAX_ATTEMPTS - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let exhausted = db::claim_p2p_outbox(&pool, 1).await.unwrap().pop().unwrap();
+    assert_eq!(exhausted.attempts, db::P2P_OUTBOX_MAX_ATTEMPTS);
+    assert!(db::release_p2p_outbox(&pool, exhausted.id).await.unwrap());
+
+    let remaining: i64 = sqlx::query_scalar("select count(*) from gateway_p2p_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+
+    drop(pool);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn earliest_ui_event_cursor_stops_at_first_visible_source_event() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let suspended_source_id = uuid::Uuid::new_v4();
+    let active_source_id = uuid::Uuid::new_v4();
+    for (id, name, status) in [
+        (suspended_source_id, "suspended", "suspended"),
+        (active_source_id, "active", "active"),
+    ] {
+        db::insert_node_source(
+            &pool,
+            db::InsertNodeSourceRecord {
+                id,
+                name,
+                export_url: &format!("https://{name}.example/export"),
+                wattetheria_snapshot_export_url: None,
+                wattetheria_events_export_url: None,
+                wattswarm_ui_base_url: None,
+                wattswarm_sync_grpc_endpoint: None,
+                region: None,
+                expected_signer_agent_did: None,
+                expected_wattswarm_node_id: None,
+                source_status: status,
+                transport_capabilities: None,
+                transport_contact_material: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for (source_id, event_id) in [
+        (suspended_source_id, "event-suspended"),
+        (active_source_id, "event-active"),
+    ] {
+        db::insert_ui_event(
+            &pool,
+            db::InsertUiEventRecord {
+                event_id,
+                source_id: Some(source_id),
+                node_id: "node-cursor-test",
+                signer_agent_did: "did:key:cursor-test",
+                data_kind: "presence",
+                event_kind: "presence.updated",
+                visibility: "public",
+                provisional: false,
+                topic_id: None,
+                organization_id: None,
+                task_id: None,
+                generated_at: 1,
+                payload: &json!({"event_id": event_id}),
+                ingest_path: "test",
+                source_cursor_or_seq: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let active_cursor: i64 =
+        sqlx::query_scalar("select cursor from gateway_ui_events where event_id = 'event-active'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        db::earliest_ui_event_cursor(&pool).await.unwrap(),
+        Some(active_cursor)
+    );
+
+    drop(pool);
     db.cleanup().await;
 }
 
@@ -1059,7 +1209,7 @@ async fn ephemeral_only_events_are_streamed_without_persisting_ui_rows() {
         gateway_identity: None,
         gateway_network: None,
         gateway_sync_tx: None,
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     };
 
     let mut event = signed_node_event(
@@ -1086,11 +1236,88 @@ async fn ephemeral_only_events_are_streamed_without_persisting_ui_rows() {
     assert_eq!(streamed.event_id, event.payload.event_id);
     assert_eq!(streamed.cursor, 0);
 
+    let duplicate_cursor =
+        wattetheria_gateway::streaming::persist_signed_node_event(&state, &event, None, None)
+            .await
+            .unwrap();
+    assert_eq!(duplicate_cursor, None);
+    let duplicate_streamed = ui_stream_rx.recv().await.unwrap();
+    assert_eq!(duplicate_streamed.event_id, event.payload.event_id);
+    assert_eq!(duplicate_streamed.cursor, 0);
+
     let persisted_count: i64 = sqlx::query_scalar("select count(*) from gateway_ui_events")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(persisted_count, 0);
+
+    drop(pool);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn duplicate_event_from_shared_database_is_replayed_to_local_stream() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let (ui_stream_tx_a, _) = tokio::sync::broadcast::channel(64);
+    let (ui_stream_tx_b, mut ui_stream_rx_b) = tokio::sync::broadcast::channel(64);
+    let (gateway_sync_tx, _gateway_sync_rx) = tokio::sync::mpsc::channel(8);
+    let state_a = AppState {
+        pool: pool.clone(),
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: Some(gateway_sync_tx),
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx_a),
+    };
+    let state_b = AppState {
+        pool: pool.clone(),
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: Some("registry-secret".to_string()),
+        bootstrap_registry_urls: Vec::new(),
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: None,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx_b),
+    };
+    let event = signed_node_event(
+        "node-shared-db",
+        DataKind::MissionLifecycle,
+        "mission.published",
+        json!({"id":"mission-shared-db","status":"published"}),
+    );
+
+    let first_cursor =
+        wattetheria_gateway::streaming::persist_signed_node_event(&state_a, &event, None, None)
+            .await
+            .unwrap();
+    assert!(first_cursor.is_some());
+    let outbox_count: i64 = sqlx::query_scalar(
+        "select count(*) from gateway_p2p_outbox where command_kind = 'event_v1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outbox_count, 1);
+
+    let duplicate_cursor =
+        wattetheria_gateway::streaming::persist_signed_node_event(&state_b, &event, None, None)
+            .await
+            .unwrap();
+    assert_eq!(duplicate_cursor, None);
+    let streamed = tokio::time::timeout(std::time::Duration::from_secs(1), ui_stream_rx_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(streamed.event_id, event.payload.event_id);
 
     drop(pool);
     db.cleanup().await;
@@ -2176,7 +2403,7 @@ async fn test_app(database_url: &str) -> Router {
         gateway_identity: None,
         gateway_network: None,
         gateway_sync_tx: None,
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     })
 }
 
@@ -2215,7 +2442,7 @@ async fn test_app_with_identity(database_url: &str) -> Router {
         gateway_identity,
         gateway_network: None,
         gateway_sync_tx: None,
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     })
 }
 
@@ -2237,7 +2464,7 @@ async fn test_app_with_identity_and_federation_peers(
         gateway_identity,
         gateway_network: None,
         gateway_sync_tx: None,
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     })
 }
 
@@ -2289,7 +2516,7 @@ async fn test_app_with_identity_and_bootstrap(
         gateway_identity,
         gateway_network: None,
         gateway_sync_tx: None,
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     })
 }
 
@@ -2324,7 +2551,7 @@ async fn test_app_with_network(
         gateway_identity: None,
         gateway_network: Some(gateway_network.clone()),
         gateway_sync_tx: None,
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     });
     (app, runtime, gateway_network)
 }

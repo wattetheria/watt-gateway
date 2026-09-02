@@ -3,11 +3,15 @@ use crate::models::{
     SignedGatewayManifest, SnapshotRow, UiEventRow,
 };
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+pub const P2P_OUTBOX_COMMAND_SNAPSHOT: &str = "snapshot_announce_v1";
+pub const P2P_OUTBOX_COMMAND_EVENT: &str = "event_v1";
+pub const P2P_OUTBOX_MAX_ATTEMPTS: i32 = 10;
 
 pub struct UpsertSnapshotRecord<'a> {
     pub source_id: Option<Uuid>,
@@ -90,6 +94,28 @@ pub struct InsertAuditRecord<'a> {
     pub provenance: &'a Value,
 }
 
+pub struct InsertP2pOutboxRecord<'a> {
+    pub dedupe_key: &'a str,
+    pub command_kind: &'a str,
+    pub payload: &'a Value,
+}
+
+pub struct SnapshotP2pAnnouncement<'a> {
+    pub node_id: &'a str,
+    pub signer_agent_did: &'a str,
+    pub generated_at: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct P2pOutboxRow {
+    pub id: i64,
+    pub dedupe_key: String,
+    pub command_kind: String,
+    pub payload: sqlx::types::Json<Value>,
+    pub attempts: i32,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatewayHealthCounts {
     pub source_count: i64,
@@ -125,7 +151,7 @@ pub async fn max_ui_event_source_seq(
 
 pub async fn connect(database_url: &str) -> Result<PgPool> {
     Ok(PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(20)
         .connect(database_url)
         .await?)
 }
@@ -344,6 +370,46 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    for (name, column) in [
+        ("idx_gateway_ui_events_node_cursor", "node_id"),
+        ("idx_gateway_ui_events_topic_cursor", "topic_id"),
+        (
+            "idx_gateway_ui_events_organization_cursor",
+            "organization_id",
+        ),
+        ("idx_gateway_ui_events_task_cursor", "task_id"),
+    ] {
+        let query = format!(
+            "create index if not exists {name} on gateway_ui_events({column}, cursor desc);"
+        );
+        sqlx::query(&query).execute(pool).await?;
+    }
+
+    sqlx::query(
+        r#"
+        create table if not exists gateway_p2p_outbox (
+            id bigserial primary key,
+            dedupe_key text not null unique,
+            command_kind text not null,
+            payload jsonb not null,
+            attempts integer not null default 0,
+            claimed_until timestamptz null,
+            created_at timestamptz not null default now()
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        create index if not exists idx_gateway_p2p_outbox_claim
+        on gateway_p2p_outbox(claimed_until, id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         r#"
         create table if not exists gateway_ingest_audit (
@@ -395,6 +461,14 @@ pub async fn init_schema(pool: &PgPool) -> Result<()> {
     sqlx::query(
         r#"
         create index if not exists idx_node_snapshots_node_id on node_snapshots(node_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        create index if not exists idx_node_snapshots_ingested_node
+        on node_snapshots(ingested_at asc, node_id asc);
         "#,
     )
     .execute(pool)
@@ -682,6 +756,23 @@ pub async fn update_source_sync_status(
 }
 
 pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) -> Result<bool> {
+    upsert_snapshot_inner(pool, record, None).await
+}
+
+pub async fn upsert_snapshot_with_p2p_outbox(
+    pool: &PgPool,
+    record: UpsertSnapshotRecord<'_>,
+    announcement: SnapshotP2pAnnouncement<'_>,
+) -> Result<bool> {
+    upsert_snapshot_inner(pool, record, Some(announcement)).await
+}
+
+async fn upsert_snapshot_inner(
+    pool: &PgPool,
+    record: UpsertSnapshotRecord<'_>,
+    announcement: Option<SnapshotP2pAnnouncement<'_>>,
+) -> Result<bool> {
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         r#"
         insert into node_snapshots (
@@ -717,9 +808,34 @@ pub async fn upsert_snapshot(pool: &PgPool, record: UpsertSnapshotRecord<'_>) ->
     .bind(record.generated_at)
     .bind(sqlx::types::Json(record.payload))
     .bind(record.signature)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
-    Ok(result.rows_affected() > 0)
+    let applied = result.rows_affected() > 0;
+    if applied && let Some(announcement) = announcement {
+        let payload = serde_json::json!({
+            "node_id": announcement.node_id,
+            "signer_agent_did": announcement.signer_agent_did,
+            "generated_at": announcement.generated_at,
+        });
+        let dedupe_key = format!(
+            "snapshot:{}:{}",
+            announcement.node_id, announcement.generated_at
+        );
+        sqlx::query(
+            r#"
+            insert into gateway_p2p_outbox (dedupe_key, command_kind, payload)
+            values ($1, $2, $3)
+            on conflict (dedupe_key) do nothing
+            "#,
+        )
+        .bind(dedupe_key)
+        .bind(P2P_OUTBOX_COMMAND_SNAPSHOT)
+        .bind(sqlx::types::Json(payload))
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(applied)
 }
 
 pub async fn list_snapshots(pool: &PgPool) -> Result<Vec<SnapshotRow>> {
@@ -786,6 +902,85 @@ pub async fn list_visible_snapshots(pool: &PgPool) -> Result<Vec<SnapshotRow>> {
         order by ingested_at desc
         "#,
     )
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn list_visible_snapshots_updated_after(
+    pool: &PgPool,
+    ingested_after: DateTime<Utc>,
+    node_id_after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<SnapshotRow>> {
+    Ok(sqlx::query_as::<_, SnapshotRow>(
+        r#"
+        select
+            source_id,
+            node_id,
+            signer_agent_did,
+            public_key,
+            generated_at,
+            ingested_at,
+            payload,
+            signature
+        from node_snapshots
+        where (
+            ingested_at > $1
+            or (ingested_at = $1 and node_id > coalesce($2::text, ''))
+        )
+          and (
+            source_id is null
+            or exists (
+                select 1
+                from node_sources
+                where node_sources.id = node_snapshots.source_id
+                  and node_sources.source_status = 'active'
+            )
+          )
+        order by ingested_at asc, node_id asc
+        limit $3
+        "#,
+    )
+    .bind(ingested_after)
+    .bind(node_id_after)
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn list_visible_snapshots_after_node_id(
+    pool: &PgPool,
+    node_id_after: &str,
+    limit: i64,
+) -> Result<Vec<SnapshotRow>> {
+    Ok(sqlx::query_as::<_, SnapshotRow>(
+        r#"
+        select
+            source_id,
+            node_id,
+            signer_agent_did,
+            public_key,
+            generated_at,
+            ingested_at,
+            payload,
+            signature
+        from node_snapshots
+        where node_id > $1
+          and (
+            source_id is null
+            or exists (
+                select 1
+                from node_sources
+                where node_sources.id = node_snapshots.source_id
+                  and node_sources.source_status = 'active'
+            )
+          )
+        order by node_id asc
+        limit $2
+        "#,
+    )
+    .bind(node_id_after)
+    .bind(limit.max(1))
     .fetch_all(pool)
     .await?)
 }
@@ -895,6 +1090,23 @@ pub async fn insert_ui_event(
     pool: &PgPool,
     record: InsertUiEventRecord<'_>,
 ) -> Result<Option<UiEventRow>> {
+    insert_ui_event_inner(pool, record, None).await
+}
+
+pub async fn insert_ui_event_with_p2p_outbox(
+    pool: &PgPool,
+    record: InsertUiEventRecord<'_>,
+    outbox: InsertP2pOutboxRecord<'_>,
+) -> Result<Option<UiEventRow>> {
+    insert_ui_event_inner(pool, record, Some(outbox)).await
+}
+
+async fn insert_ui_event_inner(
+    pool: &PgPool,
+    record: InsertUiEventRecord<'_>,
+    outbox: Option<InsertP2pOutboxRecord<'_>>,
+) -> Result<Option<UiEventRow>> {
+    let mut transaction = pool.begin().await?;
     let row = sqlx::query_as::<_, UiEventRow>(
         r#"
         insert into gateway_ui_events (
@@ -950,8 +1162,27 @@ pub async fn insert_ui_event(
     .bind(sqlx::types::Json(record.payload))
     .bind(record.ingest_path)
     .bind(record.source_cursor_or_seq)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await?;
+
+    if row.is_some()
+        && let Some(outbox) = outbox
+    {
+        sqlx::query(
+            r#"
+            insert into gateway_p2p_outbox (dedupe_key, command_kind, payload)
+            values ($1, $2, $3)
+            on conflict (dedupe_key) do nothing
+            "#,
+        )
+        .bind(outbox.dedupe_key)
+        .bind(outbox.command_kind)
+        .bind(sqlx::types::Json(outbox.payload))
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+
     if row.is_some() {
         let provenance = serde_json::json!({
             "source_cursor_or_seq": record.source_cursor_or_seq,
@@ -975,6 +1206,96 @@ pub async fn insert_ui_event(
         .await?;
     }
     Ok(row)
+}
+
+pub async fn get_ui_event_by_id(pool: &PgPool, event_id: &str) -> Result<Option<UiEventRow>> {
+    Ok(sqlx::query_as::<_, UiEventRow>(
+        r#"
+        select
+            cursor,
+            event_id,
+            source_id,
+            node_id,
+            signer_agent_did,
+            data_kind,
+            event_kind,
+            visibility,
+            provisional,
+            topic_id,
+            organization_id,
+            task_id,
+            generated_at,
+            ingested_at,
+            payload,
+            ingest_path,
+            source_cursor_or_seq
+        from gateway_ui_events
+        where event_id = $1
+        "#,
+    )
+    .bind(event_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn claim_p2p_outbox(pool: &PgPool, limit: i64) -> Result<Vec<P2pOutboxRow>> {
+    let mut transaction = pool.begin().await?;
+    let rows = sqlx::query_as::<_, P2pOutboxRow>(
+        r#"
+        with candidates as (
+            select id
+            from gateway_p2p_outbox
+            where claimed_until is null or claimed_until < now()
+            order by id asc
+            limit $1
+            for update skip locked
+        )
+        update gateway_p2p_outbox as outbox
+        set
+            claimed_until = now() + interval '30 seconds',
+            attempts = outbox.attempts + 1
+        from candidates
+        where outbox.id = candidates.id
+        returning
+            outbox.id,
+            outbox.dedupe_key,
+            outbox.command_kind,
+            outbox.payload,
+            outbox.attempts,
+            outbox.created_at
+        "#,
+    )
+    .bind(limit.max(1))
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(rows)
+}
+
+pub async fn ack_p2p_outbox(pool: &PgPool, id: i64) -> Result<()> {
+    sqlx::query("delete from gateway_p2p_outbox where id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn release_p2p_outbox(pool: &PgPool, id: i64) -> Result<bool> {
+    let deleted = sqlx::query("delete from gateway_p2p_outbox where id = $1 and attempts >= $2")
+        .bind(id)
+        .bind(P2P_OUTBOX_MAX_ATTEMPTS)
+        .execute(pool)
+        .await?;
+    if deleted.rows_affected() > 0 {
+        return Ok(true);
+    }
+    sqlx::query(
+        "update gateway_p2p_outbox set claimed_until = now() + interval '5 seconds' where id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(false)
 }
 
 pub async fn list_ui_events_after(
@@ -1033,9 +1354,9 @@ pub async fn list_ui_events_after(
 }
 
 pub async fn earliest_ui_event_cursor(pool: &PgPool) -> Result<Option<i64>> {
-    let row = sqlx::query(
+    let row = sqlx::query_scalar(
         r#"
-        select min(cursor) as earliest_cursor
+        select cursor
         from gateway_ui_events
         where source_id is null
            or exists (
@@ -1044,11 +1365,13 @@ pub async fn earliest_ui_event_cursor(pool: &PgPool) -> Result<Option<i64>> {
                 where node_sources.id = gateway_ui_events.source_id
                   and node_sources.source_status = 'active'
            )
+        order by cursor asc
+        limit 1
         "#,
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
-    Ok(row.try_get("earliest_cursor")?)
+    Ok(row)
 }
 
 pub async fn upsert_gateway_manifest(

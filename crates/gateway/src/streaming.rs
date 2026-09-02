@@ -99,6 +99,7 @@ async fn persist_signed_node_event_with_options(
     expected_signer_agent_did: Option<&str>,
     announce_p2p: bool,
 ) -> Result<Option<i64>> {
+    let announce_p2p = announce_p2p && state.gateway_sync_tx.is_some();
     let resolved_source = if source_id.is_none() && expected_signer_agent_did.is_none() {
         db::find_node_source_for_identity(
             &state.pool,
@@ -167,29 +168,45 @@ async fn persist_signed_node_event_with_options(
         });
         return Ok(None);
     }
-    let inserted = db::insert_ui_event(
-        &state.pool,
-        db::InsertUiEventRecord {
-            event_id: &event.payload.event_id,
-            source_id,
-            node_id: &event.payload.node_id,
-            signer_agent_did: &event.payload.signer_agent_did,
-            data_kind: &data_kind,
-            event_kind: &event.payload.event_kind,
-            visibility: &visibility,
-            provisional,
-            topic_id: scope.topic_id.as_deref(),
-            organization_id: scope.organization_id.as_deref(),
-            task_id: scope.task_id.as_deref(),
-            generated_at: event.payload.timestamp,
-            payload: &event.payload.payload,
-            ingest_path: "event_push",
-            source_cursor_or_seq: i64::try_from(event.payload.seq).ok(),
-        },
-    )
-    .await?;
+    let record = db::InsertUiEventRecord {
+        event_id: &event.payload.event_id,
+        source_id,
+        node_id: &event.payload.node_id,
+        signer_agent_did: &event.payload.signer_agent_did,
+        data_kind: &data_kind,
+        event_kind: &event.payload.event_kind,
+        visibility: &visibility,
+        provisional,
+        topic_id: scope.topic_id.as_deref(),
+        organization_id: scope.organization_id.as_deref(),
+        task_id: scope.task_id.as_deref(),
+        generated_at: event.payload.timestamp,
+        payload: &event.payload.payload,
+        ingest_path: "event_push",
+        source_cursor_or_seq: i64::try_from(event.payload.seq).ok(),
+    };
+    let inserted = if announce_p2p {
+        let event_json = serde_json::to_value(event)?;
+        db::insert_ui_event_with_p2p_outbox(
+            &state.pool,
+            record,
+            db::InsertP2pOutboxRecord {
+                dedupe_key: &format!("event:{}", event.payload.event_id),
+                command_kind: db::P2P_OUTBOX_COMMAND_EVENT,
+                payload: &event_json,
+            },
+        )
+        .await?
+    } else {
+        db::insert_ui_event(&state.pool, record).await?
+    };
     let Some(row) = inserted else {
         materialize_event_projection(state, event, source_id, provisional).await?;
+        if let Some(existing_row) =
+            db::get_ui_event_by_id(&state.pool, &event.payload.event_id).await?
+        {
+            state.publish_ui_event(GatewayUiEvent::try_from(existing_row)?);
+        }
         return Ok(None);
     };
     materialize_event_projection(state, event, source_id, provisional).await?;
@@ -207,11 +224,7 @@ async fn persist_signed_node_event_with_options(
         .publish_event("gateway.event.ingested", &bus_event)
         .await;
     if announce_p2p && let Some(tx) = &state.gateway_sync_tx {
-        let _ = tx
-            .send(crate::gateway_sync::GatewayP2pSyncCommand::EventApplied {
-                event: Box::new(event.clone()),
-            })
-            .await;
+        let _ = tx.try_send(crate::gateway_sync::GatewayP2pSyncCommand);
     }
     Ok(Some(row.cursor))
 }
@@ -621,12 +634,13 @@ async fn handle_ws(
     query: UiStreamQuery,
     allow_protected: bool,
 ) {
-    let mut receiver = state.ui_stream_tx.subscribe();
+    let mut receiver = state.ui_stream_tx.subscribe(query.data_kind);
     let earliest_available_cursor = db::earliest_ui_event_cursor(&state.pool)
         .await
         .ok()
         .flatten();
     let resume_rejection_reason = resume_rejection_reason(query.cursor, earliest_available_cursor);
+    let mut last_sent_cursor = query.cursor.unwrap_or_default();
     let hello = json!({
         "kind": "hello",
         "timestamp": Utc::now().timestamp(),
@@ -690,7 +704,9 @@ async fn handle_ws(
             let Ok(event) = GatewayUiEvent::try_from(row) else {
                 continue;
             };
-            if event_matches_query(&event, &query, allow_protected)
+            let cursor = event.cursor;
+            let matches_query = event_matches_query(&event, &query, allow_protected);
+            if matches_query
                 && socket
                     .send(Message::Text(
                         serde_json::to_string(&event).unwrap_or_default().into(),
@@ -700,18 +716,46 @@ async fn handle_ws(
             {
                 return;
             }
+            advance_last_sent_cursor(&mut last_sent_cursor, cursor, matches_query);
         }
     }
 
-    while let Ok(event) = receiver.recv().await {
-        if !event_matches_query(&event, &query, allow_protected) {
-            continue;
-        }
-        let Ok(payload) = serde_json::to_string(&event) else {
-            continue;
-        };
-        if socket.send(Message::Text(payload.into())).await.is_err() {
-            break;
+    loop {
+        match receiver.recv().await {
+            Ok(stream_event) => {
+                if stream_event.cursor > 0 && stream_event.cursor <= last_sent_cursor {
+                    continue;
+                }
+                if !event_matches_query(&stream_event, &query, allow_protected) {
+                    continue;
+                }
+                if socket
+                    .send(Message::Text(
+                        stream_event.payload.as_ref().to_owned().into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                advance_last_sent_cursor(&mut last_sent_cursor, stream_event.cursor, true);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let rejection = json!({
+                    "kind": "resume_rejected",
+                    "reason": "stream_lagged",
+                    "requested_cursor": last_sent_cursor,
+                    "earliest_available_cursor": earliest_available_cursor,
+                    "rebootstrap_required": true,
+                });
+                let _ = socket
+                    .send(Message::Text(rejection.to_string().into()))
+                    .await;
+                return;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return;
+            }
         }
     }
 }
@@ -756,6 +800,12 @@ fn event_matches_query(
         return false;
     }
     true
+}
+
+fn advance_last_sent_cursor(last_sent_cursor: &mut i64, cursor: i64, sent: bool) {
+    if sent && cursor > 0 {
+        *last_sent_cursor = (*last_sent_cursor).max(cursor);
+    }
 }
 
 fn resume_rejection_reason(
@@ -844,6 +894,15 @@ mod tests {
         assert_eq!(resume_rejection_reason(Some(10), Some(10)), None);
         assert_eq!(resume_rejection_reason(Some(12), Some(10)), None);
         assert_eq!(resume_rejection_reason(None, Some(10)), None);
+    }
+
+    #[test]
+    fn replay_cursor_only_advances_for_events_sent_to_client() {
+        let mut last_sent_cursor = 10;
+        advance_last_sent_cursor(&mut last_sent_cursor, 12, false);
+        assert_eq!(last_sent_cursor, 10);
+        advance_last_sent_cursor(&mut last_sent_cursor, 12, true);
+        assert_eq!(last_sent_cursor, 12);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use serde::{Serialize, de::DeserializeOwned};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_substrate::{
     GossipKind, NetworkNodeId, NetworkRuntimeObservabilitySnapshot, RawGossipMessage,
@@ -13,8 +14,8 @@ use wattswarm_network_transport_core::{
     TransportContactMaterial, TransportRoute, TransportRouter,
 };
 use wattswarm_network_transport_iroh::{
-    export_local_contact_material_for_network_peer_id, fetch_direct_data_for_network_peer_id,
-    shutdown_local_iroh_data_plane,
+    export_local_contact_material_for_network_peer_id,
+    fetch_direct_data_for_network_peer_id_with_timeout, shutdown_local_iroh_data_plane,
 };
 
 const NODE_SEED_FILE: &str = "node_seed.hex";
@@ -128,6 +129,12 @@ pub struct GatewayNetworkRuntime {
 pub struct GatewayNetworkGossip {
     pub propagation_source: NetworkNodeId,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum GatewayNetworkSyncEvent {
+    Gossip(GatewayNetworkGossip),
+    NeighborUp { peer: NetworkNodeId },
 }
 
 #[derive(Debug, Clone)]
@@ -260,24 +267,35 @@ impl GatewayNetworkRuntime {
             .publish(&SwarmScope::Global, GossipKind::Summaries, payload)
     }
 
-    pub async fn next_sync_summary(&mut self) -> Result<GatewayNetworkGossip> {
+    pub async fn next_sync_summary(&mut self) -> Result<GatewayNetworkSyncEvent> {
         loop {
-            if let SubstrateRuntimeEvent::Gossip {
-                propagation_source,
-                message:
-                    RawGossipMessage {
-                        scope: SwarmScope::Global,
-                        kind: GossipKind::Summaries,
-                        payload,
-                    },
-            } = self.inner.next_event().await?
-            {
-                return Ok(GatewayNetworkGossip {
-                    propagation_source,
-                    payload,
-                });
+            if let Some(event) = classify_sync_event(self.inner.next_event().await?) {
+                return Ok(event);
             }
         }
+    }
+}
+
+fn classify_sync_event(event: SubstrateRuntimeEvent) -> Option<GatewayNetworkSyncEvent> {
+    match event {
+        SubstrateRuntimeEvent::Gossip {
+            propagation_source,
+            message:
+                RawGossipMessage {
+                    scope: SwarmScope::Global,
+                    kind: GossipKind::Summaries,
+                    payload,
+                },
+        } => Some(GatewayNetworkSyncEvent::Gossip(GatewayNetworkGossip {
+            propagation_source,
+            payload,
+        })),
+        SubstrateRuntimeEvent::GossipNeighborUp {
+            peer,
+            scope: SwarmScope::Global,
+            kind: GossipKind::Summaries,
+        } => Some(GatewayNetworkSyncEvent::NeighborUp { peer }),
+        _ => None,
     }
 }
 
@@ -298,19 +316,27 @@ pub async fn fetch_signed_snapshot_via_iroh<T>(
 where
     T: DeserializeOwned,
 {
-    let response = fetch_direct_data_for_network_peer_id(
-        state_dir,
-        local_peer_id.as_str(),
-        remote_contact,
-        &DirectDataFetchRequest {
-            object_kind: DirectDataObjectKind::SnapshotJson,
-            object_id: snapshot_id.to_owned(),
-            scope: Some(PUBLIC_CLIENT_SNAPSHOT_SCOPE.to_owned()),
-            source_uri: None,
-            expected_digest: None,
-            expected_size: None,
-        },
-    )?;
+    let state_dir = state_dir.to_owned();
+    let local_peer_id = local_peer_id.clone();
+    let remote_contact = remote_contact.clone();
+    let snapshot_id = snapshot_id.to_owned();
+    let response = tokio::task::spawn_blocking(move || {
+        fetch_direct_data_for_network_peer_id_with_timeout(
+            &state_dir,
+            local_peer_id.as_str(),
+            &remote_contact,
+            &DirectDataFetchRequest {
+                object_kind: DirectDataObjectKind::SnapshotJson,
+                object_id: snapshot_id,
+                scope: Some(PUBLIC_CLIENT_SNAPSHOT_SCOPE.to_owned()),
+                source_uri: None,
+                expected_digest: None,
+                expected_size: None,
+            },
+            Duration::from_secs(30),
+        )
+    })
+    .await??;
     Ok(serde_json::from_slice(&response.bytes)?)
 }
 
@@ -385,4 +411,42 @@ fn open_local_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
     let store = ArtifactStore::new(artifact_store_path(state_dir));
     store.ensure_layout()?;
     Ok(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_event_classification_surfaces_summary_neighbors() {
+        let state_dir =
+            std::env::temp_dir().join(format!("gateway-p2p-sync-event-{}", rand::random::<u64>()));
+        let node = GatewayNetworkNode::generate(GatewayP2pConfig {
+            state_dir: state_dir.clone(),
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
+            ..Default::default()
+        })
+        .unwrap();
+        let peer = node.inner.local_peer_id();
+
+        let event = classify_sync_event(SubstrateRuntimeEvent::GossipNeighborUp {
+            peer: peer.clone(),
+            scope: SwarmScope::Global,
+            kind: GossipKind::Summaries,
+        });
+        assert!(matches!(
+            event,
+            Some(GatewayNetworkSyncEvent::NeighborUp { peer: actual }) if actual == peer
+        ));
+
+        let ignored = classify_sync_event(SubstrateRuntimeEvent::GossipNeighborUp {
+            peer,
+            scope: SwarmScope::Global,
+            kind: GossipKind::Events,
+        });
+        assert!(ignored.is_none());
+
+        drop(node);
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
 }

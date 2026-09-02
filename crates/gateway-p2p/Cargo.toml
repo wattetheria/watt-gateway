@@ -10,6 +10,7 @@ hex.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 wattswarm-artifact-store.workspace = true
 wattswarm-network-substrate.workspace = true
 wattswarm-network-transport-core.workspace = true

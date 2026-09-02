@@ -2,8 +2,11 @@ use anyhow::Context;
 use async_nats::ConnectOptions;
 use tracing::{info, warn};
 use wattetheria_gateway::{
-    config::Config, db, gateway_identity::GatewayIdentity, gateway_network, gateway_sync, http,
-    node_client, registry_client, state::AppState,
+    config::Config,
+    db,
+    gateway_identity::GatewayIdentity,
+    gateway_network, gateway_sync, http, node_client, registry_client,
+    state::{AppState, UiStreamHub},
 };
 
 #[tokio::main]
@@ -73,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         gateway_identity,
         gateway_network,
         gateway_sync_tx,
-        ui_stream_tx,
+        ui_stream_tx: UiStreamHub::new(ui_stream_tx),
     };
     if let (Some(runtime), Some(rx)) = (gateway_network_runtime, gateway_sync_rx) {
         tokio::spawn(gateway_sync::run_gateway_p2p_sync(

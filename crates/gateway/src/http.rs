@@ -931,24 +931,35 @@ async fn ingest_signed_snapshot_with_options(
     expected_signer_agent_did: Option<&str>,
     announce_p2p: bool,
 ) -> anyhow::Result<bool> {
+    let announce_p2p = announce_p2p && state.gateway_sync_tx.is_some();
     verify_signed_snapshot(snapshot, expected_signer_agent_did)?;
     let payload_json = serde_json::to_value(&snapshot.payload)?;
     if let Some(handle) = &state.gateway_network {
         persist_snapshot_artifact(&handle.state_dir, snapshot)?;
     }
-    let applied = db::upsert_snapshot(
-        &state.pool,
-        db::UpsertSnapshotRecord {
-            source_id,
-            node_id: &snapshot.payload.node_id,
-            signer_agent_did: &snapshot.signer_agent_did,
-            public_key: &snapshot.payload.public_key,
-            generated_at: snapshot.payload.generated_at,
-            payload: &payload_json,
-            signature: &snapshot.signature,
-        },
-    )
-    .await?;
+    let record = db::UpsertSnapshotRecord {
+        source_id,
+        node_id: &snapshot.payload.node_id,
+        signer_agent_did: &snapshot.signer_agent_did,
+        public_key: &snapshot.payload.public_key,
+        generated_at: snapshot.payload.generated_at,
+        payload: &payload_json,
+        signature: &snapshot.signature,
+    };
+    let applied = if announce_p2p {
+        db::upsert_snapshot_with_p2p_outbox(
+            &state.pool,
+            record,
+            db::SnapshotP2pAnnouncement {
+                node_id: &snapshot.payload.node_id,
+                signer_agent_did: &snapshot.signer_agent_did,
+                generated_at: snapshot.payload.generated_at,
+            },
+        )
+        .await?
+    } else {
+        db::upsert_snapshot(&state.pool, record).await?
+    };
     if applied {
         persist_snapshot_read_models(&state.pool, source_id, &snapshot.payload).await?;
         let event = json!({
@@ -963,15 +974,7 @@ async fn ingest_signed_snapshot_with_options(
             .publish_event("gateway.snapshot.ingested", &event)
             .await;
         if announce_p2p && let Some(tx) = &state.gateway_sync_tx {
-            let _ = tx
-                .send(
-                    crate::gateway_sync::GatewayP2pSyncCommand::SnapshotApplied {
-                        node_id: snapshot.payload.node_id.clone(),
-                        signer_agent_did: snapshot.signer_agent_did.clone(),
-                        generated_at: snapshot.payload.generated_at,
-                    },
-                )
-                .await;
+            let _ = tx.try_send(crate::gateway_sync::GatewayP2pSyncCommand);
         }
     }
     Ok(applied)

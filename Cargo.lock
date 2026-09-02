@@ -7378,6 +7378,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "tokio",
  "wattswarm-artifact-store",
  "wattswarm-network-substrate",
  "wattswarm-network-transport-core",
