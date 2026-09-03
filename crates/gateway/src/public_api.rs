@@ -1,7 +1,7 @@
 use crate::contracts::DataKind;
 use crate::db;
 use crate::gateway_network::GatewayNetworkHandle;
-use crate::models::{GatewayRegistryEntry, ListQuery, TopicMessageQuery, TopicQuery};
+use crate::models::{BoardQuery, GatewayRegistryEntry, ListQuery, TopicMessageQuery, TopicQuery};
 use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -321,6 +321,13 @@ pub async fn public_hive_messages_by_query(
     aggregate_public_hive_messages_endpoint(&state, query).await
 }
 
+pub async fn public_board(
+    State(state): State<AppState>,
+    Query(query): Query<BoardQuery>,
+) -> Response {
+    aggregate_public_board_messages_endpoint(&state, query).await
+}
+
 pub async fn missions(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
     aggregate_federated_projection_endpoint(
         &state,
@@ -514,6 +521,49 @@ async fn aggregate_public_hive_messages_endpoint(
             dedupe_values_by_key(&mut values, topic_message_identity_key);
             values.truncate(query.limit.unwrap_or(500));
             values = values.into_iter().map(normalize_hive_value).collect();
+            axum::Json(values).into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn aggregate_public_board_messages_endpoint(state: &AppState, query: BoardQuery) -> Response {
+    let limit = query.limit.unwrap_or(500).clamp(1, 500);
+    match projection_values(state, DataKind::BoardActivity).await {
+        Ok(mut values) => {
+            if federation_enabled(query.federation.as_deref()) {
+                let mut params = vec![("limit", limit.to_string())];
+                if let Some(value) = query.network_id.as_deref() {
+                    params.push(("network_id", value.to_string()));
+                }
+                if let Some(value) = query.source.as_deref() {
+                    params.push(("source", value.to_string()));
+                }
+                if let Some(value) = query.category.as_deref() {
+                    params.push(("category", value.to_string()));
+                }
+                if let Some(value) = query.search.as_deref() {
+                    params.push(("search", value.to_string()));
+                }
+                if let Some(value) = query.service_name.as_deref() {
+                    params.push(("service_name", value.to_string()));
+                }
+                if let Some(value) = query.author_id.as_deref() {
+                    params.push(("author_id", value.to_string()));
+                }
+                values.extend(fetch_federated_arrays(state, "/api/board", params).await);
+            }
+            values.retain(|value| matches_board_filters(value, &query));
+            sort_values_desc_by_timestamp_with_fallback(
+                &mut values,
+                &["created_at", "sequence", "snapshot_generated_at"],
+            );
+            dedupe_values_by_key(&mut values, board_message_identity_key);
+            values.truncate(limit);
             axum::Json(values).into_response()
         }
         Err(error) => (
@@ -931,6 +981,48 @@ fn matches_hive_message_filters(value: &Value, query: &TopicMessageQuery) -> boo
     )
 }
 
+fn matches_board_filters(value: &Value, query: &BoardQuery) -> bool {
+    let source_matches = query.source.as_deref().is_none_or(|expected| {
+        let expected = if expected == "services" {
+            "service"
+        } else {
+            expected
+        };
+        matches_optional_string_filter(value, &["source"], Some(expected))
+    });
+    let search_matches = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none_or(|search| {
+            serde_json::to_string(value).is_ok_and(|serialized| {
+                serialized
+                    .to_ascii_lowercase()
+                    .contains(&search.to_ascii_lowercase())
+            })
+        });
+    source_matches
+        && search_matches
+        && matches_optional_string_filter(
+            value,
+            &["network_id", "networkId"],
+            query.network_id.as_deref(),
+        )
+        && matches_optional_string_filter(value, &["category"], query.category.as_deref())
+        && matches_optional_string_filter(value, &["service_name"], query.service_name.as_deref())
+        && matches_optional_string_filter(
+            value,
+            &[
+                "author_id",
+                "author_public_id",
+                "author_node_id",
+                "authorId",
+            ],
+            query.author_id.as_deref(),
+        )
+}
+
 fn matches_optional_string_filter(value: &Value, keys: &[&str], expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -1024,6 +1116,10 @@ fn topic_message_identity_key(value: &Value) -> Option<String> {
             .unwrap_or_default();
         Some(format!("{topic_id}:{author_id}:{timestamp}:{body}"))
     })
+}
+
+fn board_message_identity_key(value: &Value) -> Option<String> {
+    topic_key_from_value(value, &["message_id", "id"])
 }
 
 fn peer_identity_key(value: &Value) -> Option<String> {

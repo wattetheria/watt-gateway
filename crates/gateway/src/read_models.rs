@@ -117,6 +117,14 @@ pub fn snapshot_projection_seeds(
         source_id,
         &source_node_id,
         generated_at,
+        DataKind::BoardActivity,
+        &snapshot.public_board_messages,
+    );
+    fanout_array(
+        &mut seeds,
+        source_id,
+        &source_node_id,
+        generated_at,
         DataKind::TaskSummary,
         &snapshot.tasks,
     );
@@ -220,6 +228,12 @@ mod tests {
             public_blocks: vec![json!({"counterpart_public_id":"blocked-1"})],
             public_topics: vec![json!({"topic_id":"topic-1"})],
             public_topic_messages: vec![json!({"message_id":"topic-msg-1","topic_id":"topic-1"})],
+            public_board_messages: vec![json!({
+                "message_id": "board-msg-1",
+                "source": "network",
+                "category": "general",
+                "content": {"text": "board"},
+            })],
             swarm_task_activity: json!({}),
             tasks: vec![json!({"id":"task-1"})],
             organizations: vec![json!({"organization_id":"org-1"})],
@@ -239,6 +253,11 @@ mod tests {
             seeds
                 .iter()
                 .any(|seed| seed.data_kind == DataKind::TaskSummary)
+        );
+        assert!(
+            seeds
+                .iter()
+                .any(|seed| seed.data_kind == DataKind::BoardActivity)
         );
     }
 

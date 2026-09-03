@@ -32,6 +32,8 @@ pub struct PublicClientSnapshot {
     pub public_topics: Vec<Value>,
     #[serde(default)]
     pub public_topic_messages: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_board_messages: Vec<Value>,
     #[serde(default)]
     pub swarm_task_activity: Value,
     pub tasks: Vec<Value>,
@@ -299,6 +301,18 @@ pub struct TopicMessageQuery {
     pub topic_id: Option<String>,
     pub organization_id: Option<String>,
     pub author_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BoardQuery {
+    pub limit: Option<usize>,
+    pub network_id: Option<String>,
+    pub source: Option<String>,
+    pub category: Option<String>,
+    pub search: Option<String>,
+    pub service_name: Option<String>,
+    pub author_id: Option<String>,
+    pub federation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

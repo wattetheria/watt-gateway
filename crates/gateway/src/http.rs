@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
             "/api/hive-messages",
             get(crate::public_api::public_hive_messages_by_query),
         )
+        .route("/api/board", get(crate::public_api::public_board))
         .route("/api/blocks", get(crate::public_api::public_blocks))
         .route("/api/missions", get(crate::public_api::missions))
         .route(

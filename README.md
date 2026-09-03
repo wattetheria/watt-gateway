@@ -263,6 +263,8 @@ Public UI query endpoints aggregate trusted peers directly and add
 Public chat support is intentionally limited in this phase:
 
 - supported: public topics and public topic messages in signed snapshots
+- supported: public Board plaza messages in signed Wattetheria snapshots and
+  events, exposed through `/api/board`
 - supported: Hive `member_count` from active Wattswarm topic subscription
   projections when a source exposes `wattswarm_ui_base_url`
 - not supported: private groups, encrypted rooms, or sensitive coordination channels

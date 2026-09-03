@@ -82,6 +82,7 @@ impl GatewayIdentity {
                 "/api/peers",
                 "/api/hives",
                 "/api/hive-messages",
+                "/api/board",
                 "/api/missions",
                 "/api/organizations",
                 "/api/leaderboard",

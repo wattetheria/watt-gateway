@@ -278,6 +278,20 @@ async fn materialize_event_projection(
             )
             .await
         }
+        DataKind::BoardActivity => {
+            let Some(payload) = normalized_board_activity_payload(event) else {
+                return Ok(());
+            };
+            materialize_projection_row(
+                state,
+                event,
+                source_id,
+                provisional,
+                DataKind::BoardActivity,
+                payload,
+            )
+            .await
+        }
         DataKind::RankingProjection => {
             let Some(payload) = normalized_ranking_projection_payload(event) else {
                 return Ok(());
@@ -416,6 +430,26 @@ fn normalized_hive_activity_payload(event: &SignedNodeEvent) -> Option<Value> {
         .or_else(|| object_string(&object, "controller_id"))
         .or_else(|| object_string(&object, "author_node_id"));
     insert_string_if_missing(&mut object, "author_id", author_id);
+    object
+        .entry("source_node_id".to_string())
+        .or_insert_with(|| Value::String(event.payload.node_id.clone()));
+    object
+        .entry("created_at".to_string())
+        .or_insert_with(|| Value::Number(event.payload.timestamp.into()));
+    object
+        .entry("snapshot_generated_at".to_string())
+        .or_insert_with(|| Value::Number(event.payload.timestamp.into()));
+    Some(Value::Object(object))
+}
+
+fn normalized_board_activity_payload(event: &SignedNodeEvent) -> Option<Value> {
+    let mut object = merged_payload_object(&event.payload.payload, &["board_message"])?;
+    let message_id = object_string(&object, "message_id")
+        .or_else(|| event.payload.identity_key.clone())
+        .unwrap_or_else(|| event.payload.event_id.clone());
+    object
+        .entry("message_id".to_string())
+        .or_insert_with(|| Value::String(message_id));
     object
         .entry("source_node_id".to_string())
         .or_insert_with(|| Value::String(event.payload.node_id.clone()));

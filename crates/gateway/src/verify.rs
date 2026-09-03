@@ -198,6 +198,7 @@ mod tests {
             public_blocks: vec![],
             public_topics: vec![],
             public_topic_messages: vec![],
+            public_board_messages: vec![],
             swarm_task_activity: json!({}),
             tasks: vec![],
             organizations: vec![],

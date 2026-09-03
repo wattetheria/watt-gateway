@@ -1571,6 +1571,116 @@ async fn hive_message_event_materializes_topic_message_projection() {
 }
 
 #[tokio::test]
+async fn public_board_messages_are_ingested_from_signed_snapshot() {
+    let db = TestDatabase::new().await;
+    let snapshot = signed_snapshot_with_board(
+        "node-board-snapshot",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+        &[json!({
+            "message_id": "board-snapshot-1",
+            "source": "network",
+            "category": "general",
+            "network_id": "network-board",
+            "feed_key": "wattetheria.board.general",
+            "scope_hint": "group:board-general",
+            "author_node_id": "node-board-author",
+            "content": {"text": "snapshot board message"},
+            "created_at": 1_780_114_500
+        })],
+    );
+    let app = test_app(&db.database_url).await;
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&snapshot).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let board = request(
+        &app,
+        "GET",
+        "/api/board?source=network&category=general&network_id=network-board&limit=10&federation=local",
+    )
+    .await;
+    assert_eq!(board.0, StatusCode::OK);
+    assert_eq!(board.1.as_array().unwrap().len(), 1);
+    assert_eq!(board.1[0]["message_id"].as_str(), Some("board-snapshot-1"));
+    assert_eq!(board.1[0]["category"].as_str(), Some("general"));
+    assert_eq!(
+        board.1[0]["source_node_id"].as_str(),
+        Some("node-board-snapshot")
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn board_message_event_materializes_board_projection() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let mut event = signed_node_event(
+        "node-board-event",
+        DataKind::BoardActivity,
+        "board.message.posted",
+        json!({
+            "message_id": "board-event-1",
+            "author_node_id": "node-board-author",
+            "source": "service",
+            "category": "services",
+            "network_id": "network-board",
+            "service_name": "weather-agent",
+            "feed_key": "wattetheria.board.services",
+            "scope_hint": "group:board-services",
+            "content": {"text": "event board message"},
+            "created_at": 1_780_114_500
+        }),
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    event.payload.scope.task_id = None;
+    event.payload.identity_key = Some("board-event-1".to_string());
+    resign_node_event(&mut event);
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let board = request(
+        &app,
+        "GET",
+        "/api/board?source=services&service_name=weather-agent&limit=10&federation=local",
+    )
+    .await;
+    assert_eq!(board.0, StatusCode::OK);
+    assert_eq!(board.1.as_array().unwrap().len(), 1);
+    assert_eq!(board.1[0]["message_id"].as_str(), Some("board-event-1"));
+    assert_eq!(board.1[0]["source"].as_str(), Some("service"));
+    assert_eq!(
+        board.1[0]["source_node_id"].as_str(),
+        Some("node-board-event")
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn sync_nodes_reports_partial_when_wattswarm_collection_fails() {
     let db = TestDatabase::new().await;
     let snapshot = signed_snapshot(
@@ -2844,6 +2954,17 @@ fn signed_snapshot(node_id: &str, contents: SnapshotContents<'_>) -> SignedPubli
     signed_snapshot_at(node_id, 1_710_000_000, contents)
 }
 
+fn signed_snapshot_with_board(
+    node_id: &str,
+    contents: SnapshotContents<'_>,
+    board_messages: &[Value],
+) -> SignedPublicClientSnapshot {
+    let mut snapshot = signed_snapshot(node_id, contents);
+    snapshot.payload.public_board_messages = board_messages.to_vec();
+    resign_snapshot(&mut snapshot);
+    snapshot
+}
+
 fn signed_snapshot_at(
     node_id: &str,
     generated_at: i64,
@@ -2876,6 +2997,7 @@ fn signed_snapshot_at(
         public_blocks: contents.public_blocks.to_vec(),
         public_topics: contents.public_topics.to_vec(),
         public_topic_messages: contents.public_topic_messages.to_vec(),
+        public_board_messages: vec![],
         swarm_task_activity: contents.swarm_task_activity,
         tasks: contents.tasks.to_vec(),
         organizations: contents.organizations.to_vec(),
@@ -2891,6 +3013,15 @@ fn signed_snapshot_at(
         signature,
         signer_agent_did: did_key_from_public_key_b64(&public_key),
     }
+}
+
+fn resign_snapshot(snapshot: &mut SignedPublicClientSnapshot) {
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    snapshot.signature = base64::engine::general_purpose::STANDARD.encode(
+        signing_key
+            .sign(&canonical_bytes(&snapshot.payload).unwrap())
+            .to_bytes(),
+    );
 }
 
 fn signed_gateway_manifest(
