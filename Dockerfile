@@ -14,7 +14,7 @@ COPY crates/gateway-p2p/Cargo.toml crates/gateway-p2p/Cargo.toml
 # not depend on sibling directories from the host machine.
 RUN sed -i \
     -e '/"crates\/message-gateway",/d' \
-    -e 's|wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }|wattetheria-gateway-contract = { git = "https://github.com/wattetheria/wattetheria.git", package = "wattetheria-gateway-contract" }|' \
+    -e 's|wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }|wattetheria-gateway-contract = { git = "https://github.com/wattetheria/wattetheria.git", rev = "bb24ad1b36b8a843bc51ecdbc6461bbe3298e4b0", package = "wattetheria-gateway-contract" }|' \
     -e 's|watt-did = { path = "../watt-did" }|watt-did = { git = "https://github.com/wattetheria/watt-did.git" }|' \
     -e 's|wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }|wattswarm-artifact-store = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-artifact-store" }|' \
     -e 's|wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }|wattswarm-network-substrate = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-substrate" }|' \
@@ -49,7 +49,7 @@ COPY --from=cacher /app/target /app/target
 # dependency rewrite again before the final build.
 RUN sed -i \
     -e '/"crates\/message-gateway",/d' \
-    -e 's|wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }|wattetheria-gateway-contract = { git = "https://github.com/wattetheria/wattetheria.git", package = "wattetheria-gateway-contract" }|' \
+    -e 's|wattetheria-gateway-contract = { path = "../wattetheria/crates/gateway-contract" }|wattetheria-gateway-contract = { git = "https://github.com/wattetheria/wattetheria.git", rev = "bb24ad1b36b8a843bc51ecdbc6461bbe3298e4b0", package = "wattetheria-gateway-contract" }|' \
     -e 's|watt-did = { path = "../watt-did" }|watt-did = { git = "https://github.com/wattetheria/watt-did.git" }|' \
     -e 's|wattswarm-artifact-store = { path = "../wattswarm/crates/artifact-store" }|wattswarm-artifact-store = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-artifact-store" }|' \
     -e 's|wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }|wattswarm-network-substrate = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-substrate" }|' \
