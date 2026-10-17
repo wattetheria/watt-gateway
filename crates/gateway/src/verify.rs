@@ -10,6 +10,21 @@ pub fn canonical_bytes(payload: &impl serde::Serialize) -> Result<Vec<u8>> {
     Ok(json.into_bytes())
 }
 
+pub fn verify_signed_space_presence(
+    presence: &wattetheria_gateway_contract::SignedSpacePresence,
+) -> Result<()> {
+    let key = public_key_b64_from_did_key(&presence.record.agent_did)?;
+    if key != presence.public_key {
+        bail!("space presence agent_did does not resolve to public_key");
+    }
+    verify_canonical_signature(
+        &presence.record,
+        &presence.signature,
+        &presence.public_key,
+        "space presence signature",
+    )
+}
+
 pub fn verify_signed_snapshot(
     snapshot: &SignedPublicClientSnapshot,
     expected_signer_agent_did: Option<&str>,
@@ -42,8 +57,7 @@ pub fn verify_signed_snapshot(
         &snapshot.signature,
         &payload.public_key,
         "snapshot signature",
-    )?;
-    Ok(())
+    )
 }
 
 pub fn verify_signed_gateway_manifest(manifest: &SignedGatewayManifest) -> Result<()> {
@@ -188,10 +202,13 @@ mod tests {
         let payload = PublicClientSnapshot {
             generated_at: 1_710_000_000,
             node_id: "node-alpha".to_string(),
+            agent_identity: None,
+            public_id: None,
             public_key: public_key.clone(),
             network_name: None,
             network_org_name: None,
             network_status: json!({"total_nodes": 2, "active_nodes": 2, "health_percent": 100, "avg_latency_ms": 0}),
+            nodes: None,
             peers: vec![json!({"id":"peer-1"})],
             operator: json!({"id":"agent-root","display_name":"Agent Root"}),
             rpc_logs: vec![],
@@ -199,6 +216,9 @@ mod tests {
             public_topics: vec![],
             public_topic_messages: vec![],
             public_board_messages: vec![],
+            space_presences: vec![],
+            node_presence: None,
+            world_events: vec![],
             swarm_task_activity: json!({}),
             tasks: vec![],
             organizations: vec![],
@@ -252,6 +272,62 @@ mod tests {
         let snapshot: SignedPublicClientSnapshot = serde_json::from_value(snapshot_json).unwrap();
 
         verify_signed_snapshot(&snapshot, None).unwrap();
+    }
+
+    #[test]
+    fn original_snapshot_signature_preserves_identity_and_nodes_wire_shapes() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let public_key = STANDARD.encode(signing_key.verifying_key().as_bytes());
+        let agent_did = did_key_from_public_key_b64(&public_key);
+        for nodes in [None, Some(json!([])), Some(json!([{"id": "native-node"}]))] {
+            let mut payload = json!({
+                "generated_at": 1_710_000_000,
+                "node_id": "native-node",
+                "agent_identity": agent_did,
+                "public_id": "public-native-agent",
+                "public_key": public_key,
+                "network_status": {},
+                "peers": [],
+                "operator": {},
+                "rpc_logs": [],
+                "public_blocks": [],
+                "public_topics": [],
+                "public_topic_messages": [],
+                "swarm_task_activity": {},
+                "tasks": [],
+                "organizations": [],
+                "leaderboard": []
+            });
+            if let Some(nodes) = nodes {
+                payload["nodes"] = nodes;
+            }
+            let signature = STANDARD.encode(
+                signing_key
+                    .sign(&canonical_bytes(&payload).unwrap())
+                    .to_bytes(),
+            );
+            let original = json!({
+                "payload": payload,
+                "signature": signature,
+                "signer_agent_did": agent_did
+            });
+            let snapshot: SignedPublicClientSnapshot =
+                serde_json::from_value(original.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&snapshot).unwrap(), original);
+            verify_signed_snapshot(&snapshot, Some(&agent_did)).unwrap();
+            for (field, tampered_value) in [
+                ("agent_identity", json!("unsigned-identity")),
+                ("public_id", json!("unsigned-public-id")),
+                ("nodes", json!([{"id": "unsigned-node"}])),
+            ] {
+                let mut tampered = original.clone();
+                tampered["payload"][field] = tampered_value;
+                let tampered: SignedPublicClientSnapshot =
+                    serde_json::from_value(tampered).unwrap();
+                let error = verify_signed_snapshot(&tampered, None).unwrap_err();
+                assert!(format!("{error:#}").contains("verify snapshot signature"));
+            }
+        }
     }
 
     #[test]

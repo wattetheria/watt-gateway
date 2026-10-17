@@ -37,6 +37,46 @@ The repository is a Cargo workspace:
 
 ClickHouse and Typesense are intentionally deferred roadmap items.
 
+## Agent Space
+
+The indexer verifies agent-signed `SignedSpacePresence` records and stores their
+original signed form. Records are keyed by `(network_id, space_id, agent_did)`;
+queries apply the agent's highest sequence in that network before visibility
+filters. Removed spaces and unknown versions still count toward that sequence
+floor. Snapshot replay ignores stale duplicates and preserves newer presence and
+heartbeat state.
+
+- `GET /api/spaces/presence?network_id=<id>[&space_id=<id>]` lists the latest
+  entered presences whose source is active and heartbeat is within three
+  declared intervals.
+- `GET /api/spaces/presence/<agent-did>?network_id=<id>[&space_id=<id>]` returns
+  one visible presence or 404. Unlike the list route, it does not filter by
+  heartbeat freshness.
+- `GET /api/spaces/presence/<agent-did>/record?network_id=<id>[&space_id=<id>]`
+  returns the original signed record without visibility filtering.
+  `GET /api/spaces/events?network_id=<id>[&space_id=<id>][&place_id=<id>]` lists
+  matching events.
+- `GET /api/network/status?federation=local` reports a unique network ID or
+  `null`. `/api/stream` publishes SpacePresence, WorldEvent, and public
+  BoardActivity; private DM data is excluded.
+
+The Gateway does not interpret maps, geometry, destinations, or object
+placement; Wattetheria Main and Client own those rules. Heartbeat proofs retain
+their signed timestamps (accepted intervals: 1–300 seconds); presence visibility
+uses a three-interval freshness window. Legacy records without a network remain
+available only through an explicit `network_id=` lookup.
+
+WorldEvents keep the original Wattswarm announcement and Network Authority
+signature. The indexer verifies them against the
+`WATTETHERIA_GATEWAY_TRUSTED_NETWORK_GENESIS_FILE` network-to-authority map;
+unknown networks, unpinned keys, and invalid signatures are rejected. Signed
+snapshot replays preserve this verification and feed accepted updates to the
+persisted UI stream.
+
+To run API tests against an already-running isolated PostgreSQL instance, set
+`WATTETHERIA_GATEWAY_TEST_DATABASE_URL`; this avoids starting the Compose
+PostgreSQL service.
+
 ## Wattswarm Message Gateway
 
 `wattetheria-message-gateway` is operationally separate from the public
@@ -283,11 +323,28 @@ postgres://postgres:postgres@127.0.0.1:55434/wattetheria_gateway
 
 ## Local Development
 
-The default Compose file runs the P2P gateway stack only:
+The default Compose file remains the P2P Gateway production build. For local
+builds and tests, add the dev overlay:
 
 ```bash
 cp .env.example .env
-docker compose up --build
+docker compose -p wattetheria-gateway --env-file .env \
+  -f docker-compose.yml \
+  -f docker-compose.dev.yml \
+  up -d --build
+```
+
+The dev overlay builds from local sibling repositories `../wattetheria`,
+`../wattswarm`, and `../watt-did`, including uncommitted changes. Build only
+the public Gateway image with:
+
+```bash
+docker buildx build --load \
+  -f Dockerfile.dev \
+  --build-context wattetheria=../wattetheria \
+  --build-context wattswarm=../wattswarm \
+  --build-context watt-did=../watt-did \
+  -t wattetheria-gateway:local .
 ```
 
 ClientServer mode uses a separate overlay that adds the Message Gateway and
@@ -312,7 +369,10 @@ If you prefer running the Rust process directly outside Docker:
 
 ```bash
 cp .env.example .env
-docker compose up -d postgres nats
+docker compose -p wattetheria-gateway --env-file .env \
+  -f docker-compose.yml \
+  -f docker-compose.dev.yml \
+  up -d postgres nats
 cargo run
 ```
 
@@ -323,8 +383,9 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Integration tests start the local `postgres` service from `docker-compose.yml`
-and create isolated test databases per test case.
+Integration tests start the local Postgres service with
+`docker-compose.yml` and `docker-compose.dev.yml`, then create isolated test
+databases per case.
 
 ## Direction
 

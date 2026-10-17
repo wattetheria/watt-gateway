@@ -30,6 +30,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ingest/snapshot", post(ingest_snapshot))
         .route("/api/ingest/event", post(streaming::ingest_node_event))
         .route("/api/stream", get(streaming::stream))
+        .route("/api/spaces/presence", get(crate::space::presences))
+        .route(
+            "/api/spaces/presence/{agent_id}",
+            get(crate::space::agent_presence),
+        )
+        .route(
+            "/api/spaces/presence/{agent_id}/record",
+            get(crate::space::agent_presence_record),
+        )
+        .route("/api/spaces/events", get(crate::space::events))
         .route("/api/registry/self-manifest", get(self_manifest))
         .route("/api/registry/self-register", post(self_register_gateway))
         .route("/api/registry/bootstrap", get(list_bootstrap_registries))
@@ -962,7 +972,16 @@ async fn ingest_signed_snapshot_with_options(
         db::upsert_snapshot(&state.pool, record).await?
     };
     if applied {
-        persist_snapshot_read_models(&state.pool, source_id, &snapshot.payload).await?;
+        let space_rows = persist_snapshot_read_models(
+            &state.pool,
+            source_id,
+            &snapshot.payload,
+            &snapshot.signer_agent_did,
+        )
+        .await?;
+        for row in space_rows {
+            state.publish_ui_event(row.try_into()?);
+        }
         let event = json!({
             "event": "gateway.snapshot.ingested",
             "source_id": source_id,

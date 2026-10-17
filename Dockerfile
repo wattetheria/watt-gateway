@@ -20,6 +20,7 @@ RUN sed -i \
     -e 's|wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }|wattswarm-network-substrate = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-substrate" }|' \
     -e 's|wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }|wattswarm-network-transport-core = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-transport-core" }|' \
     -e 's|wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }|wattswarm-network-transport-iroh = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-transport-iroh" }|' \
+    -e 's|wattswarm-protocol = { path = "../wattswarm/crates/protocol" }|wattswarm-protocol = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-protocol" }|' \
     Cargo.toml
 
 RUN mkdir -p crates/gateway/src crates/gateway-p2p/src \
@@ -55,6 +56,7 @@ RUN sed -i \
     -e 's|wattswarm-network-substrate = { path = "../wattswarm/crates/network-substrate" }|wattswarm-network-substrate = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-substrate" }|' \
     -e 's|wattswarm-network-transport-core = { path = "../wattswarm/crates/network-transport-core" }|wattswarm-network-transport-core = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-transport-core" }|' \
     -e 's|wattswarm-network-transport-iroh = { path = "../wattswarm/crates/network-transport-iroh" }|wattswarm-network-transport-iroh = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-network-transport-iroh" }|' \
+    -e 's|wattswarm-protocol = { path = "../wattswarm/crates/protocol" }|wattswarm-protocol = { git = "https://github.com/wattetheria/wattswarm.git", package = "wattswarm-protocol" }|' \
     Cargo.toml
 
 RUN --mount=type=secret,id=github_token \

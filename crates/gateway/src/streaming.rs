@@ -123,6 +123,7 @@ async fn persist_signed_node_event_with_options(
             .and_then(|source| source.expected_signer_agent_did.as_deref())
     });
     verify_signed_node_event(event, expected_signer_agent_did)?;
+    crate::space::validate_event(event)?;
     if let Some(last_seq) =
         db::max_ui_event_source_seq(&state.pool, &event.payload.node_id, source_id).await?
         && i64::try_from(event.payload.seq)
@@ -154,6 +155,17 @@ async fn persist_signed_node_event_with_options(
         event.payload.provisional_policy,
         crate::contracts::ProvisionalExportPolicy::EphemeralOnly
     ) {
+        if event.payload.data_kind == DataKind::Presence
+            && event.payload.event_kind == "node.presence.heartbeat"
+            && !crate::space::persist_node_presence(
+                &state.pool,
+                &serde_json::from_value(event.payload.payload.clone())?,
+                source_id,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
         state.publish_ui_event(GatewayUiEvent {
             cursor: 0,
             event_id: event.payload.event_id.clone(),
@@ -185,7 +197,9 @@ async fn persist_signed_node_event_with_options(
         ingest_path: "event_push",
         source_cursor_or_seq: i64::try_from(event.payload.seq).ok(),
     };
-    let inserted = if announce_p2p {
+    let inserted = if crate::space::is_space_event(event) {
+        crate::space::persist_event(&state.pool, event, source_id, announce_p2p).await?
+    } else if announce_p2p {
         let event_json = serde_json::to_value(event)?;
         db::insert_ui_event_with_p2p_outbox(
             &state.pool,
@@ -201,6 +215,9 @@ async fn persist_signed_node_event_with_options(
         db::insert_ui_event(&state.pool, record).await?
     };
     let Some(row) = inserted else {
+        if crate::space::is_space_event(event) {
+            return Ok(None);
+        }
         materialize_event_projection(state, event, source_id, provisional).await?;
         if let Some(existing_row) =
             db::get_ui_event_by_id(&state.pool, &event.payload.event_id).await?
@@ -678,6 +695,7 @@ async fn handle_ws(
     let hello = json!({
         "kind": "hello",
         "timestamp": Utc::now().timestamp(),
+        "server_time_ms": Utc::now().timestamp_millis(),
         "cursor": query.cursor.unwrap_or_default(),
         "earliest_available_cursor": earliest_available_cursor,
         "replay_supported": true,

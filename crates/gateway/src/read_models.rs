@@ -21,7 +21,10 @@ pub async fn persist_snapshot_read_models(
     pool: &sqlx::PgPool,
     source_id: Option<Uuid>,
     snapshot: &PublicClientSnapshot,
-) -> Result<()> {
+    signer_agent_did: &str,
+) -> Result<Vec<crate::models::UiEventRow>> {
+    let space_rows =
+        crate::space::persist_snapshot_space(pool, source_id, snapshot, signer_agent_did).await?;
     for seed in snapshot_projection_seeds(source_id, snapshot) {
         let data_kind = serde_json::to_string(&seed.data_kind)?
             .trim_matches('"')
@@ -44,7 +47,7 @@ pub async fn persist_snapshot_read_models(
         )
         .await?;
     }
-    Ok(())
+    Ok(space_rows)
 }
 
 pub async fn list_projection_payloads(
@@ -216,12 +219,18 @@ mod tests {
 
     fn sample_snapshot() -> PublicClientSnapshot {
         PublicClientSnapshot {
+            space_presences: vec![],
+            node_presence: None,
+            world_events: vec![],
             generated_at: 1_710_000_000,
             node_id: "node-a".to_string(),
+            agent_identity: None,
+            public_id: None,
             public_key: "pk".to_string(),
             network_name: Some("testnet".to_string()),
             network_org_name: Some("org".to_string()),
             network_status: json!({"total_nodes": 1}),
+            nodes: None,
             peers: vec![json!({"id":"peer-1"})],
             operator: json!({"id":"operator-1"}),
             rpc_logs: vec![],

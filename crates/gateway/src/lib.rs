@@ -11,6 +11,7 @@ pub mod public_api;
 pub mod read_models;
 pub mod registry_client;
 pub mod source_policy;
+pub mod space;
 pub mod state;
 pub mod streaming;
 pub mod verify;

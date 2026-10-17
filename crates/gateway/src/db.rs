@@ -188,6 +188,7 @@ async fn migrate_generated_at_column_to_timestamptz(pool: &PgPool, table_name: &
 }
 
 pub async fn init_schema(pool: &PgPool) -> Result<()> {
+    crate::space::init_schema(pool).await?;
     sqlx::query(
         r#"
         create table if not exists node_sources (

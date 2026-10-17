@@ -190,6 +190,30 @@ pub struct DataKindPolicy {
 #[must_use]
 pub fn data_kind_metadata(kind: DataKind) -> DataKindMetadata {
     match kind {
+        DataKind::SpacePresence => DataKindMetadata {
+            kind,
+            domain: SemanticDomain::World,
+            stage: DataStage::ProductProjection,
+            visibility: Visibility::Public,
+            signing_authority: "agent identity key",
+            semantic_authority: "wattetheria space presence",
+            latency_class: LatencyClass::Warm,
+            consistency_class: ConsistencyClass::LocalCommit,
+            storage_shape: "space_presence_latest",
+            identity_fields: &["space_id", "agent_did"],
+            payload_version: 1,
+            provisional_export_policy: ProvisionalExportPolicy::NeverBeforeConfirmation,
+            retention_policy: RetentionPolicy::OverwriteLatest,
+            provenance_fields: DEFAULT_PROVENANCE_FIELDS,
+            sla_targets: WARM_PRODUCT_SLA,
+            primary_source: SourceSystem::Wattetheria,
+            fallback_source: None,
+            ingest_mode: GatewayIngestMode::EventPush,
+            ui_delivery_mode: UiDeliveryMode::WsStream,
+            hybrid_subtype: None,
+            game_client_stable: true,
+            pull_only_fallback_data: false,
+        },
         DataKind::Presence => DataKindMetadata {
             kind,
             domain: SemanticDomain::Social,
@@ -209,7 +233,7 @@ pub fn data_kind_metadata(kind: DataKind) -> DataKindMetadata {
             primary_source: SourceSystem::Hybrid,
             fallback_source: Some(SourceSystem::Wattetheria),
             ingest_mode: GatewayIngestMode::DerivedProjection,
-            ui_delivery_mode: UiDeliveryMode::RestPoll,
+            ui_delivery_mode: UiDeliveryMode::WsStream,
             hybrid_subtype: Some(HybridSubtype::Overlay),
             game_client_stable: true,
             pull_only_fallback_data: false,
@@ -584,7 +608,7 @@ pub fn data_kind_metadata(kind: DataKind) -> DataKindMetadata {
             primary_source: SourceSystem::Wattetheria,
             fallback_source: None,
             ingest_mode: GatewayIngestMode::SnapshotPush,
-            ui_delivery_mode: UiDeliveryMode::RestSnapshotBootstrap,
+            ui_delivery_mode: UiDeliveryMode::WsStream,
             hybrid_subtype: None,
             game_client_stable: true,
             pull_only_fallback_data: false,
@@ -716,7 +740,11 @@ pub fn data_kind_metadata(kind: DataKind) -> DataKindMetadata {
             domain: SemanticDomain::World,
             stage: DataStage::ProductProjection,
             visibility: Visibility::Public,
-            signing_authority: "wattetheria node key",
+            signing_authority: if matches!(kind, DataKind::WorldEvent) {
+                "trusted Network Authority key"
+            } else {
+                "wattetheria node key"
+            },
             semantic_authority: "world rule engine",
             latency_class: if matches!(kind, DataKind::GalaxyEvent) {
                 LatencyClass::Hot
@@ -741,16 +769,8 @@ pub fn data_kind_metadata(kind: DataKind) -> DataKindMetadata {
             },
             primary_source: SourceSystem::Wattetheria,
             fallback_source: None,
-            ingest_mode: if matches!(kind, DataKind::GalaxyEvent) {
-                GatewayIngestMode::EventPush
-            } else {
-                GatewayIngestMode::SnapshotPush
-            },
-            ui_delivery_mode: if matches!(kind, DataKind::GalaxyEvent) {
-                UiDeliveryMode::WsStream
-            } else {
-                UiDeliveryMode::RestSnapshotBootstrap
-            },
+            ingest_mode: GatewayIngestMode::EventPush,
+            ui_delivery_mode: UiDeliveryMode::WsStream,
             hybrid_subtype: None,
             game_client_stable: true,
             pull_only_fallback_data: false,

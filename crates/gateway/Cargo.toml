@@ -12,6 +12,7 @@ base64.workspace = true
 bs58.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
+hex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,6 +26,7 @@ wattetheria-gateway-contract.workspace = true
 wattetheria-gateway-p2p = { path = "../gateway-p2p" }
 watt-did.workspace = true
 wattswarm-network-transport-core.workspace = true
+wattswarm-protocol.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

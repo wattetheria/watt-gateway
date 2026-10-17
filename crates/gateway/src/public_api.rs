@@ -47,6 +47,17 @@ async fn local_network_status_value(state: &AppState) -> anyhow::Result<Value> {
             let snapshots = rows.iter().map(|row| &row.payload.0).collect::<Vec<_>>();
             let network_name = single_shared_string(&snapshots, "network_name");
             let network_org_name = single_shared_string(&snapshots, "network_org_name");
+            let projections = projection_values(state, DataKind::NetworkProjection).await?;
+            let network_metadata = snapshots
+                .iter()
+                .map(|payload| &payload["network_status"])
+                .chain(
+                    projections
+                        .iter()
+                        .flat_map(|payload| [payload, &payload["network_status"]]),
+                )
+                .collect::<Vec<_>>();
+            let network_id = single_shared_string(&network_metadata, "network_id");
             let total_nodes = snapshots.len();
             let total_peers = snapshots
                 .iter()
@@ -87,6 +98,7 @@ async fn local_network_status_value(state: &AppState) -> anyhow::Result<Value> {
                 "public_blocks": total_public_blocks,
                 "network_name": network_name,
                 "network_org_name": network_org_name,
+                "network_id": network_id,
                 "gateway_runtime": state.gateway_network.as_ref().map(gateway_runtime_status),
                 "updated_at": db::now_rfc3339(),
             }))
@@ -121,6 +133,10 @@ fn merge_network_status_values(mut local: Value, remotes: Vec<Value>) -> Value {
                 ),
             );
         }
+        object.insert(
+            "network_id".to_string(),
+            single_shared_status_string(&statuses, "network_id"),
+        );
         object.insert(
             "network_name".to_string(),
             single_shared_status_string(&statuses, "network_name"),
@@ -1228,8 +1244,33 @@ fn single_shared_string(snapshots: &[&Value], key: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::has_valid_geo;
+    use super::merge_network_status_values;
     use super::snapshot_geo_nodes;
     use serde_json::json;
+
+    #[test]
+    fn federated_network_status_requires_one_shared_network_identifier() {
+        let local = json!({"nodes":2,"network_id":"network-a","network_name":"Network A"});
+        let matching = merge_network_status_values(
+            local.clone(),
+            vec![json!({"nodes":3,"network_id":"network-a","network_name":"Network A"})],
+        );
+        assert_eq!(matching["network_id"], "network-a");
+        assert_eq!(matching["nodes"], 5);
+        assert_eq!(matching["network_name"], "Network A");
+        assert_eq!(matching["federated_gateways"], 1);
+        let conflicting =
+            merge_network_status_values(local, vec![json!({"network_id":"network-b"})]);
+        assert!(conflicting["network_id"].is_null());
+        let absent = merge_network_status_values(
+            json!({"network_id":null}),
+            vec![json!({"network_id":" "})],
+        );
+        assert!(absent["network_id"].is_null());
+        let remote_only =
+            merge_network_status_values(json!({}), vec![json!({"network_id":"network-a"})]);
+        assert_eq!(remote_only["network_id"], "network-a");
+    }
 
     #[test]
     fn network_node_geo_requires_valid_coordinates() {

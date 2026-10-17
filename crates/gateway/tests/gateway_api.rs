@@ -37,6 +37,2889 @@ use wattswarm_network_transport_core::{PeerTransportCapabilities, TransportConta
 static POSTGRES_READY: OnceLock<()> = OnceLock::new();
 
 #[tokio::test]
+async fn space_presence_snapshot_requires_current_heartbeat_from_record_source() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let presence = signed_space_presence(10, "signed resident");
+    let did = &presence.record.agent_did;
+    let list_path = "/api/spaces/presence?network_id=test-network&space_id=the-ville";
+    let raw_path =
+        format!("/api/spaces/presence/{did}/record?network_id=test-network&space_id=the-ville");
+    let response = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        json!(space_node_event("record-source", 1, &presence)),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    assert_eq!(
+        request(&app, "GET", list_path).await.1["presences"],
+        json!([])
+    );
+    assert_eq!(request(&app, "GET", &raw_path).await.1, json!(presence));
+
+    let pool = db.pool().await;
+    let persisted_before: (String, String, String) = sqlx::query_as(
+        "select payload::text,seq::text,source_node_id from gateway_space_presence where network_id='test-network' and space_id='the-ville' and agent_did=$1",
+    )
+    .bind(did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted_before.1, "10");
+    assert_eq!(persisted_before.2, "record-source");
+    let now = chrono::Utc::now().timestamp_millis();
+    ingest_space_heartbeat(
+        &app,
+        "record-source",
+        &SigningKey::from_bytes(&[11_u8; 32]),
+        now,
+    )
+    .await;
+    ingest_space_heartbeat(
+        &app,
+        "other-source",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        now,
+    )
+    .await;
+    assert_eq!(
+        request(&app, "GET", list_path).await.1["presences"],
+        json!([])
+    );
+
+    let expired = signed_space_heartbeat(
+        "record-source",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        now - 61_000,
+        20,
+    );
+    let response = request_json(&app, "POST", "/api/ingest/event", json!(expired)).await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    assert_eq!(
+        request(&app, "GET", list_path).await.1["presences"],
+        json!([])
+    );
+
+    ingest_space_heartbeat(
+        &app,
+        "record-source",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        now,
+    )
+    .await;
+    let visible = request(&app, "GET", list_path).await;
+    assert_eq!(visible.0, StatusCode::OK);
+    assert_eq!(visible.1["presences"], json!([presence]));
+    assert_eq!(visible.1["source_node_ids"][did], "record-source");
+    assert_eq!(visible.1["display_names"], json!({}));
+    assert!(
+        visible.1["node_presences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| {
+                item["node_id"] == "record-source" && item["agent_did"] == did.as_str()
+            })
+    );
+    assert_eq!(visible.1["presences"][0]["signature"], presence.signature);
+    assert_eq!(visible.1["presences"][0]["record"]["seq"], 10);
+    let persisted_after: (String, String, String) = sqlx::query_as(
+        "select payload::text,seq::text,source_node_id from gateway_space_presence where network_id='test-network' and space_id='the-ville' and agent_did=$1",
+    )
+    .bind(did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted_after, persisted_before,
+        "heartbeat recovery must not rewrite the signed record or sequence"
+    );
+    assert_eq!(request(&app, "GET", &raw_path).await.1, json!(presence));
+
+    let mut inactive = presence.clone();
+    inactive.record.seq = 11;
+    inactive.record.entered = false;
+    resign_space_presence(&mut inactive);
+    let response = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        json!(space_node_event("tombstone-source", 1, &inactive)),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    ingest_space_heartbeat(
+        &app,
+        "tombstone-source",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        now,
+    )
+    .await;
+    let absent = request(&app, "GET", list_path).await;
+    assert_eq!(absent.1["presences"], json!([]));
+    assert_eq!(absent.1["source_node_ids"], json!({}));
+    assert_eq!(absent.1["display_names"], json!({}));
+    assert_eq!(request(&app, "GET", &raw_path).await.1, json!(inactive));
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_entered_tombstone_uses_existing_sequence_and_survives_replay() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let active = signed_space_presence(10, "preserved activity");
+    let path = format!(
+        "/api/spaces/presence/{}?network_id=test-network&space_id=the-ville",
+        active.record.agent_did
+    );
+    let raw_path = format!(
+        "/api/spaces/presence/{}/record?network_id=test-network&space_id=the-ville",
+        active.record.agent_did
+    );
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            json!(space_node_event("entered-node", 1, &active))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    ingest_space_heartbeat(
+        &app,
+        "entered-node",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    assert_eq!(request(&app, "GET", &path).await.0, StatusCode::OK);
+    let mut inactive = active.clone();
+    inactive.record.seq += 1;
+    inactive.record.entered = false;
+    resign_space_presence(&mut inactive);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            json!(space_node_event("entered-node", 2, &inactive))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(request(&app, "GET", &path).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(request(&app, "GET", &raw_path).await.1, json!(inactive));
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .1["presences"],
+        json!([]),
+        "inactive latest declaration must not appear in the resident snapshot"
+    );
+    let mut equal_sequence = active.clone();
+    equal_sequence.record.seq = inactive.record.seq;
+    resign_space_presence(&mut equal_sequence);
+    for (index, replay) in [&active, &equal_sequence].into_iter().enumerate() {
+        let event = space_node_event(&format!("replayed-node-{index}"), 1, replay);
+        assert_eq!(
+            request_json(&app, "POST", "/api/ingest/event", json!(event))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(request(&app, "GET", &raw_path).await.1, json!(inactive));
+    }
+    let mut snapshot = signed_snapshot(
+        "replayed-snapshot-node",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    snapshot.payload.space_presences = vec![active.clone()];
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    ingest_space_heartbeat(
+        &app,
+        "entered-node",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    assert_eq!(request(&app, "GET", &path).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(request(&app, "GET", &raw_path).await.1, json!(inactive));
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    assert_eq!(request(&app, "GET", &raw_path).await.1, json!(inactive));
+    let mut reentered = inactive.clone();
+    reentered.record.seq += 1;
+    reentered.record.entered = true;
+    resign_space_presence(&mut reentered);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            json!(space_node_event("entered-node", 3, &reentered))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", &path).await.1["presence"],
+        json!(reentered)
+    );
+    assert_eq!(reentered.record.from_tile, active.record.from_tile);
+    assert_eq!(reentered.record.activity, active.record.activity);
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[test]
+fn space_legacy_signed_record_missing_entered_keeps_signature_and_defaults_inactive() {
+    let presence = signed_space_presence(100, "legacy activity");
+    let mut raw = json!(presence);
+    raw["record"].as_object_mut().unwrap().remove("entered");
+    raw["record"].as_object_mut().unwrap().remove("network_id");
+    let key = SigningKey::from_bytes(&[19_u8; 32]);
+    raw["signature"] = json!(
+        base64::engine::general_purpose::STANDARD.encode(
+            key.sign(&canonical_bytes(&raw["record"]).unwrap())
+                .to_bytes()
+        )
+    );
+    let decoded: wattetheria_gateway_contract::SignedSpacePresence =
+        serde_json::from_value(raw.clone()).unwrap();
+    assert!(!decoded.record.entered);
+    wattetheria_gateway::verify::verify_signed_space_presence(&decoded).unwrap();
+    assert_eq!(json!(decoded), raw);
+}
+
+#[tokio::test]
+async fn space_sequence_record_retains_old_inactive_floor_and_strict_updates() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let pool = db.pool().await;
+    let source_id = uuid::Uuid::new_v4();
+    sqlx::query("insert into node_sources(id,name,export_url,source_status) values($1,'retired source','http://127.0.0.1/retired','suspended')")
+        .bind(source_id).execute(&pool).await.unwrap();
+    let mut old = signed_space_presence(u64::MAX - 2, "retained old activity");
+    old.record.space_version = "retained-old-map".to_owned();
+    resign_space_presence(&mut old);
+    sqlx::query("insert into gateway_space_presence(network_id,space_id,agent_did,seq,source_node_id,source_id,payload) values('test-network',$1,$2,$3::text::numeric,'retired-node',$4,$5)")
+        .bind(&old.record.space_id).bind(&old.record.agent_did).bind(old.record.seq.to_string())
+        .bind(source_id).bind(sqlx::types::Json(&old)).execute(&pool).await.unwrap();
+    let path = format!(
+        "/api/spaces/presence/{}/record?network_id=test-network&space_id=the-ville",
+        old.record.agent_did
+    );
+    let raw = request(&app, "GET", &path).await;
+    assert_eq!(raw.0, StatusCode::OK);
+    assert_eq!(raw.1, json!(old));
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .1["presences"],
+        json!([])
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            &format!(
+                "/api/spaces/presence/{}?network_id=test-network&space_id=the-ville",
+                old.record.agent_did
+            )
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence/did:key:another-agent/record?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(&app, "GET", &path.replace("the-ville", "other-space"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    let current = signed_space_presence(u64::MAX - 1, "recovered current activity");
+    let accepted = space_node_event("recovered-node", 1, &current);
+    let response = request_json(&app, "POST", "/api/ingest/event", json!(accepted)).await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    ingest_space_heartbeat(
+        &app,
+        "recovered-node",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    assert_eq!(request(&app, "GET", &path).await.1, json!(current));
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .1["presences"],
+        json!([current])
+    );
+    for (index, seq) in [u64::MAX - 1, u64::MAX - 3].into_iter().enumerate() {
+        let stale = signed_space_presence(seq, "must not overwrite recovered current");
+        let event = space_node_event(&format!("stale-node-{index}"), 1, &stale);
+        assert_eq!(
+            request_json(&app, "POST", "/api/ingest/event", json!(event))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(request(&app, "GET", &path).await.1, json!(current));
+    }
+    let mut bad = signed_space_presence(u64::MAX, "signed before tampering");
+    bad.record.activity = "invalid inner signature".to_owned();
+    let bad = space_node_event("invalid-inner-node", 1, &bad);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/event", json!(bad))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(request(&app, "GET", &path).await.1, json!(current));
+    let mut current_inactive = current.clone();
+    current_inactive.record.seq = u64::MAX;
+    resign_space_presence(&mut current_inactive);
+    sqlx::query("update gateway_space_presence set source_id=$1,seq=$2::text::numeric,payload=$3")
+        .bind(source_id)
+        .bind(current_inactive.record.seq.to_string())
+        .bind(sqlx::types::Json(&current_inactive))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(request(&app, "GET", &path).await.1, json!(current_inactive));
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .1["presences"],
+        json!([])
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_activity_limit_is_identical_for_gateway_signed_records() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let accepted = signed_space_presence(1, &"界".repeat(2000));
+    let event = space_node_event("activity-limit-valid", 1, &accepted);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/event", json!(event))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    ingest_space_heartbeat(
+        &app,
+        "activity-limit-valid",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    for (index, activity) in ["界".repeat(2001), "bad\u{0007}control".to_owned()]
+        .into_iter()
+        .enumerate()
+    {
+        let invalid = signed_space_presence(2, &activity);
+        let event = space_node_event(&format!("activity-limit-invalid-{index}"), 1, &invalid);
+        assert_eq!(
+            request_json(&app, "POST", "/api/ingest/event", json!(event))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .1["presences"],
+        json!([accepted])
+    );
+    drop(app);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn captured_production_heartbeat_is_ephemeral_and_updates_only_the_latest_proof() {
+    let event: SignedNodeEvent = serde_json::from_str(r#"{"payload":{"event_id":"did:key:z6MkuYnqQgqL5V2FTyze9przT6FVSuLLCjivtVsMCT4YDSGL:1791849137537","node_id":"did:key:z6MkuYnqQgqL5V2FTyze9przT6FVSuLLCjivtVsMCT4YDSGL","public_key":"4EoFsyOBOwCrF6R8zhFon9+IONr98pbl74CKEYHWEa0=","signer_agent_did":"did:key:z6MkuYnqQgqL5V2FTyze9przT6FVSuLLCjivtVsMCT4YDSGL","seq":1791849137537,"timestamp":1791849177,"data_kind":"presence","event_kind":"node.presence.heartbeat","visibility":"public","provisional_policy":"ephemeral_only","scope":{"node_id":"did:key:z6MkuYnqQgqL5V2FTyze9przT6FVSuLLCjivtVsMCT4YDSGL"},"identity_key":"did:key:z6MkuYnqQgqL5V2FTyze9przT6FVSuLLCjivtVsMCT4YDSGL","payload":{"agent_did":"did:key:z6MkuYnqQgqL5V2FTyze9przT6FVSuLLCjivtVsMCT4YDSGL","heartbeat_interval_sec":20,"last_heartbeat_ms":1791849177000,"node_id":"did:key:z6MkuYnqQgqL5V2FTyze9przT6FVSuLLCjivtVsMCT4YDSGL"}},"signature":"cbbH7vSjfni/IhvYqVjYqqebV9je2m1abh9HS0hM/OP/vgucPrnGCeoQMtQ51YQOOwULOurFieaDMBFH/FTLDA=="}"#).unwrap();
+    assert_eq!(
+        event.payload.provisional_policy,
+        ProvisionalExportPolicy::EphemeralOnly
+    );
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let (sender, _) = tokio::sync::broadcast::channel(64);
+    let state = AppState {
+        pool: pool.clone(),
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: None,
+        bootstrap_registry_urls: vec![],
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: None,
+        ui_stream_tx: UiStreamHub::new(sender),
+    };
+    let mut receiver = state.ui_stream_tx.subscribe(Some(DataKind::Presence));
+    let app = http::router(state);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/event", json!(event))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let frame = receiver.try_recv().unwrap();
+    assert_eq!(frame.event.cursor, 0);
+    assert!(frame.event.provisional);
+    assert_eq!(frame.event.payload, event.payload.payload);
+    assert_eq!(frame.event.generated_at, event.payload.timestamp);
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .1["node_presences"],
+        json!([event.payload.payload])
+    );
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/event", json!(event))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let mut invalid_outer = event.clone();
+    invalid_outer.payload.payload["last_heartbeat_ms"] = json!(1791849177001_i64);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/event", json!(invalid_outer))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .1["node_presences"],
+        json!([event.payload.payload])
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_ui_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_p2p_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn node_heartbeat_uses_authenticated_identity_and_original_monotonic_proof_time() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let mut event = signed_node_event(
+        "heartbeat-node",
+        DataKind::Presence,
+        "node.presence.heartbeat",
+        json!({}),
+    );
+    let heartbeat = wattetheria_gateway_contract::space::NodePresence {
+        node_id: event.payload.node_id.clone(),
+        agent_did: event.payload.signer_agent_did.clone(),
+        last_heartbeat_ms: chrono::Utc::now().timestamp_millis(),
+        heartbeat_interval_sec: 20,
+    };
+    event.payload.payload = serde_json::to_value(&heartbeat).unwrap();
+    event.payload.provisional_policy = ProvisionalExportPolicy::EphemeralOnly;
+    resign_node_event(&mut event);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(&event).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+    )
+    .await;
+    assert_eq!(response.1["node_presences"], json!([heartbeat]));
+    let mut stale = event.clone();
+    stale.payload.event_id = "heartbeat-node:stale".to_owned();
+    stale.payload.payload["last_heartbeat_ms"] = json!(heartbeat.last_heartbeat_ms - 1000);
+    resign_node_event(&mut stale);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(stale).unwrap()
+        )
+        .await
+        .1["status"],
+        "duplicate"
+    );
+    let mut forged = event.clone();
+    forged.payload.event_id = "heartbeat-node:forged".to_owned();
+    forged.payload.payload["agent_did"] = json!(signed_space_presence(1, "other").record.agent_did);
+    resign_node_event(&mut forged);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(forged).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    for policy in [
+        ProvisionalExportPolicy::NeverBeforeConfirmation,
+        ProvisionalExportPolicy::ProvisionalWithDowngrade,
+    ] {
+        let mut incorrect_policy = event.clone();
+        incorrect_policy.payload.provisional_policy = policy;
+        resign_node_event(&mut incorrect_policy);
+        assert_eq!(
+            request_json(&app, "POST", "/api/ingest/event", json!(incorrect_policy))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let mut incorrect_interval = event.clone();
+    incorrect_interval.payload.payload["heartbeat_interval_sec"] = json!(0);
+    resign_node_event(&mut incorrect_interval);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/event", json!(incorrect_interval))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let mut snapshot = signed_snapshot(
+        "heartbeat-node",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    let mut old = heartbeat.clone();
+    old.last_heartbeat_ms -= 1000;
+    snapshot.payload.node_presence = Some(old);
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(snapshot).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+    )
+    .await;
+    assert_eq!(
+        response.1["node_presences"],
+        json!([heartbeat]),
+        "old snapshot must not refresh heartbeat as receipt time"
+    );
+    let pool = db.pool().await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_ui_events where data_kind='presence'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn node_heartbeat_accepts_bounded_proof_intervals_without_durable_history() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let mut accepted = Vec::new();
+    for interval in [1, 20, 60, 300, 0, -1, 301] {
+        let mut event = signed_node_event(
+            &format!("interval-event-{interval}"),
+            DataKind::Presence,
+            "node.presence.heartbeat",
+            json!({}),
+        );
+        let heartbeat = wattetheria_gateway_contract::space::NodePresence {
+            node_id: event.payload.node_id.clone(),
+            agent_did: event.payload.signer_agent_did.clone(),
+            last_heartbeat_ms: 1_710_000_000_000,
+            heartbeat_interval_sec: interval,
+        };
+        event.payload.payload = json!(heartbeat);
+        event.payload.provisional_policy = ProvisionalExportPolicy::EphemeralOnly;
+        resign_node_event(&mut event);
+        let response = request_json(&app, "POST", "/api/ingest/event", json!(event)).await;
+        let valid = (1..=300).contains(&interval);
+        assert_eq!(
+            response.0,
+            if valid {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            "interval {interval}: {}",
+            response.1
+        );
+        if valid {
+            accepted.push(heartbeat);
+            accepted.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        }
+        let response = request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1["node_presences"], json!(accepted));
+    }
+    let pool = db.pool().await;
+    for table in ["gateway_ui_events", "gateway_p2p_outbox"] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(&format!("select count(*) from {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "ephemeral heartbeat must not enter {table}"
+        );
+    }
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn signed_snapshot_projects_only_bounded_heartbeat_intervals_and_keeps_signed_payload() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let pool = db.pool().await;
+    let mut accepted = Vec::new();
+    for interval in [1, 20, 60, 300, 0, -1, 301] {
+        let mut snapshot = signed_snapshot(
+            &format!("interval-snapshot-{interval}"),
+            SnapshotContents {
+                network_name: None,
+                network_org_name: None,
+                peers: &[],
+                public_blocks: &[],
+                public_topics: &[],
+                public_topic_messages: &[],
+                swarm_task_activity: json!({}),
+                tasks: &[],
+                organizations: &[],
+                leaderboard: &[],
+            },
+        );
+        let heartbeat = wattetheria_gateway_contract::space::NodePresence {
+            node_id: snapshot.payload.node_id.clone(),
+            agent_did: snapshot.signer_agent_did.clone(),
+            last_heartbeat_ms: 1_710_000_000_000,
+            heartbeat_interval_sec: interval,
+        };
+        snapshot.payload.node_presence = Some(heartbeat.clone());
+        resign_snapshot(&mut snapshot);
+        let response = request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot)).await;
+        assert_eq!(
+            response.0,
+            StatusCode::OK,
+            "interval {interval}: {}",
+            response.1
+        );
+        let stored: (sqlx::types::Json<Value>, String) =
+            sqlx::query_as("select payload,signature from node_snapshots where node_id=$1")
+                .bind(&snapshot.payload.node_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0.0, json!(snapshot.payload));
+        assert_eq!(stored.1, snapshot.signature);
+        if (1..=300).contains(&interval) {
+            accepted.push(heartbeat);
+            accepted.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        }
+        let response = request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1["node_presences"], json!(accepted));
+    }
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn signed_snapshot_isolates_invalid_space_items_without_changing_the_signed_payload() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let pool = db.pool().await;
+    let mut old = signed_space_presence(100, "old package resident");
+    old.record.space_version = "sha256:old-package".to_owned();
+    resign_space_presence(&mut old);
+    sqlx::query("insert into gateway_space_presence(network_id,space_id,agent_did,seq,source_node_id,payload) values('test-network',$1,$2,$3::text::numeric,$4,$5)")
+        .bind(&old.record.space_id).bind(&old.record.agent_did).bind(old.record.seq.to_string())
+        .bind("mixed-snapshot-node").bind(sqlx::types::Json(&old)).execute(&pool).await.unwrap();
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+    )
+    .await;
+    assert_eq!(
+        response.1["presences"],
+        json!([]),
+        "a signed record without its source heartbeat is not a visible resident"
+    );
+    let raw_path = format!(
+        "/api/spaces/presence/{}/record?network_id=test-network&space_id=the-ville",
+        old.record.agent_did
+    );
+    assert_eq!(request(&app, "GET", &raw_path).await.1, json!(old));
+    let valid = signed_space_presence(101, "new package resident");
+    let mut invalid = signed_space_presence(999, "valid signature before tampering");
+    invalid.record.activity = "unsigned forged activity".to_owned();
+    old.record.seq = 1000;
+    resign_space_presence(&mut old);
+    let mut snapshot = signed_snapshot(
+        "mixed-snapshot-node",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[json!({"id":"legitimate-task","title":"Existing task"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    snapshot.payload.public_board_messages =
+        vec![json!({"message_id":"legitimate-board","content":"Existing board message"})];
+    snapshot.payload.space_presences = vec![invalid, old.clone(), valid.clone()];
+    snapshot.payload.node_presence = Some(wattetheria_gateway_contract::space::NodePresence {
+        node_id: snapshot.payload.node_id.clone(),
+        agent_did: "wrong authenticated agent".to_owned(),
+        last_heartbeat_ms: chrono::Utc::now().timestamp_millis(),
+        heartbeat_interval_sec: 20,
+    });
+    resign_snapshot(&mut snapshot);
+    let response = request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot)).await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    let stored: (sqlx::types::Json<Value>, String) = sqlx::query_as(
+        "select payload,signature from node_snapshots where node_id='mixed-snapshot-node'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored.0.0,
+        json!(snapshot.payload),
+        "original signed payload must not be sanitized"
+    );
+    assert_eq!(stored.1, snapshot.signature);
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+    )
+    .await;
+    assert_eq!(response.1["presences"], json!([]));
+    assert_eq!(response.1["node_presences"], json!([]));
+    assert_eq!(request(&app, "GET", &raw_path).await.1, json!(old));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_ui_events where data_kind='space_presence'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    for kind in ["task_summary", "board_activity"] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "select count(*) from gateway_projection_rows where data_kind=$1"
+            )
+            .bind(kind)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+    let mut forged_outer = snapshot.clone();
+    forged_outer.payload.generated_at += 100;
+    forged_outer
+        .payload
+        .tasks
+        .push(json!({"id":"unsigned-task"}));
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/snapshot", json!(forged_outer))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let stored: sqlx::types::Json<Value> = sqlx::query_scalar(
+        "select payload from node_snapshots where node_id='mixed-snapshot-node'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.0, json!(snapshot.payload));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_projection_rows where data_kind='task_summary'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn original_full_snapshot_preserves_signed_fields_and_rejects_each_field_tamper() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let pool = db.pool().await;
+    let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
+    let public_key =
+        base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes());
+    let signer = did_key_from_public_key_b64(&public_key);
+    for (index, nodes) in [
+        None,
+        Some(json!([])),
+        Some(json!([{"id": "native-node", "running": true}])),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let node_id = format!("original-full-snapshot-{index}");
+        let presence =
+            signed_space_presence(u64::MAX - 3 + index as u64, "original native activity");
+        wattetheria_gateway::verify::verify_signed_space_presence(&presence).unwrap();
+        let mut payload = json!({
+            "generated_at": 1_710_000_000 + index,
+            "node_id": node_id,
+            "agent_identity": signer,
+            "public_id": "public-native-agent",
+            "public_key": public_key,
+            "network_status": {"total_nodes": 1},
+            "peers": [],
+            "operator": {"id": "native-agent"},
+            "rpc_logs": [],
+            "public_blocks": [],
+            "public_topics": [],
+            "public_topic_messages": [],
+            "public_board_messages": [{"message_id": format!("native-board-{index}"), "content": "original board"}],
+            "space_presences": [presence],
+            "swarm_task_activity": {},
+            "tasks": [{"id": format!("native-task-{index}"), "title": "Original task"}],
+            "organizations": [],
+            "leaderboard": []
+        });
+        if let Some(nodes) = nodes {
+            payload["nodes"] = nodes;
+        }
+        if index == 3 {
+            payload.as_object_mut().unwrap().remove("agent_identity");
+            payload.as_object_mut().unwrap().remove("public_id");
+        }
+        let signature = base64::engine::general_purpose::STANDARD.encode(
+            signing_key
+                .sign(&canonical_bytes(&payload).unwrap())
+                .to_bytes(),
+        );
+        let original =
+            json!({"payload": payload, "signature": signature, "signer_agent_did": signer});
+        let typed: SignedPublicClientSnapshot = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(
+            json!(typed),
+            original,
+            "typed decoding must preserve the signed shape"
+        );
+        wattetheria_gateway::verify::verify_signed_snapshot(&typed, Some(&signer)).unwrap();
+        let response = request_json(&app, "POST", "/api/ingest/snapshot", original.clone()).await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        ingest_space_heartbeat(
+            &app,
+            &node_id,
+            &SigningKey::from_bytes(&[19_u8; 32]),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+        for (field, tampered_value) in [
+            ("agent_identity", json!("unsigned-identity")),
+            ("public_id", json!("unsigned-public-id")),
+            ("nodes", json!([{"id": "unsigned-node"}])),
+        ] {
+            let mut tampered = original.clone();
+            tampered["payload"][field] = tampered_value;
+            let response = request_json(&app, "POST", "/api/ingest/snapshot", tampered).await;
+            assert_eq!(
+                response.0,
+                StatusCode::BAD_REQUEST,
+                "{field}: {}",
+                response.1
+            );
+        }
+        let stored: (sqlx::types::Json<Value>, String) =
+            sqlx::query_as("select payload, signature from node_snapshots where node_id=$1")
+                .bind(&node_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0.0, original["payload"]);
+        assert_eq!(stored.1, signature);
+        let restored: SignedPublicClientSnapshot = serde_json::from_value(json!({
+            "payload": stored.0.0, "signature": stored.1, "signer_agent_did": signer
+        }))
+        .unwrap();
+        wattetheria_gateway::verify::verify_signed_snapshot(&restored, Some(&signer)).unwrap();
+        let response = request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+        )
+        .await;
+        assert_eq!(response.1["presences"], json!([presence]));
+    }
+    for kind in ["task_summary", "board_activity"] {
+        let count = sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_projection_rows where data_kind=$1",
+        )
+        .bind(kind)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 4);
+    }
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn snapshot_presence_recovery_publishes_only_newer_original_signed_records() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let (sender, _) = tokio::sync::broadcast::channel(64);
+    let state = AppState {
+        pool: pool.clone(),
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: None,
+        bootstrap_registry_urls: vec![],
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: None,
+        ui_stream_tx: UiStreamHub::new(sender),
+    };
+    let mut receiver = state.ui_stream_tx.subscribe(Some(DataKind::SpacePresence));
+    let app = http::router(state);
+    let presence = signed_space_presence(1, "restored");
+    let mut snapshot = signed_snapshot(
+        "snapshot-recovery-node",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    snapshot.payload.space_presences = vec![presence.clone()];
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(&snapshot).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let frame = receiver.try_recv().unwrap();
+    assert_eq!(frame.event.payload, json!(presence));
+    assert_eq!(frame.event.generated_at, presence.record.updated_at / 1000);
+    assert!(frame.event.cursor > 0);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    snapshot.payload.generated_at += 1;
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(&snapshot).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let newer = signed_space_presence(2, "newer recovered");
+    snapshot.payload.generated_at += 1;
+    snapshot.payload.space_presences = vec![newer.clone()];
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(&snapshot).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let frame = receiver.try_recv().unwrap();
+    assert_eq!(frame.event.payload, json!(newer));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    snapshot.payload.generated_at += 1;
+    snapshot.payload.space_presences = vec![presence];
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(&snapshot).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_ui_events where data_kind='space_presence'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_presence_display_names_follow_visible_matching_snapshots() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let mut snapshot = signed_snapshot(
+        "names-node",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    let mut presence = signed_space_presence(10, "name refresh preserves movement");
+    presence.record.agent_did = snapshot.signer_agent_did.clone();
+    presence.public_key = snapshot.payload.public_key.clone();
+    let key = SigningKey::from_bytes(&[11_u8; 32]);
+    presence.signature = base64::engine::general_purpose::STANDARD.encode(
+        key.sign(&canonical_bytes(&presence.record).unwrap())
+            .to_bytes(),
+    );
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            json!(space_node_event("names-node", 1, &presence))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    ingest_space_heartbeat(
+        &app,
+        "names-node",
+        &SigningKey::from_bytes(&[11_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    let path = "/api/spaces/presence?network_id=test-network&space_id=the-ville";
+    let response = request(&app, "GET", path).await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["display_names"], json!({}));
+    assert_eq!(response.1["presences"], json!([presence]));
+
+    snapshot.payload.network_status["network_id"] = json!("test-network");
+    snapshot.payload.operator["display_name"] = json!("MRX");
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let first = snapshot.clone();
+    let did = presence.record.agent_did.clone();
+    for (name, expected) in [
+        (json!("MRX"), Some("MRX")),
+        (json!("Renamed Agent"), Some("Renamed Agent")),
+        (json!("  "), None),
+        (json!(null), None),
+        (json!({"name":"not a string"}), None),
+        (json!("Restored"), Some("Restored")),
+    ] {
+        snapshot.payload.generated_at += 1;
+        snapshot.payload.operator["display_name"] = name;
+        resign_snapshot(&mut snapshot);
+        let ingested = request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot)).await;
+        assert_eq!(ingested.0, StatusCode::OK, "{}", ingested.1);
+        let response = request(&app, "GET", path).await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(
+            response.1["display_names"]
+                .get(&did)
+                .and_then(Value::as_str),
+            expected
+        );
+        assert_eq!(response.1["presences"], json!([presence]));
+    }
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/snapshot", json!(first))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", path).await.1["display_names"][&did],
+        "Restored"
+    );
+
+    snapshot.payload.generated_at += 1;
+    snapshot.payload.network_status["network_id"] = json!("another-network");
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let response = request(&app, "GET", path).await;
+    assert_eq!(response.1["display_names"], json!({}));
+    assert_eq!(response.1["presences"], json!([presence]));
+
+    snapshot.payload.generated_at += 1;
+    snapshot.payload.network_status["network_id"] = json!("test-network");
+    let other_key = SigningKey::from_bytes(&[23_u8; 32]);
+    snapshot.payload.public_key =
+        base64::engine::general_purpose::STANDARD.encode(other_key.verifying_key().as_bytes());
+    snapshot.signer_agent_did = did_key_from_public_key_b64(&snapshot.payload.public_key);
+    snapshot.signature = base64::engine::general_purpose::STANDARD.encode(
+        other_key
+            .sign(&canonical_bytes(&snapshot.payload).unwrap())
+            .to_bytes(),
+    );
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let response = request(&app, "GET", path).await;
+    assert_eq!(response.1["display_names"], json!({}));
+    assert_eq!(response.1["presences"], json!([presence]));
+
+    snapshot.payload.generated_at += 1;
+    snapshot.payload.public_key = presence.public_key.clone();
+    snapshot.signer_agent_did = did.clone();
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let pool = db.pool().await;
+    let source_id = uuid::Uuid::new_v4();
+    sqlx::query("insert into node_sources(id,name,export_url,source_status) values($1,'names source','http://127.0.0.1/names','active')")
+        .bind(source_id).execute(&pool).await.unwrap();
+    sqlx::query("update node_snapshots set source_id=$1 where node_id='names-node'")
+        .bind(source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        request(&app, "GET", path).await.1["display_names"][&did],
+        "Restored"
+    );
+    sqlx::query("update node_sources set source_status='suspended' where id=$1")
+        .bind(source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = request(&app, "GET", path).await;
+    assert_eq!(response.1["display_names"], json!({}));
+    assert_eq!(response.1["presences"], json!([presence]));
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_presence_latest_is_agent_signed_and_sequence_ordered_across_nodes() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let presence = signed_space_presence(10, "first");
+    let newer = signed_space_presence(11, "newer");
+    let agent_did = &presence.record.agent_did;
+    for (node, sequence, record, expected) in [
+        ("node-a", 1, presence.clone(), "ok"),
+        ("node-b", 2, newer.clone(), "ok"),
+        ("node-c", 3, presence.clone(), "duplicate"),
+        ("node-d", 4, newer.clone(), "duplicate"),
+    ] {
+        let event = space_node_event(node, sequence, &record);
+        let response = request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(event).unwrap(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        assert_eq!(response.1["status"], expected);
+    }
+    ingest_space_heartbeat(
+        &app,
+        "node-b",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["presences"], json!([newer]));
+    assert!(response.1["server_time_ms"].as_i64().unwrap() > 1_000_000_000_000);
+    let response = request(
+        &app,
+        "GET",
+        &format!("/api/spaces/presence/{agent_did}?network_id=test-network&space_id=the-ville"),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["presence"]["record"]["seq"], 11);
+    let pool = db.pool().await;
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from gateway_ui_events where data_kind='space_presence'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 2, "stale records must not enter public WS replay");
+    let source: String = sqlx::query_scalar("select source_node_id from gateway_space_presence")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source, "node-b");
+    let mut forged = newer.clone();
+    forged.record.activity = "forged".to_owned();
+    let event = space_node_event("node-attacker", 5, &forged);
+    let response = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(event).unwrap(),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST);
+    let mut wrong_did = signed_space_presence(12, "wrong did");
+    wrong_did.record.agent_did =
+        signed_node_event("other", DataKind::Presence, "heartbeat", json!({}))
+            .payload
+            .signer_agent_did;
+    let event = space_node_event("node-attacker", 6, &wrong_did);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(event).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence/absent?network_id=test-network&space_id=the-ville"
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=unknown"
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_presence_place_filter_uses_current_tile_and_schema_upgrade_preserves_data() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let mut presence = signed_space_presence(1, "opaque signed geometry");
+    presence.record.space_id = "unknown-space".to_owned();
+    presence.record.space_version = "sha256:unknown-map".to_owned();
+    presence.record.from_tile = [u32::MAX, u32::MAX];
+    presence.record.path = "URDL".to_owned();
+    presence.record.destination_place_id = "unknown-place".to_owned();
+    presence.record.object_place_id = Some("unknown-object".to_owned());
+    for seq in 1..=3 {
+        presence.record.seq = seq;
+        presence.record.depart_at =
+            chrono::Utc::now().timestamp_millis() + if seq == 2 { 60_000 } else { -1_000 };
+        resign_space_presence(&mut presence);
+        let event = space_node_event("node-a", seq, &presence);
+        let response = request_json(&app, "POST", "/api/ingest/event", json!(event)).await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        if seq == 1 {
+            ingest_space_heartbeat(
+                &app,
+                "node-a",
+                &SigningKey::from_bytes(&[19_u8; 32]),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await;
+        }
+        let response = request(
+            &app,
+            "GET",
+            "/api/spaces/presence?network_id=test-network&space_id=unknown-space",
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1["presences"], json!([presence]));
+        for path in [
+            "/api/spaces/presence?network_id=test-network&space_id=unknown-space&place_id=unknown-place",
+            "/api/spaces/presence?network_id=test-network&place_id=unknown-object",
+        ] {
+            let response = request(&app, "GET", path).await;
+            assert_eq!(response.0, StatusCode::BAD_REQUEST, "{}", response.1);
+            let message = response.1.to_string().to_lowercase();
+            assert!(
+                message.contains("main") && message.contains("client"),
+                "{message}"
+            );
+        }
+    }
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_ui_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        3
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_schema_upgrades_existing_gateway_tables_idempotently_without_data_loss() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let event = signed_node_event(
+        "old-node",
+        DataKind::BoardActivity,
+        "board.message.published",
+        json!({"message_id":"old-message","feed_key":"wattetheria.board.general","author_public_id":"old-agent","body":"Preserved"}),
+    );
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(event).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let pool = db.pool().await;
+    sqlx::query(
+        "drop table gateway_space_presence,gateway_space_events,gateway_space_node_presence",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("create table gateway_space_presence(space_id text not null,agent_did text not null,seq numeric(20,0) not null,source_node_id text not null,source_id uuid null,payload jsonb not null,primary key(space_id,agent_did))")
+        .execute(&pool).await.unwrap();
+    let mut legacy = json!(signed_space_presence(u64::MAX - 1, "legacy original body"));
+    legacy["record"]
+        .as_object_mut()
+        .unwrap()
+        .remove("network_id");
+    legacy["record"].as_object_mut().unwrap().remove("entered");
+    let key = SigningKey::from_bytes(&[19_u8; 32]);
+    legacy["signature"] = json!(
+        base64::engine::general_purpose::STANDARD.encode(
+            key.sign(&canonical_bytes(&legacy["record"]).unwrap())
+                .to_bytes()
+        )
+    );
+    let decoded: wattetheria_gateway_contract::SignedSpacePresence =
+        serde_json::from_value(legacy.clone()).unwrap();
+    wattetheria_gateway::verify::verify_signed_space_presence(&decoded).unwrap();
+    let source_id = uuid::Uuid::new_v4();
+    sqlx::query("insert into node_sources(id,name,export_url,source_status) values($1,'legacy source','http://127.0.0.1/legacy','active')")
+        .bind(source_id).execute(&pool).await.unwrap();
+    sqlx::query("insert into gateway_space_presence(space_id,agent_did,seq,source_node_id,source_id,payload) values('the-ville',$1,$2::text::numeric,'legacy-node',$3,$4)")
+        .bind(&decoded.record.agent_did).bind(decoded.record.seq.to_string())
+        .bind(source_id).bind(sqlx::types::Json(&legacy)).execute(&pool).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    db::init_schema(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_ui_events where event_id='old-node:1'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_projection_rows where data_kind='board_activity'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    let stored: (
+        String,
+        String,
+        Option<uuid::Uuid>,
+        String,
+        sqlx::types::Json<Value>,
+    ) = sqlx::query_as(
+        "select network_id,source_node_id,source_id,seq::text,payload from gateway_space_presence",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.0, "");
+    assert_eq!(stored.1, "legacy-node");
+    assert_eq!(stored.2, Some(source_id));
+    assert_eq!(stored.3, decoded.record.seq.to_string());
+    assert_eq!(stored.4.0, legacy);
+    let response = request(
+        &app,
+        "GET",
+        &format!(
+            "/api/spaces/presence/{}/record?network_id=&space_id=the-ville",
+            decoded.record.agent_did
+        ),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1, legacy);
+    assert_eq!(
+        request(&app, "GET", "/api/spaces/presence?network_id=test-network")
+            .await
+            .1["presences"],
+        json!([])
+    );
+    let modern = signed_space_presence(1, "new namespace independent floor");
+    let response = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        json!(space_node_event("modern-node", 1, &modern)),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    ingest_space_heartbeat(
+        &app,
+        "modern-node",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        request(&app, "GET", "/api/spaces/presence?network_id=test-network")
+            .await
+            .1["presences"],
+        json!([modern])
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_presence_isolates_same_agent_and_space_by_network() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let first = signed_space_presence(100, "first network");
+    let mut second = signed_space_presence(1, "second network");
+    second.record.network_id = "other-network".to_owned();
+    resign_space_presence(&mut second);
+    for (index, presence) in [&first, &second].into_iter().enumerate() {
+        let node = format!("network-node-{index}");
+        let response = request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            json!(space_node_event(&node, 1, presence)),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        ingest_space_heartbeat(
+            &app,
+            &node,
+            &SigningKey::from_bytes(&[19_u8; 32]),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+    }
+    let mut forged_network = first.clone();
+    forged_network.record.network_id = second.record.network_id.clone();
+    let response = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        json!(space_node_event("network-tamper-node", 1, &forged_network)),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST, "{}", response.1);
+    for presence in [&first, &second] {
+        let path = format!(
+            "/api/spaces/presence?network_id={}&space_id=the-ville",
+            presence.record.network_id
+        );
+        let response = request(&app, "GET", &path).await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1["presences"], json!([presence]));
+        let raw = format!(
+            "/api/spaces/presence/{}/record?network_id={}",
+            presence.record.agent_did, presence.record.network_id
+        );
+        assert_eq!(request(&app, "GET", &raw).await.1, json!(presence));
+        let single = format!(
+            "/api/spaces/presence/{}?network_id={}",
+            presence.record.agent_did, presence.record.network_id
+        );
+        assert_eq!(
+            request(&app, "GET", &single).await.1["presence"],
+            json!(presence)
+        );
+    }
+    for path in [
+        "/api/spaces/presence",
+        "/api/spaces/presence?network_id=",
+        "/api/spaces/presence/absent?space_id=the-ville",
+        "/api/spaces/events?space_id=the-ville",
+        "/api/spaces/events?network_id=",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/presence?network_id=test-network&space_id=unknown",
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["presences"], json!([]));
+    let pool = db.pool().await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_snapshot_namespaces_presence_ui_events_by_network() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let first = signed_space_presence(10, "snapshot first network");
+    let mut second = first.clone();
+    second.record.network_id = "other-network".to_owned();
+    resign_space_presence(&mut second);
+    let mut snapshot = signed_snapshot(
+        "multi-network-snapshot-node",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    assert_ne!(
+        snapshot.payload.agent_identity.as_deref(),
+        Some(first.record.agent_did.as_str())
+    );
+    snapshot.payload.space_presences = vec![first.clone(), second.clone()];
+    resign_snapshot(&mut snapshot);
+    let response = request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot)).await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    ingest_space_heartbeat(
+        &app,
+        "multi-network-snapshot-node",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    for presence in [&first, &second] {
+        let path = format!(
+            "/api/spaces/presence?network_id={}&space_id={}",
+            presence.record.network_id, presence.record.space_id,
+        );
+        let response = request(&app, "GET", &path).await;
+        assert_eq!(response.0, StatusCode::OK);
+        assert_eq!(response.1["presences"], json!([presence]));
+    }
+    let pool = db.pool().await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    let ui_rows: Vec<(String, sqlx::types::Json<Value>)> = sqlx::query_as(
+        "select event_id,payload from gateway_ui_events where data_kind='space_presence'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ui_rows.len(), 2);
+    for presence in [&first, &second] {
+        let event_id = format!(
+            "space-presence:{}:{}:{}:{}",
+            presence.record.network_id,
+            presence.record.space_id,
+            presence.record.agent_did,
+            presence.record.seq,
+        );
+        let row = ui_rows.iter().find(|(id, _)| id == &event_id).unwrap();
+        assert_eq!(row.1.0, json!(presence));
+    }
+    let stored: (sqlx::types::Json<Value>, String) = sqlx::query_as(
+        "select payload,signature from node_snapshots where node_id='multi-network-snapshot-node'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.0.0, json!(snapshot.payload));
+    assert_eq!(stored.1, snapshot.signature);
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn space_presence_global_sequence_precedes_space_filter_and_tombstone_replays() {
+    for newest_first in [false, true] {
+        let db = TestDatabase::new().await;
+        let app = test_app(&db.database_url).await;
+        let old = signed_space_presence(100, "old space");
+        let mut newest = signed_space_presence(101, "new space");
+        newest.record.space_id = "second-space".to_owned();
+        resign_space_presence(&mut newest);
+        let arrivals = if newest_first {
+            [&newest, &old]
+        } else {
+            [&old, &newest]
+        };
+        for (index, presence) in arrivals.into_iter().enumerate() {
+            let node = format!("cross-space-{index}");
+            let response = request_json(
+                &app,
+                "POST",
+                "/api/ingest/event",
+                json!(space_node_event(&node, 1, presence)),
+            )
+            .await;
+            assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+            ingest_space_heartbeat(
+                &app,
+                &node,
+                &SigningKey::from_bytes(&[19_u8; 32]),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await;
+        }
+        let all = "/api/spaces/presence?network_id=test-network";
+        let old_list = "/api/spaces/presence?network_id=test-network&space_id=the-ville";
+        let old_single = format!(
+            "/api/spaces/presence/{}?network_id=test-network&space_id=the-ville",
+            old.record.agent_did
+        );
+        let raw = format!(
+            "/api/spaces/presence/{}/record?network_id=test-network",
+            old.record.agent_did
+        );
+        assert_eq!(
+            request(&app, "GET", all).await.1["presences"],
+            json!([newest])
+        );
+        assert_eq!(
+            request(&app, "GET", old_list).await.1["presences"],
+            json!([])
+        );
+        assert_eq!(
+            request(&app, "GET", &old_single).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(request(&app, "GET", &raw).await.1, json!(newest));
+        let mut tombstone = old.clone();
+        tombstone.record.seq = 102;
+        tombstone.record.entered = false;
+        resign_space_presence(&mut tombstone);
+        for (node, presence) in [
+            ("inactive-newest", &tombstone),
+            ("stale-other-space", &newest),
+            ("stale-old-space", &old),
+        ] {
+            let response = request_json(
+                &app,
+                "POST",
+                "/api/ingest/event",
+                json!(space_node_event(node, 1, presence)),
+            )
+            .await;
+            assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+            assert_eq!(request(&app, "GET", &raw).await.1, json!(tombstone));
+        }
+        assert_eq!(request(&app, "GET", all).await.1["presences"], json!([]));
+        assert_eq!(
+            request(&app, "GET", &old_single).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(
+                &app,
+                "GET",
+                "/api/spaces/presence?network_id=test-network&space_id=second-space"
+            )
+            .await
+            .1["presences"],
+            json!([])
+        );
+        let mut missing_entered = json!(newest);
+        missing_entered["record"]["space_id"] = json!("third-space");
+        missing_entered["record"]["seq"] = json!(103);
+        missing_entered["record"]
+            .as_object_mut()
+            .unwrap()
+            .remove("entered");
+        let key = SigningKey::from_bytes(&[19_u8; 32]);
+        missing_entered["signature"] = json!(
+            base64::engine::general_purpose::STANDARD.encode(
+                key.sign(&canonical_bytes(&missing_entered["record"]).unwrap())
+                    .to_bytes()
+            )
+        );
+        let decoded: wattetheria_gateway_contract::SignedSpacePresence =
+            serde_json::from_value(missing_entered.clone()).unwrap();
+        assert!(!decoded.record.entered);
+        wattetheria_gateway::verify::verify_signed_space_presence(&decoded).unwrap();
+        let response = request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            json!(space_node_event("missing-entered-newest", 1, &decoded)),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        assert_eq!(request(&app, "GET", &raw).await.1, missing_entered);
+        assert_eq!(request(&app, "GET", all).await.1["presences"], json!([]));
+        let single = format!(
+            "/api/spaces/presence/{}?network_id=test-network",
+            old.record.agent_did
+        );
+        assert_eq!(request(&app, "GET", &single).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            request(&app, "GET", old_list).await.1["presences"],
+            json!([])
+        );
+        let pool = db.pool().await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            3
+        );
+        pool.close().await;
+        db.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn space_presence_inactive_highest_source_does_not_resurrect_older_space() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let old = signed_space_presence(100, "active old source");
+    let mut highest = signed_space_presence(101, "highest source");
+    highest.record.space_id = "second-space".to_owned();
+    resign_space_presence(&mut highest);
+    for (node, presence) in [
+        ("active-source-node", &old),
+        ("inactive-source-node", &highest),
+    ] {
+        let response = request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            json!(space_node_event(node, 1, presence)),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        ingest_space_heartbeat(
+            &app,
+            node,
+            &SigningKey::from_bytes(&[19_u8; 32]),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+    }
+    let pool = db.pool().await;
+    let source_id = uuid::Uuid::new_v4();
+    sqlx::query("insert into node_sources(id,name,export_url,source_status) values($1,'highest source','http://127.0.0.1/highest','active')")
+        .bind(source_id).execute(&pool).await.unwrap();
+    sqlx::query("update gateway_space_presence set source_id=$1 where source_node_id='inactive-source-node'")
+        .bind(source_id).execute(&pool).await.unwrap();
+    assert_eq!(
+        request(&app, "GET", "/api/spaces/presence?network_id=test-network")
+            .await
+            .1["presences"],
+        json!([highest])
+    );
+    let raw = format!(
+        "/api/spaces/presence/{}/record?network_id=test-network",
+        old.record.agent_did
+    );
+    let single = format!(
+        "/api/spaces/presence/{}?network_id=test-network",
+        old.record.agent_did
+    );
+    for status in ["suspended", "invalid"] {
+        sqlx::query("update node_sources set source_status=$1 where id=$2")
+            .bind(status)
+            .bind(source_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for path in [
+            "/api/spaces/presence?network_id=test-network",
+            "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+            "/api/spaces/presence?network_id=test-network&space_id=second-space",
+        ] {
+            let response = request(&app, "GET", path).await;
+            assert_eq!(response.0, StatusCode::OK);
+            assert_eq!(response.1["presences"], json!([]), "{status} {path}");
+        }
+        assert_eq!(request(&app, "GET", &single).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(request(&app, "GET", &raw).await.1, json!(highest));
+    }
+    pool.close().await;
+    db.cleanup().await;
+}
+
+fn signed_space_presence(
+    seq: u64,
+    activity: &str,
+) -> wattetheria_gateway_contract::SignedSpacePresence {
+    let key = SigningKey::from_bytes(&[19_u8; 32]);
+    let public_key =
+        base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes());
+    let mut presence = wattetheria_gateway_contract::SignedSpacePresence {
+        record: wattetheria_gateway_contract::SpacePresenceRecord {
+            agent_did: did_key_from_public_key_b64(&public_key),
+            network_id: "test-network".to_owned(),
+            space_id: "the-ville".to_owned(),
+            space_version: "sha256:test-map".to_owned(),
+            seq,
+            entered: true,
+            from_tile: [19, 58],
+            path: String::new(),
+            depart_at: chrono::Utc::now().timestamp_millis(),
+            destination_place_id: "adam-smiths-house".to_owned(),
+            activity: activity.to_owned(),
+            object_place_id: None,
+            updated_at: chrono::Utc::now().timestamp_millis(),
+        },
+        public_key,
+        signature: String::new(),
+    };
+    resign_space_presence(&mut presence);
+    presence
+}
+
+#[tokio::test]
+async fn space_activity_object_validation_matches_signed_product_contract() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let (sender, _) = tokio::sync::broadcast::channel(64);
+    let state = AppState {
+        pool: pool.clone(),
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: None,
+        bootstrap_registry_urls: vec![],
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: None,
+        ui_stream_tx: UiStreamHub::new(sender),
+    };
+    let mut receiver = state.ui_stream_tx.subscribe(Some(DataKind::SpacePresence));
+    let app = http::router(state);
+    let mut valid = signed_space_presence(1, "using sink");
+    valid.record.from_tile = [20, 68];
+    valid.record.destination_place_id = "adam-smiths-house/bathroom".to_owned();
+    valid.record.object_place_id = Some("adam-smiths-house/bathroom/bathroom-sink".to_owned());
+    resign_space_presence(&mut valid);
+    let mut wrong_kind = valid.clone();
+    wrong_kind.record.seq = 2;
+    wrong_kind.record.object_place_id = Some(valid.record.destination_place_id.clone());
+    let mut wrong_tile = valid.clone();
+    wrong_tile.record.seq = 3;
+    wrong_tile.record.from_tile = [22, 66];
+    resign_space_presence(&mut wrong_tile);
+    let latest = wrong_tile.clone();
+    let mut zero_sequence = valid.clone();
+    zero_sequence.record.seq = 0;
+    for (mut presence, expected) in [
+        (valid.clone(), StatusCode::OK),
+        (wrong_kind, StatusCode::OK),
+        (wrong_tile, StatusCode::OK),
+        (zero_sequence, StatusCode::BAD_REQUEST),
+    ] {
+        resign_space_presence(&mut presence);
+        let event = space_node_event("object-validation-node", presence.record.seq, &presence);
+        let response = request_json(&app, "POST", "/api/ingest/event", json!(event)).await;
+        assert_eq!(response.0, expected, "{}", response.1);
+        if expected == StatusCode::OK {
+            assert_eq!(receiver.try_recv().unwrap().event.payload, json!(presence));
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+    ingest_space_heartbeat(
+        &app,
+        "object-validation-node",
+        &SigningKey::from_bytes(&[19_u8; 32]),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await;
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+    )
+    .await;
+    assert_eq!(response.1["presences"], json!([latest]));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_ui_events where data_kind='space_presence'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        3
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn world_event_accepts_only_pinned_authority_and_deduplicates_relay_replays() {
+    let key = SigningKey::from_bytes(&[23_u8; 32]);
+    let pins = json!({"space-test-network":hex::encode(key.verifying_key().as_bytes())});
+    let configured = std::env::var("WATTETHERIA_GATEWAY_TRUSTED_NETWORK_GENESIS_FILE")
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if configured != Some(pins.clone()) {
+        let path = std::env::temp_dir().join(format!(
+            "gateway-space-authority-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, serde_json::to_vec(&pins).unwrap()).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "world_event_accepts_only_pinned_authority_and_deduplicates_relay_replays",
+                "--nocapture",
+            ])
+            .env("WATTETHERIA_GATEWAY_TRUSTED_NETWORK_GENESIS_FILE", &path)
+            .output()
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let (sender, _) = tokio::sync::broadcast::channel(64);
+    let state = AppState {
+        pool: pool.clone(),
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: None,
+        bootstrap_registry_urls: vec![],
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: None,
+        ui_stream_tx: UiStreamHub::new(sender),
+    };
+    let mut receiver = state.ui_stream_tx.subscribe(Some(DataKind::WorldEvent));
+    let app = http::router(state);
+    let mut announcement = wattswarm_protocol::types::EventAnnouncementPayload {
+        announcement_id: "concert-one".to_owned(),
+        network_id: "space-test-network".to_owned(),
+        authority_node_id: hex::encode(key.verifying_key().as_bytes()),
+        issued_at: chrono::Utc::now().timestamp_millis() as u64,
+        content: json!({"event_id":"concert-one","space_id":"the-ville","place_id":"johnson-park","title":"Concert","description":"Public music","starts_at":1_800_000_000_000_i64,"ends_at":1_800_003_600_000_i64}),
+        authority_signature: String::new(),
+    };
+    announcement.authority_signature = hex::encode(
+        key.sign(&canonical_bytes(&announcement.unsigned_payload()).unwrap())
+            .to_bytes(),
+    );
+    let value = serde_json::to_value(&announcement).unwrap();
+    let mut pins = std::collections::BTreeMap::new();
+    pins.insert(
+        announcement.network_id.clone(),
+        announcement.authority_node_id.clone(),
+    );
+    wattetheria_gateway::space::validate_world_event_with_authorities(&value, &pins).unwrap();
+    assert!(
+        wattetheria_gateway::space::validate_world_event_with_authorities(
+            &value,
+            &std::collections::BTreeMap::new()
+        )
+        .is_err()
+    );
+    let mut wrong_pin = pins.clone();
+    wrong_pin.insert(
+        announcement.network_id.clone(),
+        hex::encode(
+            SigningKey::from_bytes(&[24_u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        ),
+    );
+    assert!(
+        wattetheria_gateway::space::validate_world_event_with_authorities(&value, &wrong_pin)
+            .is_err()
+    );
+    let mut tampered = value.clone();
+    tampered["content"]["title"] = json!("forged");
+    assert!(
+        wattetheria_gateway::space::validate_world_event_with_authorities(&tampered, &pins)
+            .is_err()
+    );
+    for (node, expected) in [("relay-one", "ok"), ("relay-two", "duplicate")] {
+        let mut event = signed_node_event(
+            node,
+            DataKind::WorldEvent,
+            "space.world_event.published",
+            value.clone(),
+        );
+        event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+        event.payload.timestamp = chrono::Utc::now().timestamp();
+        resign_node_event(&mut event);
+        assert_ne!(
+            event.payload.public_key,
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes())
+        );
+        let response = request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(event).unwrap(),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        assert_eq!(response.1["status"], expected);
+    }
+    assert_eq!(receiver.try_recv().unwrap().event.payload, value);
+    for (id, title, equal_end) in [
+        ("empty-title", "", false),
+        ("blank-title", "  ", false),
+        ("equal-end", "Concert", true),
+        ("  ", "Concert", false),
+    ] {
+        let mut malformed = announcement.clone();
+        malformed.announcement_id = id.to_owned();
+        malformed.content["event_id"] = json!(id);
+        malformed.content["title"] = json!(title);
+        if equal_end {
+            malformed.content["ends_at"] = malformed.content["starts_at"].clone();
+        }
+        malformed.authority_signature = hex::encode(
+            key.sign(&canonical_bytes(&malformed.unsigned_payload()).unwrap())
+                .to_bytes(),
+        );
+        let mut event = signed_node_event(
+            "malformed-product-relay",
+            DataKind::WorldEvent,
+            "space.world_event.published",
+            json!(malformed),
+        );
+        event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+        resign_node_event(&mut event);
+        let response = request_json(&app, "POST", "/api/ingest/event", json!(event)).await;
+        assert_eq!(response.0, StatusCode::BAD_REQUEST, "{}", response.1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/events?network_id=space-test-network&space_id=the-ville&place_id=johnson-park",
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["events"], json!([value]));
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/events?network_id=space-test-network&space_id=the-ville&place_id=adam-smiths-house",
+    )
+    .await;
+    assert_eq!(response.1["events"], json!([]));
+    let mut unknown = announcement.clone();
+    unknown.network_id = "untrusted-network".to_owned();
+    unknown.authority_signature = hex::encode(
+        key.sign(&canonical_bytes(&unknown.unsigned_payload()).unwrap())
+            .to_bytes(),
+    );
+    let mut unknown_event = signed_node_event(
+        "relay-unknown",
+        DataKind::WorldEvent,
+        "space.world_event.published",
+        serde_json::to_value(unknown).unwrap(),
+    );
+    unknown_event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    resign_node_event(&mut unknown_event);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(unknown_event).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let mut event = signed_node_event(
+        "relay-forged",
+        DataKind::WorldEvent,
+        "space.world_event.published",
+        tampered,
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    resign_node_event(&mut event);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(event).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_ui_events where data_kind='world_event'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let mut recovered = announcement.clone();
+    recovered.announcement_id = "concert-recovered".to_owned();
+    recovered.content["event_id"] = json!("concert-recovered");
+    recovered.content["space_id"] = json!("unknown-space");
+    recovered.content["place_id"] = json!("unknown-place");
+    recovered.authority_signature = hex::encode(
+        key.sign(&canonical_bytes(&recovered.unsigned_payload()).unwrap())
+            .to_bytes(),
+    );
+    let recovered = serde_json::to_value(recovered).unwrap();
+    let mut untrusted = serde_json::to_value(&announcement).unwrap();
+    untrusted["network_id"] = json!("untrusted-network");
+    let mut snapshot = signed_snapshot(
+        "world-snapshot-relay",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[json!({"id":"mission-preserved","title":"Existing mission"})],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    snapshot.payload.world_events = vec![recovered.clone(), untrusted];
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(&snapshot).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    snapshot.payload.generated_at += 1;
+    assert_eq!(receiver.try_recv().unwrap().event.payload, recovered);
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(&snapshot).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/events?network_id=space-test-network",
+    )
+    .await;
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(response.1["events"].as_array().unwrap().len(), 2);
+    assert!(
+        response.1["events"]
+            .as_array()
+            .unwrap()
+            .contains(&recovered)
+    );
+    for (path, expected) in [
+        (
+            "/api/spaces/events?network_id=space-test-network&space_id=unknown-space&place_id=unknown-place",
+            json!([recovered]),
+        ),
+        (
+            "/api/spaces/events?network_id=space-test-network&space_id=the-ville",
+            json!([value]),
+        ),
+        (
+            "/api/spaces/events?network_id=space-test-network&place_id=unknown-place",
+            json!([recovered]),
+        ),
+        ("/api/spaces/events?network_id=other-network", json!([])),
+        (
+            "/api/spaces/events?network_id=space-test-network&space_id=not-present",
+            json!([]),
+        ),
+    ] {
+        let response = request(&app, "GET", path).await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        assert_eq!(response.1["events"], expected);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from gateway_ui_events where data_kind='world_event'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(sqlx::query_scalar::<_,i64>("select count(*) from gateway_projection_rows where data_kind='task_summary' and identity_key='mission-preserved'").fetch_one(&pool).await.unwrap(),1,"unknown authority must not block other snapshot read models");
+    pool.close().await;
+    db.cleanup().await;
+}
+
+fn resign_space_presence(presence: &mut wattetheria_gateway_contract::SignedSpacePresence) {
+    let key = SigningKey::from_bytes(&[19_u8; 32]);
+    presence.signature = base64::engine::general_purpose::STANDARD.encode(
+        key.sign(&canonical_bytes(&presence.record).unwrap())
+            .to_bytes(),
+    );
+}
+
+#[tokio::test]
+async fn space_snapshot_bootstrap_returns_every_latest_presence_and_preserves_newer_seq() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let mut presences = Vec::new();
+    for index in 0..205u8 {
+        let key = SigningKey::from_bytes(&[index; 32]);
+        let mut presence = signed_space_presence(1, "bootstrap");
+        presence.public_key =
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes());
+        presence.record.agent_did = did_key_from_public_key_b64(&presence.public_key);
+        presence.signature = base64::engine::general_purpose::STANDARD.encode(
+            key.sign(&canonical_bytes(&presence.record).unwrap())
+                .to_bytes(),
+        );
+        presences.push(presence);
+    }
+    let mut snapshot = signed_snapshot(
+        "bootstrap-node",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    snapshot.payload.space_presences = presences.clone();
+    resign_snapshot(&mut snapshot);
+    let response = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&snapshot).unwrap(),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    for index in 0..205u8 {
+        ingest_space_heartbeat(
+            &app,
+            "bootstrap-node",
+            &SigningKey::from_bytes(&[index; 32]),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await;
+    }
+    let response = request(
+        &app,
+        "GET",
+        "/api/spaces/presence?network_id=test-network&space_id=the-ville",
+    )
+    .await;
+    assert_eq!(
+        response.1["presences"].as_array().unwrap().len(),
+        205,
+        "REST bootstrap must not use WS replay's 200 limit"
+    );
+    let newer = signed_space_presence(2, "fresh event");
+    let event = space_node_event("event-node", 1, &newer);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/event",
+            serde_json::to_value(&event).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    snapshot.payload.generated_at += 1;
+    resign_snapshot(&mut snapshot);
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(&snapshot).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let response = request(
+        &app,
+        "GET",
+        &format!(
+            "/api/spaces/presence/{}?network_id=test-network&space_id=the-ville",
+            newer.record.agent_did
+        ),
+    )
+    .await;
+    assert_eq!(response.1["presence"], json!(newer));
+    let mut invalid = snapshot.clone();
+    invalid.payload.generated_at += 100;
+    invalid.payload.space_presences[0].record.activity = "unsigned forged activity".to_owned();
+    assert_eq!(
+        request_json(
+            &app,
+            "POST",
+            "/api/ingest/snapshot",
+            serde_json::to_value(invalid).unwrap()
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let pool = db.pool().await;
+    let persisted: sqlx::types::Json<Value> =
+        sqlx::query_scalar("select payload from node_snapshots where node_id='bootstrap-node'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        persisted.0["generated_at"],
+        json!(snapshot.payload.generated_at),
+        "invalid outer signature must be rejected before snapshot mutation"
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+fn space_node_event(
+    node: &str,
+    seq: u64,
+    presence: &wattetheria_gateway_contract::SignedSpacePresence,
+) -> SignedNodeEvent {
+    let mut event = signed_node_event(
+        node,
+        DataKind::SpacePresence,
+        "space.presence.changed",
+        serde_json::to_value(presence).unwrap(),
+    );
+    event.payload.event_id = format!("{node}:{seq}");
+    event.payload.seq = seq;
+    event.payload.timestamp = chrono::Utc::now().timestamp();
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    resign_node_event(&mut event);
+    event
+}
+
+fn signed_space_heartbeat(
+    node_id: &str,
+    key: &SigningKey,
+    last_heartbeat_ms: i64,
+    heartbeat_interval_sec: i64,
+) -> SignedNodeEvent {
+    let mut event = signed_node_event(
+        node_id,
+        DataKind::Presence,
+        "node.presence.heartbeat",
+        json!({}),
+    );
+    event.payload.public_key =
+        base64::engine::general_purpose::STANDARD.encode(key.verifying_key().as_bytes());
+    event.payload.signer_agent_did = did_key_from_public_key_b64(&event.payload.public_key);
+    event.payload.event_id = format!("{node_id}:heartbeat:{last_heartbeat_ms}");
+    event.payload.timestamp = last_heartbeat_ms / 1000;
+    event.payload.provisional_policy = ProvisionalExportPolicy::EphemeralOnly;
+    event.payload.payload = json!({
+        "node_id": node_id,
+        "agent_did": event.payload.signer_agent_did,
+        "last_heartbeat_ms": last_heartbeat_ms,
+        "heartbeat_interval_sec": heartbeat_interval_sec,
+    });
+    event.signature = base64::engine::general_purpose::STANDARD.encode(
+        key.sign(&canonical_bytes(&event.payload).unwrap())
+            .to_bytes(),
+    );
+    event
+}
+
+async fn ingest_space_heartbeat(
+    app: &Router,
+    node_id: &str,
+    key: &SigningKey,
+    last_heartbeat_ms: i64,
+) {
+    let event = signed_space_heartbeat(node_id, key, last_heartbeat_ms, 20);
+    let response = request_json(app, "POST", "/api/ingest/event", json!(event)).await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+}
+
+#[tokio::test]
+async fn local_network_identifier_uses_visible_metadata_without_product_activity() {
+    let db = TestDatabase::new().await;
+    let app = test_app(&db.database_url).await;
+    let path = "/api/network/status?federation=local";
+    let empty = request(&app, "GET", path).await;
+    assert_eq!(empty.0, StatusCode::OK);
+    assert_eq!(empty.1.get("network_id"), Some(&Value::Null));
+    let mut snapshot = signed_snapshot(
+        "clean-network-node",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+    );
+    snapshot.payload.network_status["network_id"] = json!("metadata-network");
+    resign_snapshot(&mut snapshot);
+    let response = request_json(&app, "POST", "/api/ingest/snapshot", json!(snapshot)).await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    assert_eq!(
+        request(&app, "GET", path).await.1["network_id"],
+        "metadata-network"
+    );
+    assert_eq!(
+        request(&app, "GET", "/api/network/nodes?federation=local")
+            .await
+            .1,
+        json!([])
+    );
+    assert!(snapshot.payload.space_presences.is_empty());
+    assert!(snapshot.payload.world_events.is_empty());
+    assert!(snapshot.payload.public_board_messages.is_empty());
+    assert!(snapshot.payload.public_topics.is_empty());
+    assert!(snapshot.payload.public_topic_messages.is_empty());
+    let pool = db.pool().await;
+    let source_id = uuid::Uuid::new_v4();
+    sqlx::query("insert into node_sources(id,name,export_url,source_status) values($1,'network metadata','http://127.0.0.1/network-metadata','active')")
+        .bind(source_id).execute(&pool).await.unwrap();
+    for (index, payload, expected) in [
+        (json!({"network_id":"metadata-network"}), json!("metadata-network")),
+        (json!({"network_status":{"network_id":"other-network"}}), Value::Null),
+        (json!({"network_id":"metadata-network","network_status":{"network_id":"other-network"}}), Value::Null),
+        (json!({"network_status":{"network_id":"metadata-network"}}), json!("metadata-network")),
+    ].into_iter().enumerate().map(|(index, (payload, expected))| (index, payload, expected)) {
+        db::upsert_projection_row(&pool, UpsertProjectionRecord {
+            data_kind: "network_projection",
+            identity_key: "network-metadata-source",
+            source_node_id: "network-metadata-source",
+            source_id: Some(source_id),
+            generated_at: 1_710_000_001 + index as i64,
+            visibility: "public",
+            payload: &payload,
+            provenance: &json!({"source":"network metadata test"}),
+        }).await.unwrap();
+        assert_eq!(request(&app, "GET", path).await.1["network_id"], expected);
+    }
+    let conflicting = json!({"network_id":"inactive-network"});
+    db::upsert_projection_row(
+        &pool,
+        UpsertProjectionRecord {
+            data_kind: "network_projection",
+            identity_key: "network-metadata-source",
+            source_node_id: "network-metadata-source",
+            source_id: Some(source_id),
+            generated_at: 1_710_000_010,
+            visibility: "public",
+            payload: &conflicting,
+            provenance: &json!({"source":"network metadata test"}),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(request(&app, "GET", path).await.1["network_id"].is_null());
+    for status in ["suspended", "invalid"] {
+        sqlx::query("update node_sources set source_status=$1 where id=$2")
+            .bind(status)
+            .bind(source_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            request(&app, "GET", path).await.1["network_id"],
+            "metadata-network"
+        );
+    }
+    let stored: (sqlx::types::Json<Value>, String) = sqlx::query_as(
+        "select payload,signature from node_snapshots where node_id='clean-network-node'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.0.0, json!(snapshot.payload));
+    assert_eq!(stored.1, snapshot.signature);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_presence")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_space_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from gateway_ui_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    pool.close().await;
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn register_and_sync_ingests_snapshot_and_aggregates() {
     let db = TestDatabase::new().await;
     let export_server = MockExportServer::spawn(signed_snapshot(
@@ -2895,14 +5778,25 @@ impl TestDatabase {
 }
 
 async fn ensure_postgres() {
-    POSTGRES_READY.get_or_init(|| {
-        let status = Command::new("docker")
-            .args(["compose", "up", "-d", "postgres"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .status()
-            .expect("run docker compose up -d postgres");
-        assert!(status.success(), "postgres compose service failed to start");
-    });
+    if std::env::var_os("WATTETHERIA_GATEWAY_TEST_DATABASE_URL").is_none() {
+        POSTGRES_READY.get_or_init(|| {
+            let status = Command::new("docker")
+                .args([
+                    "compose",
+                    "-f",
+                    "../../docker-compose.yml",
+                    "-f",
+                    "../../docker-compose.dev.yml",
+                    "up",
+                    "-d",
+                    "postgres",
+                ])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .status()
+                .expect("run docker compose with the dev overlay up -d postgres");
+            assert!(status.success(), "postgres compose service failed to start");
+        });
+    }
 
     let admin_url = admin_database_url(&test_database_url());
     for _ in 0..30 {
@@ -2976,6 +5870,8 @@ fn signed_snapshot_at(
     let payload = PublicClientSnapshot {
         generated_at,
         node_id: node_id.to_string(),
+        agent_identity: None,
+        public_id: None,
         public_key: public_key.clone(),
         network_name: contents.network_name.map(str::to_string),
         network_org_name: contents.network_org_name.map(str::to_string),
@@ -2985,6 +5881,7 @@ fn signed_snapshot_at(
             "health_percent": 100,
             "avg_latency_ms": 0
         }),
+        nodes: None,
         peers: contents.peers.to_vec(),
         operator: json!({
             "id": "agent-root",
@@ -2998,6 +5895,9 @@ fn signed_snapshot_at(
         public_topics: contents.public_topics.to_vec(),
         public_topic_messages: contents.public_topic_messages.to_vec(),
         public_board_messages: vec![],
+        space_presences: vec![],
+        node_presence: None,
+        world_events: vec![],
         swarm_task_activity: contents.swarm_task_activity,
         tasks: contents.tasks.to_vec(),
         organizations: contents.organizations.to_vec(),

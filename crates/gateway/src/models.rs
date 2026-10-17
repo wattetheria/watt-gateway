@@ -17,12 +17,18 @@ pub struct SignedPublicClientSnapshot {
 pub struct PublicClientSnapshot {
     pub generated_at: i64,
     pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_id: Option<String>,
     pub public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_org_name: Option<String>,
     pub network_status: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<Vec<Value>>,
     pub peers: Vec<Value>,
     pub operator: Value,
     pub rpc_logs: Vec<Value>,
@@ -34,6 +40,12 @@ pub struct PublicClientSnapshot {
     pub public_topic_messages: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_board_messages: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub space_presences: Vec<wattetheria_gateway_contract::SignedSpacePresence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_presence: Option<wattetheria_gateway_contract::space::NodePresence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub world_events: Vec<Value>,
     #[serde(default)]
     pub swarm_task_activity: Value,
     pub tasks: Vec<Value>,
