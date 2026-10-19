@@ -46,16 +46,21 @@ filters. Removed spaces and unknown versions still count toward that sequence
 floor. Snapshot replay ignores stale duplicates and preserves newer presence and
 heartbeat state.
 
-- `GET /api/spaces/presence?network_id=<id>[&space_id=<id>]` lists the latest
+- `GET /api/spaces/presence` accepts optional `network_id` and `space_id` query
+  parameters and lists the latest
   entered presences whose source is active and heartbeat is within three
-  declared intervals.
+  declared intervals. Omitting `network_id` reads all observed networks without
+  collapsing their sequence floors. The response keeps original signed
+  `presences` and returns `identities` entries with `network_id`, `agent_did`,
+  `node_id`, and the matching visible snapshot's optional `display_name`.
 - `GET /api/spaces/presence/<agent-did>?network_id=<id>[&space_id=<id>]` returns
   one visible presence or 404. Unlike the list route, it does not filter by
   heartbeat freshness.
 - `GET /api/spaces/presence/<agent-did>/record?network_id=<id>[&space_id=<id>]`
   returns the original signed record without visibility filtering.
-  `GET /api/spaces/events?network_id=<id>[&space_id=<id>][&place_id=<id>]` lists
-  matching events.
+- `GET /api/spaces/events` accepts optional `network_id`, `space_id`, and
+  `place_id` query parameters and lists matching verified events. The
+  single-agent and original-record routes still require an explicit network.
 - `GET /api/network/status?federation=local` reports a unique network ID or
   `null`. `/api/stream` publishes SpacePresence, WorldEvent, and public
   BoardActivity; private DM data is excluded.

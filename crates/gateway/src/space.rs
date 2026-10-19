@@ -25,6 +25,13 @@ pub struct SpaceQuery {
     pub place_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct SpaceObservationQuery {
+    pub network_id: Option<String>,
+    pub space_id: Option<String>,
+    pub place_id: Option<String>,
+}
+
 struct SnapshotSource<'a> {
     source_id: Option<Uuid>,
     node_id: &'a str,
@@ -414,11 +421,26 @@ async fn upsert_presence(
         .bind(node_id).bind(source_id).bind(sqlx::types::Json(presence)).fetch_optional(&mut **tx).await?.is_some())
 }
 
-pub async fn presences(State(state): State<AppState>, Query(query): Query<SpaceQuery>) -> Response {
-    if let Err(error) = validate_presence_query(&query) {
+pub async fn presences(
+    State(state): State<AppState>,
+    Query(query): Query<SpaceObservationQuery>,
+) -> Response {
+    if let Err(error) = validate_observation_query(&query) {
         return error_response(StatusCode::BAD_REQUEST, error);
     }
-    match presence_values(&state.pool, &query).await {
+    if query.place_id.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("presence place_id filtering requires geometry owned by Main/Client"),
+        );
+    }
+    match presence_values(
+        &state.pool,
+        query.network_id.as_deref(),
+        query.space_id.as_deref(),
+    )
+    .await
+    {
         Ok(values) => {
             let node_presences = match node_presences(&state.pool).await {
                 Ok(values) => values,
@@ -436,37 +458,54 @@ pub async fn presences(State(state): State<AppState>, Query(query): Query<SpaceQ
                         })
                 })
                 .collect::<Vec<_>>();
-            let source_node_ids = values
-                .iter()
-                .map(|(presence, node)| (presence.record.agent_did.clone(), node.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let names = sqlx::query_as::<_, (String, String)>(
-                "select n.signer_agent_did,n.payload->'operator'->>'display_name' \
+            let names = sqlx::query_as::<_, (String, String, String)>(
+                "select p.network_id,n.signer_agent_did,n.payload->'operator'->>'display_name' \
                  from node_snapshots n \
-                 join unnest($1::text[],$2::text[]) p(agent_did,node_id) \
+                 join unnest($1::text[],$2::text[],$3::text[]) p(network_id,agent_did,node_id) \
                    on n.node_id=p.node_id and n.signer_agent_did=p.agent_did \
                  left join node_sources s on s.id=n.source_id \
-                 where n.payload->'network_status'->>'network_id'=$3 \
+                 where n.payload->'network_status'->>'network_id'=p.network_id \
                    and (n.source_id is null or s.source_status='active') \
                    and jsonb_typeof(n.payload->'operator'->'display_name')='string' \
                    and btrim(n.payload->'operator'->>'display_name')<>''",
             )
-            .bind(source_node_ids.keys().cloned().collect::<Vec<_>>())
-            .bind(source_node_ids.values().cloned().collect::<Vec<_>>())
-            .bind(&query.network_id)
+            .bind(
+                values
+                    .iter()
+                    .map(|(p, _)| &p.record.network_id)
+                    .collect::<Vec<_>>(),
+            )
+            .bind(
+                values
+                    .iter()
+                    .map(|(p, _)| &p.record.agent_did)
+                    .collect::<Vec<_>>(),
+            )
+            .bind(values.iter().map(|(_, node)| node).collect::<Vec<_>>())
             .fetch_all(&state.pool)
             .await;
             let display_names = match names {
-                Ok(names) => names.into_iter().collect::<BTreeMap<_, _>>(),
+                Ok(names) => names
+                    .into_iter()
+                    .map(|(network, did, name)| ((network, did), name))
+                    .collect::<BTreeMap<_, _>>(),
                 Err(error) => {
                     return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.into());
                 }
             };
+            let identities = values
+                .iter()
+                .map(|(presence, node)| {
+                    let record = &presence.record;
+                    let name = display_names.get(&(record.network_id.clone(), record.agent_did.clone()));
+                    json!({"network_id":record.network_id,"agent_did":record.agent_did,"node_id":node,"display_name":name})
+                })
+                .collect::<Vec<_>>();
             let presences = values
                 .into_iter()
                 .map(|(presence, _)| presence)
                 .collect::<Vec<_>>();
-            axum::Json(json!({"network_id":query.network_id,"space_id":query.space_id,"server_time_ms":now,"presences":presences,"source_node_ids":source_node_ids,"display_names":display_names,"node_presences":node_presences})).into_response()
+            axum::Json(json!({"network_id":query.network_id,"space_id":query.space_id,"server_time_ms":now,"presences":presences,"identities":identities,"node_presences":node_presences})).into_response()
         }
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
@@ -540,19 +579,39 @@ fn validate_network_query(query: &SpaceQuery) -> Result<()> {
     Ok(())
 }
 
+fn validate_observation_query(query: &SpaceObservationQuery) -> Result<()> {
+    if query
+        .network_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("network_id must not be empty");
+    }
+    if query
+        .space_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("space_id must not be empty");
+    }
+    Ok(())
+}
+
 async fn presence_values(
     pool: &PgPool,
-    query: &SpaceQuery,
+    network_id: Option<&str>,
+    space_id: Option<&str>,
 ) -> Result<Vec<(SignedSpacePresence, String)>> {
     let values = sqlx::query_as::<_, (sqlx::types::Json<SignedSpacePresence>, String)>(
         "select p.payload,p.source_node_id from \
-         (select distinct on (agent_did) * from gateway_space_presence where network_id=$1 \
-          order by agent_did,seq desc,space_id) p left join node_sources s on s.id=p.source_id \
+         (select distinct on (network_id,agent_did) * from gateway_space_presence \
+          where ($1::text is null or network_id=$1) and network_id<>'' \
+          order by network_id,agent_did,seq desc,space_id) p left join node_sources s on s.id=p.source_id \
          where ($2::text is null or p.space_id=$2) \
-         and (p.source_id is null or s.source_status='active') order by p.agent_did",
+         and (p.source_id is null or s.source_status='active') order by p.network_id,p.agent_did",
     )
-    .bind(&query.network_id)
-    .bind(&query.space_id)
+    .bind(network_id)
+    .bind(space_id)
     .fetch_all(pool)
     .await?;
     Ok(values
@@ -570,7 +629,13 @@ pub async fn agent_presence(
         return error_response(StatusCode::BAD_REQUEST, error);
     }
     let now = Utc::now().timestamp_millis();
-    match presence_values(&state.pool, &query).await {
+    match presence_values(
+        &state.pool,
+        Some(&query.network_id),
+        query.space_id.as_deref(),
+    )
+    .await
+    {
         Ok(values) => match values
             .into_iter()
             .find(|(presence, _)| presence.record.agent_did == agent_id && presence.record.entered)
@@ -593,14 +658,17 @@ pub async fn agent_presence(
     }
 }
 
-pub async fn events(State(state): State<AppState>, Query(query): Query<SpaceQuery>) -> Response {
-    if let Err(error) = validate_network_query(&query) {
+pub async fn events(
+    State(state): State<AppState>,
+    Query(query): Query<SpaceObservationQuery>,
+) -> Response {
+    if let Err(error) = validate_observation_query(&query) {
         return error_response(StatusCode::BAD_REQUEST, error);
     }
     match sqlx::query_scalar::<_, sqlx::types::Json<Value>>(
         "select e.payload from gateway_space_events e left join node_sources s on s.id=e.source_id \
-         where e.network_id=$1 and ($2::text is null or e.space_id=$2) and ($3::text is null or e.place_id=$3) \
-         and (e.source_id is null or s.source_status='active') order by e.announcement_id"
+         where ($1::text is null or e.network_id=$1) and ($2::text is null or e.space_id=$2) and ($3::text is null or e.place_id=$3) \
+         and (e.source_id is null or s.source_status='active') order by e.network_id,e.announcement_id"
     ).bind(&query.network_id).bind(&query.space_id).bind(&query.place_id).fetch_all(&state.pool).await {
         Ok(values) => axum::Json(json!({"network_id":query.network_id,"space_id":query.space_id,"server_time_ms":Utc::now().timestamp_millis(),"events":values.into_iter().map(|value|value.0).collect::<Vec<_>>()})).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR,axum::Json(json!({"error":error.to_string()}))).into_response(),
