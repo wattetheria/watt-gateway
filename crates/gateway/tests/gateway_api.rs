@@ -4701,6 +4701,95 @@ async fn board_message_event_materializes_board_projection() {
 }
 
 #[tokio::test]
+async fn board_event_stream_payload_matches_rest_projection() {
+    let db = TestDatabase::new().await;
+    let pool = db.pool().await;
+    db::init_schema(&pool).await.unwrap();
+    let (sender, _) = tokio::sync::broadcast::channel(64);
+    let state = AppState {
+        pool: pool.clone(),
+        node_client: NodeClient::new(5).unwrap(),
+        registry_client: RegistryClient::new(5).unwrap(),
+        nats: None,
+        registry_admin_token: None,
+        bootstrap_registry_urls: vec![],
+        gateway_identity: None,
+        gateway_network: None,
+        gateway_sync_tx: None,
+        ui_stream_tx: UiStreamHub::new(sender),
+    };
+    let mut receiver = state.ui_stream_tx.subscribe(Some(DataKind::BoardActivity));
+    let app = http::router(state);
+    // Live node board events carry no created_at; the projection fills it from the event time.
+    let mut event = signed_node_event(
+        "node-board-live",
+        DataKind::BoardActivity,
+        "board.message.posted",
+        json!({
+            "message_id": "board-live-1",
+            "author_agent_did": "did:key:board-live-author",
+            "source": "network",
+            "category": "general",
+            "network_id": "network-board",
+            "feed_key": "wattetheria.board.general",
+            "scope_hint": "group:board-general",
+            "content": "hello town"
+        }),
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    event.payload.scope.task_id = None;
+    event.payload.identity_key = Some("board-live-1".to_string());
+    resign_node_event(&mut event);
+
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let board = request(
+        &app,
+        "GET",
+        "/api/board?source=network&category=general&limit=10&federation=local",
+    )
+    .await;
+    assert_eq!(board.0, StatusCode::OK);
+    let rest = &board.1[0];
+    assert_eq!(rest["created_at"], json!(event.payload.timestamp));
+    let live = receiver.try_recv().unwrap().event.payload;
+    let replay = db::list_ui_events_after(
+        &pool,
+        db::ListUiEventsQuery {
+            cursor: 0,
+            data_kind: Some("board_activity"),
+            node_id: None,
+            topic_id: None,
+            organization_id: None,
+            task_id: None,
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
+    let replayed = &replay[0].payload.0;
+    for key in [
+        "message_id",
+        "created_at",
+        "source_node_id",
+        "network_id",
+        "content",
+    ] {
+        assert_eq!(live[key], rest[key], "live stream {key}");
+        assert_eq!(replayed[key], rest[key], "replayed stream {key}");
+    }
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn sync_nodes_reports_partial_when_wattswarm_collection_fails() {
     let db = TestDatabase::new().await;
     let snapshot = signed_snapshot(

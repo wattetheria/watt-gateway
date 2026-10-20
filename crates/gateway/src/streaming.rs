@@ -180,6 +180,13 @@ async fn persist_signed_node_event_with_options(
         });
         return Ok(None);
     }
+    let projection = event_projection(event);
+    // When an event projects onto its own kind, stream subscribers (live and replay) receive the
+    // same normalized payload REST serves. The signed original is kept for P2P relay.
+    let ui_payload = match &projection {
+        Some((kind, payload)) if *kind == event.payload.data_kind => payload,
+        _ => &event.payload.payload,
+    };
     let record = db::InsertUiEventRecord {
         event_id: &event.payload.event_id,
         source_id,
@@ -193,7 +200,7 @@ async fn persist_signed_node_event_with_options(
         organization_id: scope.organization_id.as_deref(),
         task_id: scope.task_id.as_deref(),
         generated_at: event.payload.timestamp,
-        payload: &event.payload.payload,
+        payload: ui_payload,
         ingest_path: "event_push",
         source_cursor_or_seq: i64::try_from(event.payload.seq).ok(),
     };
@@ -218,7 +225,7 @@ async fn persist_signed_node_event_with_options(
         if crate::space::is_space_event(event) {
             return Ok(None);
         }
-        materialize_event_projection(state, event, source_id, provisional).await?;
+        materialize_event_projection(state, event, source_id, provisional, projection).await?;
         if let Some(existing_row) =
             db::get_ui_event_by_id(&state.pool, &event.payload.event_id).await?
         {
@@ -226,7 +233,7 @@ async fn persist_signed_node_event_with_options(
         }
         return Ok(None);
     };
-    materialize_event_projection(state, event, source_id, provisional).await?;
+    materialize_event_projection(state, event, source_id, provisional, projection).await?;
     let ui_event = GatewayUiEvent::try_from(row.clone())?;
     state.publish_ui_event(ui_event);
     let bus_event = json!({
@@ -246,85 +253,36 @@ async fn persist_signed_node_event_with_options(
     Ok(Some(row.cursor))
 }
 
+/// The read-model kind and normalized payload an event projects to, as served by REST.
+fn event_projection(event: &SignedNodeEvent) -> Option<(DataKind, Value)> {
+    match event.payload.data_kind {
+        DataKind::MissionLifecycle => normalized_mission_lifecycle_payload(event)
+            .map(|payload| (DataKind::TaskSummary, payload)),
+        DataKind::HiveMetadata => {
+            normalized_hive_metadata_payload(event).map(|payload| (DataKind::HiveMetadata, payload))
+        }
+        DataKind::HiveActivity | DataKind::HiveMessagePosted => {
+            normalized_hive_activity_payload(event).map(|payload| (DataKind::HiveActivity, payload))
+        }
+        DataKind::BoardActivity => normalized_board_activity_payload(event)
+            .map(|payload| (DataKind::BoardActivity, payload)),
+        DataKind::RankingProjection => normalized_ranking_projection_payload(event)
+            .map(|payload| (DataKind::RankingProjection, payload)),
+        _ => None,
+    }
+}
+
 async fn materialize_event_projection(
     state: &AppState,
     event: &SignedNodeEvent,
     source_id: Option<Uuid>,
     provisional: bool,
+    projection: Option<(DataKind, Value)>,
 ) -> Result<()> {
-    match event.payload.data_kind {
-        DataKind::MissionLifecycle => {
-            let Some(payload) = normalized_mission_lifecycle_payload(event) else {
-                return Ok(());
-            };
-            materialize_projection_row(
-                state,
-                event,
-                source_id,
-                provisional,
-                DataKind::TaskSummary,
-                payload,
-            )
-            .await
-        }
-        DataKind::HiveMetadata => {
-            let Some(payload) = normalized_hive_metadata_payload(event) else {
-                return Ok(());
-            };
-            materialize_projection_row(
-                state,
-                event,
-                source_id,
-                provisional,
-                DataKind::HiveMetadata,
-                payload,
-            )
-            .await
-        }
-        DataKind::HiveActivity | DataKind::HiveMessagePosted => {
-            let Some(payload) = normalized_hive_activity_payload(event) else {
-                return Ok(());
-            };
-            materialize_projection_row(
-                state,
-                event,
-                source_id,
-                provisional,
-                DataKind::HiveActivity,
-                payload,
-            )
-            .await
-        }
-        DataKind::BoardActivity => {
-            let Some(payload) = normalized_board_activity_payload(event) else {
-                return Ok(());
-            };
-            materialize_projection_row(
-                state,
-                event,
-                source_id,
-                provisional,
-                DataKind::BoardActivity,
-                payload,
-            )
-            .await
-        }
-        DataKind::RankingProjection => {
-            let Some(payload) = normalized_ranking_projection_payload(event) else {
-                return Ok(());
-            };
-            materialize_projection_row(
-                state,
-                event,
-                source_id,
-                provisional,
-                DataKind::RankingProjection,
-                payload,
-            )
-            .await
-        }
-        _ => Ok(()),
-    }
+    let Some((data_kind, payload)) = projection else {
+        return Ok(());
+    };
+    materialize_projection_row(state, event, source_id, provisional, data_kind, payload).await
 }
 
 fn normalized_ranking_projection_payload(event: &SignedNodeEvent) -> Option<Value> {
