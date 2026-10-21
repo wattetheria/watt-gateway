@@ -4648,6 +4648,99 @@ async fn public_board_messages_are_ingested_from_signed_snapshot() {
 }
 
 #[tokio::test]
+async fn forged_global_board_announcements_are_dropped_on_snapshot_and_push() {
+    let db = TestDatabase::new().await;
+    let impostor = SigningKey::from_bytes(&[29_u8; 32]);
+    let mut announcement = wattswarm_protocol::types::EventAnnouncementPayload {
+        announcement_id: "forged-concert".to_owned(),
+        network_id: "space-test-network".to_owned(),
+        authority_node_id: hex::encode(impostor.verifying_key().as_bytes()),
+        issued_at: 1_800_000_000_000,
+        content: json!({"event_id":"forged-concert","space_id":"the-ville","place_id":"johnson-park","title":"Forged","starts_at":1_800_000_000_000_i64,"ends_at":1_800_003_600_000_i64}),
+        authority_signature: String::new(),
+    };
+    announcement.authority_signature = hex::encode(
+        impostor
+            .sign(&canonical_bytes(&announcement.unsigned_payload()).unwrap())
+            .to_bytes(),
+    );
+    let forged = json!({
+        "message_id": "forged-global",
+        "source": "global",
+        "category": "global",
+        "global_kind": "EventAnnouncement",
+        "content": {"type": "EventAnnouncement", "payload": announcement},
+        "world_event": announcement.content,
+        "created_at": 1_780_114_500
+    });
+    let snapshot = signed_snapshot_with_board(
+        "node-board-forger",
+        SnapshotContents {
+            network_name: None,
+            network_org_name: None,
+            peers: &[],
+            public_blocks: &[],
+            public_topics: &[],
+            public_topic_messages: &[],
+            swarm_task_activity: json!({}),
+            tasks: &[],
+            organizations: &[],
+            leaderboard: &[],
+        },
+        &[
+            forged.clone(),
+            json!({
+                "message_id": "plain-with-event",
+                "source": "network",
+                "category": "general",
+                "content": {"text": "hello"},
+                "world_event": announcement.content,
+                "created_at": 1_780_114_400
+            }),
+        ],
+    );
+    let app = test_app(&db.database_url).await;
+    let ingest = request_json(
+        &app,
+        "POST",
+        "/api/ingest/snapshot",
+        serde_json::to_value(&snapshot).unwrap(),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::OK);
+
+    let mut pushed = forged.clone();
+    pushed["message_id"] = json!("forged-global-push");
+    let mut event = signed_node_event(
+        "node-board-forger",
+        DataKind::BoardActivity,
+        "board.message.posted",
+        pushed,
+    );
+    event.payload.provisional_policy = ProvisionalExportPolicy::NeverBeforeConfirmation;
+    event.payload.scope.task_id = None;
+    event.payload.identity_key = Some("forged-global-push".to_string());
+    resign_node_event(&mut event);
+    let push = request_json(
+        &app,
+        "POST",
+        "/api/ingest/event",
+        serde_json::to_value(&event).unwrap(),
+    )
+    .await;
+    assert_ne!(push.0, StatusCode::OK);
+
+    let board = request(&app, "GET", "/api/board?limit=10&federation=local").await;
+    assert_eq!(board.0, StatusCode::OK);
+    let rows = board.1.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["message_id"].as_str(), Some("plain-with-event"));
+    assert!(rows[0].get("world_event").is_none());
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn board_message_event_materializes_board_projection() {
     let db = TestDatabase::new().await;
     let app = test_app(&db.database_url).await;

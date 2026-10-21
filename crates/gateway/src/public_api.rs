@@ -573,6 +573,8 @@ async fn aggregate_public_board_messages_endpoint(state: &AppState, query: Board
                 }
                 values.extend(fetch_federated_arrays(state, "/api/board", params).await);
             }
+            // Also covers rows stored before this check and rows from federated gateways.
+            let mut values = crate::space::trusted_board_messages(values);
             values.retain(|value| matches_board_filters(value, &query));
             sort_values_desc_by_timestamp_with_fallback(
                 &mut values,

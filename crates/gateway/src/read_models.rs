@@ -121,7 +121,7 @@ pub fn snapshot_projection_seeds(
         &source_node_id,
         generated_at,
         DataKind::BoardActivity,
-        &snapshot.public_board_messages,
+        &crate::space::trusted_board_messages(snapshot.public_board_messages.clone()),
     );
     fanout_array(
         &mut seeds,

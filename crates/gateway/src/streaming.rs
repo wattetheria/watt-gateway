@@ -181,7 +181,13 @@ async fn persist_signed_node_event_with_options(
         });
         return Ok(None);
     }
-    let projection = event_projection(event);
+    let projection = match event_projection(event) {
+        Some((DataKind::BoardActivity, payload)) => Some((
+            DataKind::BoardActivity,
+            crate::space::trusted_board_message(payload)?,
+        )),
+        projection => projection,
+    };
     // When an event projects onto its own kind, stream subscribers (live and replay) receive the
     // same normalized payload REST serves. The signed original is kept for P2P relay.
     let ui_payload = match &projection {

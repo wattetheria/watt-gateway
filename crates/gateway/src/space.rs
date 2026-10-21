@@ -680,12 +680,74 @@ fn error_response(status: StatusCode, error: anyhow::Error) -> Response {
 }
 
 fn validate_world_event(payload: &Value) -> Result<()> {
+    validate_world_event_with_authorities(payload, &trusted_network_authorities()?)
+}
+
+fn trusted_network_authorities() -> Result<BTreeMap<String, String>> {
     let path = std::env::var("WATTETHERIA_GATEWAY_TRUSTED_NETWORK_GENESIS_FILE")
         .context("WorldEvent requires configured trusted network authorities")?;
-    let authorities: BTreeMap<String, String> =
-        serde_json::from_slice(&std::fs::read(path).context("read trusted network authorities")?)
-            .context("parse trusted network authorities")?;
-    validate_world_event_with_authorities(payload, &authorities)
+    serde_json::from_slice(&std::fs::read(path).context("read trusted network authorities")?)
+        .context("parse trusted network authorities")
+}
+
+/// Board rows from node snapshots, pushes and peers, without forged Network Authority notices.
+pub fn trusted_board_messages(values: Vec<Value>) -> Vec<Value> {
+    values
+        .into_iter()
+        .filter_map(|value| match trusted_board_message(value) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!("untrusted global board message dropped: {error}");
+                None
+            }
+        })
+        .collect()
+}
+
+pub fn trusted_board_message(value: Value) -> Result<Value> {
+    if board_announcement(&value).is_none() {
+        return trusted_board_message_with_authorities(value, &BTreeMap::new());
+    }
+    trusted_board_message_with_authorities(value, &trusted_network_authorities()?)
+}
+
+/// Any node can put a "global" row on the board, so an EventAnnouncement row must carry a valid
+/// Network Authority signature, and its world_event is rebuilt from the signed content.
+/// Other rows lose world_event: only a signed announcement may place an event in the Space.
+pub fn trusted_board_message_with_authorities(
+    mut value: Value,
+    authorities: &BTreeMap<String, String>,
+) -> Result<Value> {
+    let announcement = board_announcement(&value).cloned();
+    let Some(object) = value.as_object_mut() else {
+        return Ok(value);
+    };
+    match announcement {
+        None => {
+            object.remove("world_event");
+        }
+        Some(announcement) => {
+            validate_world_event_with_authorities(&announcement, authorities)?;
+            let world: WorldEvent = serde_json::from_value(announcement["content"].clone())?;
+            object.insert("world_event".to_owned(), serde_json::to_value(world)?);
+        }
+    }
+    Ok(value)
+}
+
+/// For a row claiming to be an EventAnnouncement, the signed payload it must carry (Null when missing).
+fn board_announcement(value: &Value) -> Option<&Value> {
+    let content = value.get("content");
+    let typed = content
+        .and_then(|content| content.get("type"))
+        .and_then(Value::as_str)
+        == Some("EventAnnouncement");
+    let kind = value.get("global_kind").and_then(Value::as_str) == Some("EventAnnouncement");
+    (typed || kind).then(|| {
+        content
+            .and_then(|content| content.get("payload"))
+            .unwrap_or(&Value::Null)
+    })
 }
 
 pub fn validate_world_event_with_authorities(
@@ -738,5 +800,65 @@ mod tests {
         };
         assert!(heartbeat_is_current(&heartbeat, 70_000));
         assert!(!heartbeat_is_current(&heartbeat, 70_001));
+    }
+
+    fn signed_board_announcement(key: &ed25519_dalek::SigningKey, title: &str) -> Value {
+        use ed25519_dalek::Signer as _;
+        let mut announcement = EventAnnouncementPayload {
+            announcement_id: "concert-one".to_owned(),
+            network_id: "space-test-network".to_owned(),
+            authority_node_id: hex::encode(key.verifying_key().as_bytes()),
+            issued_at: 1_800_000_000_000,
+            content: json!({"event_id":"concert-one","space_id":"the-ville","place_id":"johnson-park","title":title,"description":"Public music","starts_at":1_800_000_000_000_i64,"ends_at":1_800_003_600_000_i64}),
+            authority_signature: String::new(),
+        };
+        announcement.authority_signature = hex::encode(
+            key.sign(&crate::verify::canonical_bytes(&announcement.unsigned_payload()).unwrap())
+                .to_bytes(),
+        );
+        json!({
+            "message_id": "global-1",
+            "source": "global",
+            "category": "global",
+            "global_kind": "EventAnnouncement",
+            "content": {"type": "EventAnnouncement", "payload": announcement},
+            "world_event": {"event_id": "concert-one", "title": "node supplied"},
+        })
+    }
+
+    #[test]
+    fn board_announcement_needs_the_pinned_authority_signature() {
+        let authority = ed25519_dalek::SigningKey::from_bytes(&[23_u8; 32]);
+        let pins = BTreeMap::from([(
+            "space-test-network".to_owned(),
+            hex::encode(authority.verifying_key().as_bytes()),
+        )]);
+        let trusted = trusted_board_message_with_authorities(
+            signed_board_announcement(&authority, "Concert"),
+            &pins,
+        )
+        .unwrap();
+        assert_eq!(trusted["world_event"]["title"], json!("Concert"));
+        assert_eq!(trusted["world_event"]["place_id"], json!("johnson-park"));
+
+        let impostor = ed25519_dalek::SigningKey::from_bytes(&[24_u8; 32]);
+        let forged = signed_board_announcement(&impostor, "Concert");
+        assert!(trusted_board_message_with_authorities(forged.clone(), &pins).is_err());
+        assert!(trusted_board_message_with_authorities(forged, &BTreeMap::new()).is_err());
+
+        let mut tampered = signed_board_announcement(&authority, "Concert");
+        tampered["content"]["payload"]["content"]["title"] = json!("Free tokens");
+        assert!(trusted_board_message_with_authorities(tampered, &pins).is_err());
+
+        let bare = json!({"message_id":"global-2","source":"global","global_kind":"EventAnnouncement","content":"Concert tonight"});
+        assert!(trusted_board_message_with_authorities(bare, &pins).is_err());
+    }
+
+    #[test]
+    fn board_rows_without_an_announcement_lose_world_event() {
+        let row = json!({"message_id":"m-1","source":"global","global_kind":"PolicyTuned","content":{"type":"PolicyTuned"},"world_event":{"event_id":"fake"}});
+        let trusted = trusted_board_message(row).unwrap();
+        assert!(trusted.get("world_event").is_none());
+        assert_eq!(trusted["global_kind"], json!("PolicyTuned"));
     }
 }
