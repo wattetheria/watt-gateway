@@ -4758,7 +4758,8 @@ async fn board_event_stream_payload_matches_rest_projection() {
     .await;
     assert_eq!(board.0, StatusCode::OK);
     let rest = &board.1[0];
-    assert_eq!(rest["created_at"], json!(event.payload.timestamp));
+    // Event timestamps are seconds; board created_at is milliseconds like the node's own store.
+    assert_eq!(rest["created_at"], json!(event.payload.timestamp * 1000));
     let live = receiver.try_recv().unwrap().event.payload;
     let replay = db::list_ui_events_after(
         &pool,

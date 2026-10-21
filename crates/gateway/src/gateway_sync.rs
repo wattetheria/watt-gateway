@@ -949,7 +949,7 @@ async fn fetch_and_ingest_snapshot(
     Ok(())
 }
 
-fn normalize_generated_at_millis(generated_at: i64) -> i64 {
+pub(crate) fn normalize_generated_at_millis(generated_at: i64) -> i64 {
     if generated_at.unsigned_abs() >= 100_000_000_000 {
         generated_at
     } else {

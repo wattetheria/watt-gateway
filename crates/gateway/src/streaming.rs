@@ -3,6 +3,7 @@ use crate::contracts::{
     projection_identity_key, visibility_for_kind,
 };
 use crate::db;
+use crate::gateway_sync::normalize_generated_at_millis;
 use crate::http::ingest_signed_snapshot;
 use crate::state::AppState;
 use crate::verify::verify_signed_node_event;
@@ -430,7 +431,10 @@ fn normalized_board_activity_payload(event: &SignedNodeEvent) -> Option<Value> {
         .or_insert_with(|| Value::String(event.payload.node_id.clone()));
     object
         .entry("created_at".to_string())
-        .or_insert_with(|| Value::Number(event.payload.timestamp.into()));
+        // Board created_at is milliseconds, like the node's stored message; event timestamps are seconds.
+        .or_insert_with(|| {
+            Value::Number(normalize_generated_at_millis(event.payload.timestamp).into())
+        });
     object
         .entry("snapshot_generated_at".to_string())
         .or_insert_with(|| Value::Number(event.payload.timestamp.into()));
