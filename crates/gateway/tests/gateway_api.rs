@@ -2256,6 +2256,7 @@ fn signed_space_presence(
     let mut presence = wattetheria_gateway_contract::SignedSpacePresence {
         record: wattetheria_gateway_contract::SpacePresenceRecord {
             agent_did: did_key_from_public_key_b64(&public_key),
+            avatar_id: Some(24),
             network_id: "test-network".to_owned(),
             space_id: "the-ville".to_owned(),
             space_version: "sha256:test-map".to_owned(),
